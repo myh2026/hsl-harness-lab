@@ -1,0 +1,143 @@
+# ============================================================================
+# HSL Harness Lab — CI + 每日定时回归
+# ----------------------------------------------------------------------------
+# 触发：push / PR + 每日 UTC 20:45（北京 04:45，与工具链定时任务错开 15 分钟）
+#       + 手动 workflow_dispatch
+# 覆盖：论文双方向 harness 全链 CI ——
+#       mathphys：静态检查 → 剧本端到端（注入 2 个模型错误）→ 产物断言
+#                 → 38 后端投射 → 生成 Python 语义级验证
+#       armorlab：破甲演练（7 攻击 6 拦截 1 穿透 + 1 误报）→ 产物断言
+#                 → 38 后端投射 → 生成 Python 裁决逐项一致验证
+# 依赖：兄弟检出 myh2026/harness-specification-language（工具链，main 分支）
+#       —— run-tests.sh 默认按 ../../harness-specification-language/ 解析，
+#       兄弟目录布局开箱即用，兼做两仓库集成测试
+# 完善：失败自动开 Issue（scheduled-test-failure 标签），恢复全绿自动关闭
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '45 20 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  BUN_VERSION: '1'
+
+jobs:
+  # ── 1. 数学物理专攻 harness ──────────────────────────────────────────
+  mathphys:
+    name: MathPhysLab（数理验证 harness）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出工具链仓库（harness-specification-language）
+        uses: actions/checkout@v4
+        with:
+          repository: myh2026/harness-specification-language
+          path: harness-specification-language
+      - name: 检出本仓库（hsl-harness-lab）
+        uses: actions/checkout@v4
+        with:
+          path: hsl-harness-lab
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: MathPhysLab CI（量纲代数 + 独立重算 + 合理性三道防线）
+        run: bash hsl-harness-lab/mathphys/run-tests.sh
+
+  # ── 2. 网安破甲 harness（红蓝对抗）───────────────────────────────────
+  armorlab:
+    name: ArmorLab（红蓝对抗 harness）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出工具链仓库（harness-specification-language）
+        uses: actions/checkout@v4
+        with:
+          repository: myh2026/harness-specification-language
+          path: harness-specification-language
+      - name: 检出本仓库（hsl-harness-lab）
+        uses: actions/checkout@v4
+        with:
+          path: hsl-harness-lab
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: ArmorLab CI（规避率 / 误报率双计量 + 装甲评级）
+        run: bash hsl-harness-lab/armorlab/run-tests.sh
+
+  # ── 3. 失败自动开 Issue（测试→跟踪→完善闭环）────────────────────────
+  report:
+    name: Auto-issue on failure
+    needs: [mathphys, armorlab]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS_JSON);
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+            const failed = Object.entries(needs)
+              .filter(([, v]) => v.result === 'failure')
+              .map(([k]) => k);
+            const LABEL = 'scheduled-test-failure';
+            try {
+              await github.rest.issues.createLabel({ owner, repo, name: LABEL, color: 'd73a4a' });
+            } catch (e) { /* 标签已存在 */ }
+            const open = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: LABEL
+            });
+            if (failed.length === 0) {
+              for (const it of open.data) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: it.number,
+                  body: `✅ ${stamp} 定时测试恢复全绿。\n运行记录：${runUrl}`
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: it.number, state: 'closed'
+                });
+              }
+              core.info('全绿：无失败需要报告');
+              return;
+            }
+            const body = [
+              `**${stamp} 定时测试失败**`,
+              '',
+              `失败矩阵：${failed.map(f => '`' + f + '`').join(' · ')}`,
+              '',
+              `运行记录：${runUrl}`,
+              '',
+              '> 此 Issue 由定时任务自动创建与维护；恢复全绿后自动评论并关闭。'
+            ].join('\n');
+            if (open.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: open.data[0].number, body
+              });
+              core.info(`已更新既有跟踪 Issue #${open.data[0].number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner, repo,
+                title: '⏰ 定时测试失败（Scheduled Tests）',
+                body, labels: [LABEL]
+              });
+              core.info(`已创建跟踪 Issue #${created.data.number}`);
+            }
