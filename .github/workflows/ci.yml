@@ -1,8 +1,7 @@
 # ============================================================================
-# HSL Harness Lab — CI + 每日定时回归
+# HSL Harness Lab — CI + 每 15 分钟定时回归
 # ----------------------------------------------------------------------------
-# 触发：push / PR + 每日 UTC 20:45（北京 04:45，与工具链定时任务错开 15 分钟）
-#       + 手动 workflow_dispatch
+# 触发：push / PR + 每 15 分钟（cron */15）+ 手动 workflow_dispatch
 # 覆盖：论文双方向 harness 全链 CI ——
 #       mathphys：静态检查 → 剧本端到端（注入 2 个模型错误）→ 产物断言
 #                 → 38 后端投射 → 生成 Python 语义级验证
@@ -10,7 +9,7 @@
 #                 → 38 后端投射 → 生成 Python 裁决逐项一致验证
 # 依赖：兄弟检出 myh2026/harness-specification-language（工具链，main 分支）
 #       —— run-tests.sh 默认按 ../../harness-specification-language/ 解析，
-#       兄弟目录布局开箱即用，兼做两仓库集成测试
+#       兄弟目录布局开箱即用，兼做两仓库集成测试（工具链升级 15 分钟内在这里现形）
 # 完善：失败自动开 Issue（scheduled-test-failure 标签），恢复全绿自动关闭
 # ============================================================================
 
@@ -22,11 +21,12 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: '45 20 * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
+# 事件分组：避免 15 分钟定时运行与 push 运行互相同组取消
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

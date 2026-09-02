@@ -1,5 +1,7 @@
 # HSL Harness Lab — 毕业论文 harness 实验场
 
+[![CI](https://github.com/myh2026/hsl-harness-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/myh2026/hsl-harness-lab/actions/workflows/ci.yml)
+
 > 用 [HSL（Harness Specification Language）](https://github.com/myh2026/harness-specification-language)
 > 实测撰写的两个 harness 项目 + 一份语法舒适度评估报告。
 > 目标：为毕业论文的两个候选方向提供可运行的实验基线。
@@ -11,6 +13,8 @@
 | `mathphys/` | 数理专攻 harness | 被测模型提交 Formula→Compute→Claim 解题步骤，harness 用量纲分析 + 独立重算 + 合理性检查逐步裁决（4 道力学题注入 2 个错误，全部捕获） | `bash mathphys/run-tests.sh` |
 | `armorlab/` | 网安破甲 harness（红蓝对抗） | 红队载荷 vs 蓝方防火墙，同时计量规避率与误报率，输出装甲评级与薄弱面备忘（7 攻击 6 拦截 1 穿透 + 1 误报） | `bash armorlab/run-tests.sh` |
 | `SYNTAX-REVIEW.md` | — | 语法舒适度实测评估（~700 行 HSL 撰写体验 + 8 个工具链缺陷实录 + 修复验证） | — |
+
+CI：push / PR 即时回归 + **每 15 分钟定时全链回归**（兄弟检出工具链仓库 main 分支——工具链升级 15 分钟内在此现形）；失败自动开 `scheduled-test-failure` 标签 Issue，恢复全绿自动评论并关闭。
 
 ## 环境要求
 
