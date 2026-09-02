@@ -1,0 +1,186 @@
+// main.hsl — MathPhysLab 入口：AgentLoop 分发 + 报告 + 物理层投射
+//
+// 拓扑：bank（题库/公式库）与 judge（裁决）是节点；
+//       Formula 动作让 judge 咨询 bank，Compute/Claim 是 judge 的自环验证。
+
+import { Dim, Problem, Move, Verdict, StepRecord, ScoreReport } from "./types.hsl";
+import { problem_bank } from "./formulas.hsl";
+import { judge_formula_v, judge_compute_v, judge_claim_v, verdict_record, formula_result_dim } from "./verifier.hsl";
+
+// ---- 剧本桥：从 fixture 取下一步（插上 deepseek 即为真实模型）----
+
+fn next_move() -> Move {
+    let raw: String = native typescript {
+        const s = await $host.fixture.nextAct();
+        return s;
+    };
+    match parse_move(raw) {
+        Result::Ok(mv) => mv,
+        Result::Err(e) => Move::Done { summary: format!("协议违规：{}", e) },
+    }
+}
+
+fn parse_move(raw: String) -> Result<Move, String> {
+    let fields: HashMap<String, String> = native typescript {
+        const obj = JSON.parse(raw);
+        const out = new Map();
+        for (const [k, v] of Object.entries(obj)) out.set(k, String(v));
+        return out;
+    };
+    let step = fields.get(String::from("step")).unwrap_or(String::from(""));
+    let problem = fields.get(String::from("problem")).unwrap_or(String::from(""));
+    let value = fields.get(String::from("value")).unwrap_or(String::from("0")).parse::<f64>().unwrap_or(0.0);
+    let unit = fields.get(String::from("unit")).unwrap_or(String::from("scalar"));
+    if step == String::from("formula") {
+        Ok(Move::Formula { problem, name: fields.get(String::from("formula")).unwrap_or(String::from("")) })
+    } else if step == String::from("compute") {
+        Ok(Move::Compute { problem, value, unit })
+    } else if step == String::from("claim") {
+        Ok(Move::Claim { problem, value, unit })
+    } else if step == String::from("done") {
+        Ok(Move::Done { summary: fields.get(String::from("summary")).unwrap_or(String::from("")) })
+    } else {
+        Err(format!("未知 step: {}", step))
+    }
+}
+
+// ---- 报告渲染（纯函数）----
+
+fn render_report(report: ScoreReport) -> String {
+    let mut out = String::from("# MathPhysLab 数理推演验证报告\n\n");
+    out.push_str(format!("| # | 步骤 | 题目 | 裁决 | 说明 |\n").as_str());
+    out.push_str(format!("|---|---|---|---|---|\n").as_str());
+    for r in report.records {
+        out.push_str(format!("| {} | {} | {} | {} {} | {} |\n",
+            r.turn, r.step, r.problem,
+            if r.ok { String::from("✓") } else { String::from("✗") },
+            r.verdict, r.detail).as_str());
+    }
+    out.push_str(format!("\n**汇总**：{} 道题 · 公式 {} · 计算 {} · 结论 {} · **捕获错误 {}** · 最终正确 {}/{}\n",
+        report.problems, report.formulas_checked, report.computes_checked,
+        report.claims_checked, report.errors_caught, report.final_correct, report.problems).as_str());
+    out
+}
+
+// ---- 编排主体：拓扑是一等公民 ----
+
+graph MathPhysLab(mut budget: i64) -> Result<ScoreReport, String> {
+    node bank: Vec<Problem> = problem_bank();   // 题库（judge 经由 edge 咨询）
+    node judge: () = ();                         // 裁决器（插件注入位）
+    let mut records: Vec<StepRecord> = Vec::new();
+    let mut formulas_checked: i64 = 0;
+    let mut computes_checked: i64 = 0;
+    let mut claims_checked: i64 = 0;
+    let mut errors_caught: i64 = 0;
+    let mut final_correct: i64 = 0;
+    let mut turn: i64 = 0;
+    let mut last_result_dim: Dim = Dim { m: 0, l: 0, t: 0 };
+    let mut formula_declared: bool = false;
+
+    edge judge -> bank on Move::Formula;      // 公式提案：裁决器咨询题库
+    edge judge -> judge on Move::Compute;     // 中间计算：裁决器自环验证
+    edge judge -> judge on Move::Claim;       // 最终结论：独立重算对账
+
+    loop {
+        if budget <= 0 {
+            break;                             // 预算闸门
+        }
+        turn += 1;
+        let mv = next_move();
+        match mv {
+            Move::Formula { problem, name } => {
+                let v = judge_formula_v(problem.clone(), name.clone());
+                let rec = verdict_record(v, turn, String::from("formula"), problem.clone());
+                match formula_result_dim(problem.clone(), name.clone()) {
+                    Option::Some(d) => { last_result_dim = d; formula_declared = true; },
+                    Option::None => { formula_declared = false; },
+                }
+                formulas_checked += 1;
+                if rec.ok == false { errors_caught += 1; }
+                records.push(rec);
+                budget -= 1;
+            },
+            Move::Compute { problem, value, unit } => {
+                let v = judge_compute_v(value, unit.clone(), last_result_dim.clone(), formula_declared);
+                let rec = verdict_record(v, turn, String::from("compute"), problem.clone());
+                computes_checked += 1;
+                if rec.ok == false { errors_caught += 1; }
+                records.push(rec);
+                budget -= 1;
+            },
+            Move::Claim { problem, value, unit } => {
+                let v = judge_claim_v(problem.clone(), value, unit.clone());
+                let rec = verdict_record(v, turn, String::from("claim"), problem.clone());
+                claims_checked += 1;
+                if rec.ok { final_correct += 1; }
+                if rec.ok == false { errors_caught += 1; }
+                records.push(rec);
+                budget -= 1;
+            },
+            Move::Done { summary } => {
+                println!("[done] {}", summary);
+                break;
+            },
+        }
+    }
+
+    Ok(ScoreReport {
+        problems: 4,
+        formulas_checked,
+        computes_checked,
+        claims_checked,
+        errors_caught,
+        final_correct,
+        records,
+    })
+}
+
+fn main() -> Result<(), String> {
+    let report = MathPhysLab::run(24)?;
+    let md = render_report(report);
+    println!("{}", md);
+    let written: bool = native typescript {
+        $host.artifacts.write("mathphys-report.md", md);
+        return true;
+    };
+    if written {
+        println!("[artifacts] mathphys-report.md 已写出");
+    }
+    Ok(())
+}
+
+scale = microkernel;
+
+block lab_config {
+lab:
+  name: MathPhysLab
+  mode: verification
+  problems: 4
+  tolerance_style: per-problem
+}
+
+block agent_instructions {
+# MathPhysLab 数理推演验证 harness
+
+被测模型按 Formula → Compute → Claim 协议提交解题步骤，
+harness 做量纲校验、独立重算与合理性检查，输出逐步裁决报告。
+}
+
+project {
+    // 核心协议类型双语言显式投射（R1：显式映射遮蔽规则，故 python 侧也需显式列出）
+    Dim     -> "gen/py/Dim.py"     : python,
+    Dim     -> "gen/ts/dim.ts"     : typescript,
+    Move    -> "gen/py/Move.py"    : python,
+    Move    -> "gen/ts/move.ts"    : typescript,
+    Verdict -> "gen/py/Verdict.py" : python,
+    Verdict -> "gen/ts/verdict.ts" : typescript,
+
+    rules {
+        struct -> "gen/py/{name}.py"  : python,
+        enum   -> "gen/py/{name}.py"  : python,
+        fn     -> "gen/py/{name}.py"  : python,
+        const  -> "gen/py/{name}.py"  : python,
+        graph  -> "gen/py/{name}.py"  : python,
+        block  -> "config/{name}.yml" : yaml,
+    }
+}

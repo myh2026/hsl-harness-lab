@@ -1,0 +1,85 @@
+// types.hsl — MathPhysLab 数理推演验证 harness · 类型契约层
+//
+// 设计原则：契约先于实现。所有跨模块数据形状集中在此，
+// 供 HSL 端逻辑与多后端投射共用（P-3/P-4 规则保证物理层合法）。
+
+// ---- 量纲（力学系：M^m · L^l · T^t）----
+
+export struct Dim {
+    m: i64,    // 质量指数
+    l: i64,    // 长度指数
+    t: i64,    // 时间指数
+}
+
+// ---- 物理量：数值 + 单位 + 量纲 ----
+
+export struct Quantity {
+    name: String,    // 给定量的名字（如 "v0" / "angle"）
+    value: f64,
+    unit: String,    // 原始单位串（如 "m/s"）
+    dim: Dim,
+}
+
+// ---- 题目：给定 + 所求量纲 + 容差 ----
+
+export struct Problem {
+    id: String,
+    topic: String,          // projectile / freefall / energy / pendulum
+    given: Vec<Quantity>,
+    ask: Dim,               // 期望答案的量纲
+    tolerance: f64,
+}
+
+// ---- 公式规格：名字 + 主题 + 量纲签名 ----
+
+export struct FormulaSpec {
+    name: String,
+    topic: String,
+    result: Dim,
+    ins: Vec<Dim>,
+}
+
+// ---- 动作协议：被测模型（或剧本）与 harness 的对话 ----
+
+export enum Move {
+    Formula { problem: String, name: String },
+    Compute { problem: String, value: f64, unit: String },
+    Claim { problem: String, value: f64, unit: String },
+    Done { summary: String },
+}
+
+// ---- 判定：harness 对模型每一步的裁决 ----
+
+export enum Verdict {
+    FormulaOk { result_dim: Dim },
+    FormulaUnknown { name: String },
+    FormulaIrrelevant { name: String, topic: String },
+    UnknownUnit { unit: String },
+    DimMismatch { expect: Dim, got: Dim },
+    NumericError { expect: f64, got: f64, tolerance: f64 },
+    SanityWarn { value: f64, reason: String },
+    Correct { value: f64 },
+}
+
+// ---- 逐步记录（报告的最小单元）----
+
+export struct StepRecord {
+    turn: i64,
+    step: String,       // formula / compute / claim
+    problem: String,
+    detail: String,
+    verdict: String,
+    ok: bool,
+}
+
+// ---- 汇总报告 ----
+
+export struct ScoreReport {
+    problems: i64,
+    formulas_checked: i64,
+    computes_checked: i64,
+    claims_checked: i64,
+    errors_caught: i64,
+    final_correct: i64,
+    records: Vec<StepRecord>,
+}

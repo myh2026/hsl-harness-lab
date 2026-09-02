@@ -1,0 +1,118 @@
+// formulas.hsl — 公式库与独立重算（蓝方验证的 ground truth）
+//
+// 关键设计：harness 不信任被测模型的推导，一切数值结论都由本模块
+// 按公式独立重算一遍（与模型路径无关），再与模型的 claim 对账。
+
+import { Dim, Problem, Quantity, FormulaSpec } from "./types.hsl";
+import { unit_dim } from "./units.hsl";
+import { sin, sqrt, PI } from "std/math";
+
+export const G: f64 = 9.8;    // 重力加速度（m/s2）
+
+// 量纲记号（局部构造，避免魔法数字散落）
+fn d_len() -> Dim { Dim { m: 0, l: 1, t: 0 } }
+fn d_time() -> Dim { Dim { m: 0, l: 0, t: 1 } }
+fn d_vel() -> Dim { Dim { m: 0, l: 1, t: -1 } }
+fn d_accel() -> Dim { Dim { m: 0, l: 1, t: -2 } }
+fn d_energy() -> Dim { Dim { m: 1, l: 2, t: -2 } }
+
+export fn formula_bank() -> Vec<FormulaSpec> {
+    vec![
+        FormulaSpec {
+            name: String::from("range_v2_sin2a_over_g"),
+            topic: String::from("projectile"),
+            result: d_len(),
+            ins: vec![d_vel(), d_vel(), d_accel()],
+        },
+        FormulaSpec {
+            name: String::from("v_sqrt_2gh"),
+            topic: String::from("freefall"),
+            result: d_vel(),
+            ins: vec![d_accel(), d_len()],
+        },
+        FormulaSpec {
+            name: String::from("ke_half_mv2"),
+            topic: String::from("energy"),
+            result: d_energy(),
+            ins: vec![d_len(), d_vel(), d_vel()],
+        },
+        FormulaSpec {
+            name: String::from("T_2pi_sqrt_L_over_g"),
+            topic: String::from("pendulum"),
+            result: d_time(),
+            ins: vec![d_len(), d_accel()],
+        },
+    ]
+}
+
+export fn given_value(given: Vec<Quantity>, name: String) -> Option<f64> {
+    for q in given {
+        if q.name == name { return Some(q.value); }
+    }
+    None
+}
+
+// 题库：4 道典型力学题
+export fn problem_bank() -> Vec<Problem> {
+    vec![
+        Problem {
+            id: String::from("projectile"),
+            topic: String::from("projectile"),
+            given: vec![
+                Quantity { name: String::from("v0"), value: 20.0, unit: String::from("m/s"), dim: unit_dim(String::from("m/s")) },
+                Quantity { name: String::from("angle"), value: 45.0, unit: String::from("deg"), dim: unit_dim(String::from("deg")) },
+            ],
+            ask: unit_dim(String::from("m")),
+            tolerance: 0.1,
+        },
+        Problem {
+            id: String::from("freefall"),
+            topic: String::from("freefall"),
+            given: vec![
+                Quantity { name: String::from("h"), value: 45.0, unit: String::from("m"), dim: unit_dim(String::from("m")) },
+            ],
+            ask: unit_dim(String::from("m/s")),
+            tolerance: 0.05,
+        },
+        Problem {
+            id: String::from("energy"),
+            topic: String::from("energy"),
+            given: vec![
+                Quantity { name: String::from("m"), value: 2.0, unit: String::from("kg"), dim: unit_dim(String::from("kg")) },
+                Quantity { name: String::from("v"), value: 3.0, unit: String::from("m/s"), dim: unit_dim(String::from("m/s")) },
+            ],
+            ask: unit_dim(String::from("J")),
+            tolerance: 0.01,
+        },
+        Problem {
+            id: String::from("pendulum"),
+            topic: String::from("pendulum"),
+            given: vec![
+                Quantity { name: String::from("L"), value: 1.0, unit: String::from("m"), dim: unit_dim(String::from("m")) },
+            ],
+            ask: unit_dim(String::from("s")),
+            tolerance: 0.01,
+        },
+    ]
+}
+
+// 独立重算：按问题主题选公式，完全不看模型的中间步骤
+export fn recompute(problem: Problem) -> f64 {
+    if problem.topic == String::from("projectile") {
+        let v0 = given_value(problem.given.clone(), String::from("v0")).unwrap_or(0.0);
+        let angle = given_value(problem.given.clone(), String::from("angle")).unwrap_or(0.0);
+        let rad = angle * PI / 180.0;
+        v0 * v0 * sin(2.0 * rad) / G
+    } else if problem.topic == String::from("freefall") {
+        let h = given_value(problem.given.clone(), String::from("h")).unwrap_or(0.0);
+        sqrt(2.0 * G * h)
+    } else if problem.topic == String::from("energy") {
+        let m = given_value(problem.given.clone(), String::from("m")).unwrap_or(0.0);
+        let v = given_value(problem.given.clone(), String::from("v")).unwrap_or(0.0);
+        0.5 * m * v * v
+    } else {
+        // pendulum（未知主题同样按单摆处理 —— 题库封闭，无外部输入）
+        let l = given_value(problem.given.clone(), String::from("L")).unwrap_or(0.0);
+        2.0 * PI * sqrt(l / G)
+    }
+}

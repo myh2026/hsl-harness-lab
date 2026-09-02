@@ -1,0 +1,237 @@
+// main.hsl — ArmorLab 入口：红蓝对抗编排 + 计分 + 物理层投射
+//
+// 拓扑：red（红队模型注入位，Box<dyn RedTeamModel>）攻击 blue（防火墙）；
+//       Probe 请求同样过 blue（测误报面）；scorer 汇总评级。
+
+import { Move, Verdict, RoundLog, ScoreReport } from "./types.hsl";
+import { inspect_payload } from "./defense.hsl";
+
+// ---- 红队模型协议：剧本可换真实 LLM（dsh 的 ModelProvider 同款模式）----
+
+export trait RedTeamModel {
+    fn next_move(self) -> String;    // 返回原始 JSON 动作串
+}
+
+export struct ScriptedRedTeam { session: i64 }
+
+impl RedTeamModel for ScriptedRedTeam {
+    fn next_move(self) -> String {
+        let raw: String = native typescript {
+            const s = await $host.fixture.nextAct();
+            return s;
+        };
+        raw
+    }
+}
+
+fn parse_move(raw: String) -> Result<Move, String> {
+    let fields: HashMap<String, String> = native typescript {
+        const obj = JSON.parse(raw);
+        const out = new Map();
+        for (const [k, v] of Object.entries(obj)) out.set(k, String(v));
+        return out;
+    };
+    let mv = fields.get(String::from("move")).unwrap_or(String::from(""));
+    let label = fields.get(String::from("label")).unwrap_or(String::from(""));
+    let payload = fields.get(String::from("payload")).unwrap_or(String::from(""));
+    let tactic = fields.get(String::from("tactic")).unwrap_or(String::from(""));
+    if mv == String::from("attack") {
+        Ok(Move::Attack { payload, tactic, label })
+    } else if mv == String::from("probe") {
+        Ok(Move::Probe { payload, label })
+    } else if mv == String::from("done") {
+        Ok(Move::Done { summary: fields.get(String::from("summary")).unwrap_or(String::from("")) })
+    } else {
+        Err(format!("未知 move: {}", mv))
+    }
+}
+
+// ---- 蓝方回合裁决 → 日志（协议在 fn，分发在 loop）----
+
+fn judge_attack(payload: String, tactic: String, label: String, turn: i64) -> RoundLog {
+    let v = inspect_payload(payload.clone());
+    match v {
+        Verdict::Blocked { rule } => RoundLog {
+            turn,
+            kind: String::from("attack"),
+            label,
+            tactic,
+            verdict: format!("Blocked({})", rule),
+            ok: true,
+        },
+        Verdict::Passed => RoundLog {
+            turn,
+            kind: String::from("attack"),
+            label,
+            tactic,
+            verdict: String::from("Passed"),
+            ok: false,    // 攻击穿透 = 装甲失守
+        },
+    }
+}
+
+fn judge_probe(payload: String, label: String, turn: i64) -> RoundLog {
+    let v = inspect_payload(payload.clone());
+    match v {
+        Verdict::Blocked { rule } => RoundLog {
+            turn,
+            kind: String::from("probe"),
+            label,
+            tactic: String::from("benign"),
+            verdict: format!("Blocked({})", rule),
+            ok: false,    // 良性被拦 = 误报
+        },
+        Verdict::Passed => RoundLog {
+            turn,
+            kind: String::from("probe"),
+            label,
+            tactic: String::from("benign"),
+            verdict: String::from("Passed"),
+            ok: true,
+        },
+    }
+}
+
+// ---- 报告渲染 ----
+
+fn render_report(report: ScoreReport) -> String {
+    let mut out = String::from("# ArmorLab 红蓝对抗报告\n\n");
+    out.push_str(format!("| # | 类型 | 标签 | 战术 | 裁决 | 蓝方 |\n").as_str());
+    out.push_str(format!("|---|---|---|---|---|---|\n").as_str());
+    for l in report.logs {
+        out.push_str(format!("| {} | {} | {} | {} | {} | {} |\n",
+            l.turn, l.kind, l.label, l.tactic, l.verdict,
+            if l.ok { String::from("✓") } else { String::from("✗") }).as_str());
+    }
+    out.push_str(format!("\n**计分**：攻击 {}（拦截 {} / 穿透 {}） · 探针 {}（误报 {}） · 规避率 {:.3} · 误报率 {:.3}\n",
+        report.attacks, report.blocked, report.evaded,
+        report.benign, report.false_positive,
+        report.evasion_rate, report.fp_rate).as_str());
+    out.push_str(format!("\n**装甲评级**：{}\n", report.rating).as_str());
+    for n in report.notes {
+        out.push_str(format!("- ⚠ {}\n", n).as_str());
+    }
+    out
+}
+
+// ---- 编排主体 ----
+
+graph ArmorLab(mut budget: i64) -> Result<ScoreReport, String> {
+    node red: Box<dyn RedTeamModel> = Box::new(ScriptedRedTeam { session: 1 });
+    node blue: () = ();      // 防火墙插件注入位（inspect 适配真实 WAP/WAF）
+    node scorer: () = ();    // 计分器插件注入位
+
+    edge red -> blue on Move::Attack;     // 攻击注入防火墙
+    edge red -> blue on Move::Probe;      // 探针同样过防火墙（测误报面）
+    edge blue -> scorer on Verdict::Blocked;
+    edge blue -> scorer on Verdict::Passed;
+
+    let mut logs: Vec<RoundLog> = Vec::new();
+    let mut attacks: i64 = 0;
+    let mut blocked: i64 = 0;
+    let mut evaded: i64 = 0;
+    let mut benign: i64 = 0;
+    let mut false_positive: i64 = 0;
+    let mut turn: i64 = 0;
+
+    loop {
+        if budget <= 0 {
+            break;    // 预算闸门
+        }
+        turn += 1;
+        let raw = red.next_move();
+        let mv = match parse_move(raw) {
+            Result::Ok(m) => m,
+            Result::Err(e) => Move::Done { summary: format!("协议违规：{}", e) },
+        };
+        match mv {
+            Move::Attack { payload, tactic, label } => {
+                let log = judge_attack(payload, tactic, label, turn);
+                if log.ok { blocked += 1; } else { evaded += 1; }
+                attacks += 1;
+                logs.push(log);
+                budget -= 1;
+            },
+            Move::Probe { payload, label } => {
+                let log = judge_probe(payload, label, turn);
+                if log.ok { benign += 1; } else { false_positive += 1; }
+                logs.push(log);
+                budget -= 1;
+            },
+            Move::Done { summary } => {
+                println!("[done] {}", summary);
+                break;
+            },
+        }
+    }
+
+    // 规避率 / 误报率（零除保护）
+    let evasion_rate = if attacks > 0 { evaded as f64 / attacks as f64 } else { 0.0 };
+    let fp_rate = if benign + false_positive > 0 { false_positive as f64 / (benign + false_positive) as f64 } else { 0.0 };
+
+    // 评级与改进备忘
+    let rating = if evasion_rate > 0.25 {
+        String::from("FAIL-evasion（规避率超阈，装甲不达标）")
+    } else if fp_rate > 0.25 {
+        String::from("FAIL-false-positive（误报率超阈，可用性受损）")
+    } else if evasion_rate > 0.1 || fp_rate > 0.1 {
+        String::from("PASS-with-warnings（达标但有薄弱面，见备忘）")
+    } else {
+        String::from("PASS（装甲完整）")
+    };
+
+    let mut notes: Vec<String> = Vec::new();
+    if evaded > 0 {
+        notes.push(format!("有 {} 条攻击穿透：双重编码（%25xx）绕过单遍解码签名 —— 建议增加递归解码归一化", evaded));
+    }
+    if false_positive > 0 {
+        notes.push(format!("有 {} 条良性探针被拦截：traversal-dotdot 规则误伤路径规范化语境 —— 建议上下文白名单", false_positive));
+    }
+
+    Ok(ScoreReport { attacks, blocked, evaded, benign, false_positive, evasion_rate, fp_rate, rating, notes, logs })
+}
+
+fn main() -> Result<(), String> {
+    let report = ArmorLab::run(24)?;
+    let md = render_report(report);
+    println!("{}", md);
+    let written: bool = native typescript {
+        $host.artifacts.write("armorlab-report.md", md);
+        return true;
+    };
+    if written {
+        println!("[artifacts] armorlab-report.md 已写出");
+    }
+    Ok(())
+}
+
+scale = microkernel;
+
+block armor_config {
+armorlab:
+  rules: 18
+  budget: 24
+  thresholds:
+    evasion: 0.25
+    false_positive: 0.25
+}
+
+block agent_instructions {
+# ArmorLab 红蓝对抗 harness
+
+红队按 Attack/Probe/Done 协议提交载荷，蓝方防火墙裁决，
+harness 输出规避率、误报率与装甲评级。替换 defense::inspect
+即可对真实 WAF / AI 守门代理执行同一拓扑的破甲演练。
+}
+
+project {
+    rules {
+        struct -> "gen/py/{name}.py"  : python,
+        enum   -> "gen/py/{name}.py"  : python,
+        fn     -> "gen/py/{name}.py"  : python,
+        const  -> "gen/py/{name}.py"  : python,
+        graph  -> "gen/py/{name}.py"  : python,
+        trait  -> "gen/ts/{name}.ts"  : typescript,
+        block  -> "config/{name}.yml" : yaml,
+    }
+}

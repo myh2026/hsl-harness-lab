@@ -1,0 +1,18 @@
+{
+  "acts": [
+    "{\"step\":\"formula\",\"problem\":\"projectile\",\"formula\":\"range_v2_sin2a_over_g\"}",
+    "{\"step\":\"compute\",\"problem\":\"projectile\",\"value\":163.3,\"unit\":\"m2\"}",
+    "{\"step\":\"claim\",\"problem\":\"projectile\",\"value\":40.82,\"unit\":\"m\"}",
+    "{\"step\":\"formula\",\"problem\":\"freefall\",\"formula\":\"v_sqrt_2gh\"}",
+    "{\"step\":\"compute\",\"problem\":\"freefall\",\"value\":29.7,\"unit\":\"m/s\"}",
+    "{\"step\":\"claim\",\"problem\":\"freefall\",\"value\":31.2,\"unit\":\"m/s\"}",
+    "{\"step\":\"formula\",\"problem\":\"energy\",\"formula\":\"ke_half_mv2\"}",
+    "{\"step\":\"compute\",\"problem\":\"energy\",\"value\":9.0,\"unit\":\"J\"}",
+    "{\"step\":\"claim\",\"problem\":\"energy\",\"value\":9.0,\"unit\":\"J\"}",
+    "{\"step\":\"formula\",\"problem\":\"pendulum\",\"formula\":\"T_2pi_sqrt_L_over_g\"}",
+    "{\"step\":\"compute\",\"problem\":\"pendulum\",\"value\":2.007,\"unit\":\"s\"}",
+    "{\"step\":\"claim\",\"problem\":\"pendulum\",\"value\":2.007,\"unit\":\"s\"}",
+    "{\"step\":\"done\",\"summary\":\"已提交 4 题解答\"}"
+  ],
+  "reviews": []
+}

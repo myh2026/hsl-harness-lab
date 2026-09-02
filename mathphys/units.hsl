@@ -1,0 +1,56 @@
+// units.hsl — 量纲代数与单位解析（纯逻辑层，可独立单测）
+
+import { Dim } from "./types.hsl";
+
+export const DIM_SCALAR: Dim = Dim { m: 0, l: 0, t: 0 };
+
+export fn dim_eq(a: Dim, b: Dim) -> bool {
+    a.m == b.m && a.l == b.l && a.t == b.t
+}
+
+export fn dim_mul(a: Dim, b: Dim) -> Dim {
+    Dim { m: a.m + b.m, l: a.l + b.l, t: a.t + b.t }
+}
+
+export fn dim_div(a: Dim, b: Dim) -> Dim {
+    Dim { m: a.m - b.m, l: a.l - b.l, t: a.t - b.t }
+}
+
+export fn dim_pow(a: Dim, n: i64) -> Dim {
+    Dim { m: a.m * n, l: a.l * n, t: a.t * n }
+}
+
+export fn dim_to_str(d: Dim) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if d.m != 0 { parts.push(format!("M^{}", d.m)); }
+    if d.l != 0 { parts.push(format!("L^{}", d.l)); }
+    if d.t != 0 { parts.push(format!("T^{}", d.t)); }
+    if parts.len() == 0 {
+        String::from("scalar")
+    } else {
+        parts.join(String::from(" "))
+    }
+}
+
+// 单位白名单：已知单位表（未知单位会在 check_unit 阶段被拒绝）
+export fn unit_known(unit: String) -> bool {
+    unit == String::from("m") || unit == String::from("m2") || unit == String::from("s")
+        || unit == String::from("kg") || unit == String::from("m/s") || unit == String::from("m/s2")
+        || unit == String::from("N") || unit == String::from("J")
+        || unit == String::from("deg") || unit == String::from("rad")
+        || unit == String::from("scalar")
+}
+
+export fn unit_dim(unit: String) -> Dim {
+    if unit == String::from("m") { Dim { m: 0, l: 1, t: 0 } }
+    else if unit == String::from("m2") { Dim { m: 0, l: 2, t: 0 } }
+    else if unit == String::from("s") { Dim { m: 0, l: 0, t: 1 } }
+    else if unit == String::from("kg") { Dim { m: 1, l: 0, t: 0 } }
+    else if unit == String::from("m/s") { Dim { m: 0, l: 1, t: -1 } }
+    else if unit == String::from("m/s2") { Dim { m: 0, l: 1, t: -2 } }
+    else if unit == String::from("N") { Dim { m: 1, l: 1, t: -2 } }
+    else if unit == String::from("J") { Dim { m: 1, l: 2, t: -2 } }
+    else if unit == String::from("deg") { Dim { m: 0, l: 0, t: 0 } }
+    else if unit == String::from("rad") { Dim { m: 0, l: 0, t: 0 } }
+    else { Dim { m: 0, l: 0, t: 0 } }
+}

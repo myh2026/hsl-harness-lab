@@ -1,0 +1,43 @@
+// types.hsl — ArmorLab 红蓝对抗 harness · 类型契约层
+//
+// 破甲 harness：红队提交攻击/探针载荷，蓝方防火墙裁决，
+// harness 记录回合并给出规避率 / 误报率与装甲评级。
+
+export struct FirewallRule {
+    id: String,        // 规则标识（裁决与报告引用）
+    family: String,    // sqli / xss / traversal / injection / encoding / anomaly
+    pattern: String,   // 小写签名（经 normalize 后匹配）
+}
+
+export enum Move {
+    Attack { payload: String, tactic: String, label: String },
+    Probe { payload: String, label: String },
+    Done { summary: String },
+}
+
+export enum Verdict {
+    Blocked { rule: String },
+    Passed,
+}
+
+export struct RoundLog {
+    turn: i64,
+    kind: String,       // attack / probe
+    label: String,
+    tactic: String,
+    verdict: String,    // Blocked(rule) / Passed
+    ok: bool,           // 蓝方视角：攻击被拦或探针放行 = true
+}
+
+export struct ScoreReport {
+    attacks: i64,
+    blocked: i64,
+    evaded: i64,
+    benign: i64,
+    false_positive: i64,
+    evasion_rate: f64,
+    fp_rate: f64,
+    rating: String,     // PASS / PASS-with-warnings / FAIL-evasion / FAIL-false-positive
+    notes: Vec<String>,
+    logs: Vec<RoundLog>,
+}

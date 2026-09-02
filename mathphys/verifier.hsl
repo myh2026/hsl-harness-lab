@@ -1,0 +1,176 @@
+// verifier.hsl — 裁决层：把 Verdict 展平成 StepRecord（AgentLoop 只分发 Move）
+//
+// 分层理由：graph AgentLoop 内的枚举 match 禁止 _ 通配兜底（S-6 铁律），
+// 因此把对 8 种 Verdict 的穷尽处理收敛在本模块的普通函数里，
+// 主循环只对 4 种 Move 显式分发 —— 这正是 dsh 示例「协议在 fn、分发在 loop」的惯用法。
+
+import { Dim, Problem, Verdict, StepRecord, FormulaSpec } from "./types.hsl";
+import { dim_eq, dim_to_str, unit_dim, unit_known } from "./units.hsl";
+import { formula_bank, problem_bank, recompute } from "./formulas.hsl";
+
+fn find_problem(bank: Vec<Problem>, id: String) -> Option<Problem> {
+    for p in bank {
+        if p.id == id { return Some(p); }
+    }
+    None
+}
+
+fn find_formula(bank: Vec<FormulaSpec>, name: String) -> Option<FormulaSpec> {
+    for f in bank {
+        if f.name == name { return Some(f); }
+    }
+    None
+}
+
+// 量纲合法的物理量域：|value| 超过 1e12 视为失真（sanity 上限）
+fn sane(value: f64) -> bool {
+    value == value && value.abs() < 1000000000000.0
+}
+
+// ---- 三类裁决入口（返回 Verdict）----
+
+export fn judge_formula_v(problem_id: String, name: String) -> Verdict {
+    let problem = find_problem(problem_bank(), problem_id.clone());
+    let formula = find_formula(formula_bank(), name.clone());
+    match formula {
+        Option::Some(f) => {
+            match problem {
+                Option::Some(p) => {
+                    if f.topic == p.topic {
+                        Verdict::FormulaOk { result_dim: f.result }
+                    } else {
+                        Verdict::FormulaIrrelevant { name: name.clone(), topic: p.topic }
+                    }
+                },
+                Option::None => Verdict::FormulaOk { result_dim: f.result },
+            }
+        },
+        Option::None => Verdict::FormulaUnknown { name: name.clone() },
+    }
+}
+
+export fn judge_compute_v(value: f64, unit: String, expect: Dim, formula_declared: bool) -> Verdict {
+    if !unit_known(unit.clone()) {
+        return Verdict::UnknownUnit { unit: unit.clone() };
+    }
+    let got = unit_dim(unit.clone());
+    if formula_declared && !dim_eq(got, expect) {
+        return Verdict::DimMismatch { expect: expect.clone(), got: got.clone() };
+    }
+    if !sane(value) {
+        return Verdict::SanityWarn { value, reason: String::from("数值非有限或量级失真") };
+    }
+    Verdict::Correct { value }
+}
+
+export fn judge_claim_v(problem_id: String, value: f64, unit: String) -> Verdict {
+    let problem = find_problem(problem_bank(), problem_id.clone());
+    match problem {
+        Option::Some(p) => {
+            if !unit_known(unit.clone()) {
+                return Verdict::UnknownUnit { unit: unit.clone() };
+            }
+            let got = unit_dim(unit.clone());
+            if !dim_eq(got, p.ask) {
+                return Verdict::DimMismatch { expect: p.ask.clone(), got: got.clone() };
+            }
+            if !sane(value) || value < 0.0 {
+                return Verdict::SanityWarn { value, reason: String::from("物理量应为非负有限值") };
+            }
+            let expected = recompute(p.clone());
+            if (value - expected).abs() > p.tolerance {
+                return Verdict::NumericError { expect: expected, got: value, tolerance: p.tolerance };
+            }
+            Verdict::Correct { value }
+        },
+        Option::None => Verdict::FormulaUnknown { name: problem_id.clone() },
+    }
+}
+
+// ---- Verdict → StepRecord 展平（普通函数，允许穷尽列出全部 8 变体）----
+
+export fn verdict_record(v: Verdict, turn: i64, step: String, problem: String) -> StepRecord {
+    match v {
+        Verdict::FormulaOk { result_dim } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("结果量纲 {}", dim_to_str(result_dim)),
+            verdict: String::from("FormulaOk"),
+            ok: true,
+        },
+        Verdict::FormulaUnknown { name } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("公式 {} 不在公式库中", name),
+            verdict: String::from("FormulaUnknown"),
+            ok: false,
+        },
+        Verdict::FormulaIrrelevant { name, topic } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("公式 {} 与题目主题 {} 不符", name, topic),
+            verdict: String::from("FormulaIrrelevant"),
+            ok: false,
+        },
+        Verdict::UnknownUnit { unit } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("单位 {} 不在单位表白名单", unit),
+            verdict: String::from("UnknownUnit"),
+            ok: false,
+        },
+        Verdict::DimMismatch { expect, got } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("量纲失配：期望 {} 实得 {}", dim_to_str(expect), dim_to_str(got)),
+            verdict: String::from("DimMismatch"),
+            ok: false,
+        },
+        Verdict::NumericError { expect, got, tolerance } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("数值超差：期望 {:.3} 实得 {:.3}（容差 {}）", expect, got, tolerance),
+            verdict: String::from("NumericError"),
+            ok: false,
+        },
+        Verdict::SanityWarn { value, reason } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("合理性警告：{}（value={}）", reason, value),
+            verdict: String::from("SanityWarn"),
+            ok: false,
+        },
+        Verdict::Correct { value } => StepRecord {
+            turn,
+            step: step.clone(),
+            problem: problem.clone(),
+            detail: format!("通过（value={}）", value),
+            verdict: String::from("Correct"),
+            ok: true,
+        },
+    }
+}
+
+// 公式上下文提取：AgentLoop 内维护 last_result_dim 用（Option 双臂穷尽）
+export fn formula_result_dim(problem_id: String, name: String) -> Option<Dim> {
+    let problem = find_problem(problem_bank(), problem_id.clone());
+    let formula = find_formula(formula_bank(), name.clone());
+    match formula {
+        Option::Some(f) => {
+            match problem {
+                Option::Some(p) => {
+                    if f.topic == p.topic { Option::Some(f.result) } else { Option::None }
+                },
+                Option::None => Option::Some(f.result),
+            }
+        },
+        Option::None => Option::None,
+    }
+}

@@ -1,0 +1,61 @@
+// defense.hsl — 蓝方防火墙引擎（被测目标，纯 HSL 实现）
+//
+// 设计意图：这是一个「可替换的靶标」。把 inspect_payload() 换成对真实 WAF /
+// AI 守门代理的适配（native 块走 HTTP 或 $host.llm），图拓扑与计分
+// 完全不变 —— 这正是 harness 的分层价值。
+
+import { FirewallRule, Verdict } from "./types.hsl";
+
+// 归一化：小写化 + 剥离 SQL 注释碎片（/**/ 拼接攻击）
+export fn normalize(raw: String) -> String {
+    let lowered = raw.to_lowercase();
+    lowered.replace(String::from("/**/"), String::from(""))
+}
+
+// 规则表：有序签名匹配（首条命中即裁决）
+export fn firewall_rules() -> Vec<FirewallRule> {
+    vec![
+        FirewallRule { id: String::from("sqli-quote-or"),   family: String::from("sqli"),      pattern: String::from("' or 1=1") },
+        FirewallRule { id: String::from("sqli-union"),      family: String::from("sqli"),      pattern: String::from("union select") },
+        FirewallRule { id: String::from("sqli-drop"),       family: String::from("sqli"),      pattern: String::from("; drop table") },
+        FirewallRule { id: String::from("xss-script"),      family: String::from("xss"),       pattern: String::from("<script") },
+        FirewallRule { id: String::from("xss-onerror"),     family: String::from("xss"),       pattern: String::from("onerror=") },
+        FirewallRule { id: String::from("xss-js-uri"),      family: String::from("xss"),       pattern: String::from("javascript:") },
+        FirewallRule { id: String::from("traversal-dotdot"), family: String::from("traversal"), pattern: String::from("../") },
+        FirewallRule { id: String::from("traversal-enc"),   family: String::from("traversal"), pattern: String::from("%2e%2e") },
+        FirewallRule { id: String::from("inject-ignore-prev"), family: String::from("injection"), pattern: String::from("ignore previous instructions") },
+        FirewallRule { id: String::from("inject-ignore-all"),  family: String::from("injection"), pattern: String::from("ignore all previous") },
+        FirewallRule { id: String::from("inject-sysprompt"),   family: String::from("injection"), pattern: String::from("system prompt") },
+        FirewallRule { id: String::from("inject-dan"),          family: String::from("injection"), pattern: String::from("you are now dan") },
+        FirewallRule { id: String::from("inject-devmode"),      family: String::from("injection"), pattern: String::from("developer mode") },
+        FirewallRule { id: String::from("enc-quote"),        family: String::from("encoding"),  pattern: String::from("%27") },
+        FirewallRule { id: String::from("enc-lt"),           family: String::from("encoding"),  pattern: String::from("%3c") },
+        FirewallRule { id: String::from("frag-base64"),      family: String::from("encoding"),  pattern: String::from("base64_decode") },
+        FirewallRule { id: String::from("frag-atob"),        family: String::from("encoding"),  pattern: String::from("eval(atob(") },
+        FirewallRule { id: String::from("uni-escape"),       family: String::from("encoding"),  pattern: r"\u003c" },
+    ]
+}
+
+// 裁决：归一化 → 逐条签名 → 长度异常兜底
+export fn inspect_payload(raw: String) -> Verdict {
+    let p = normalize(raw.clone());
+    let hits = firewall_rules().filter(|r| p.contains(r.pattern.clone()));
+    match hits.first() {
+        Option::Some(r) => Verdict::Blocked { rule: r.id.clone() },
+        Option::None => {
+            if p.len() > 512 {
+                Verdict::Blocked { rule: String::from("anomaly-length") }
+            } else {
+                Verdict::Passed
+            }
+        },
+    }
+}
+
+// 裁决的可读化（报告用）
+export fn verdict_text(v: Verdict) -> String {
+    match v {
+        Verdict::Blocked { rule } => format!("Blocked({})", rule),
+        Verdict::Passed => String::from("Passed"),
+    }
+}
