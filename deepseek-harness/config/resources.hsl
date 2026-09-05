@@ -8,15 +8,13 @@
 import { DEFAULT_MAX_TURNS, DEFAULT_MAX_BASH, DEFAULT_MAX_OUTPUT } from "../types/state.hsl";
 
 /// 系统提示词主体（identity 分节；注入 LLM 的完整协议说明）。
+/// 工具面完整 schema 由 prompt.hsl 的 tools 分节从 registered_calls()
+/// 同源渲染（此处只保留协议示例，避免双份清单漂移）。
 export block SYSTEM_PROMPT {
 You are DSH, a coding agent harness assembled from plugins. You complete tasks in a workspace by calling tools.
 
 # Tools
-- read_file: {"action": "tool", "tool": "read_file", "path": "<relative path>"}
-- write_file: {"action": "tool", "tool": "write_file", "path": "<relative path>", "content": "<full file content>"}
-- edit_file: {"action": "tool", "tool": "edit_file", "path": "<relative path>", "old_text": "<exact existing text>", "new_text": "<replacement>"}
-- bash: {"action": "tool", "tool": "bash", "command": "<shell command>"}
-- list_files: {"action": "tool", "tool": "list_files"}
+The tools section below lists every registered tool with its JSON call format.
 
 # Protocol (CRITICAL)
 Every turn you respond with EXACTLY ONE JSON object. No prose. No markdown fences.
@@ -27,8 +25,9 @@ Wrong example: {"action": "read_file", "path": "stats.ts"}
 # Rules
 1. Inspect before editing: read_file first, then edit with minimal diffs.
 2. Verify your work: run the tests with bash when possible.
-3. When the task is complete, respond: {"action": "done", "summary": "<what you did>"}.
-4. Budget: at most {{DEFAULT_MAX_BASH}} bash calls. Keep commands short and safe.
+3. Long tasks: maintain a todo_write list; delegate isolated work to subagent / workflow / ralph.
+4. When the task is complete, respond: {"action": "done", "summary": "<what you did>"}.
+5. Budget: at most {{DEFAULT_MAX_BASH}} bash calls. Keep commands short and safe.
 }
 
 /// 审查者判据（review 分节；独立闸门的裁决标准）。
@@ -69,7 +68,7 @@ export static EVENTS_SCHEMA {
     "type": "object",
     "required": ["name"],
     "properties": {
-      "name": { "type": "string", "enum": ["run_start", "turn_opened", "prompt_assembled", "model_replied", "tool_dispatched", "tool_guarded", "turn_closed", "review_verdict", "run_end"] },
+      "name": { "type": "string", "enum": ["run_start", "turn_opened", "prompt_assembled", "model_replied", "tool_dispatched", "tool_guarded", "turn_closed", "review_verdict", "budget_exhausted", "run_end", "todo_updated", "skill_catalog_published", "skill_loaded", "goal_created", "goal_updated", "goal_round_started", "subagent_spawned", "subagent_replied", "job_spawned", "job_notice_delivered", "web_searched", "web_fetched", "approval_resolved", "checkpoint_taken", "checkpoint_restored", "tool_results_pruned", "compacted", "plan_mode_changed", "plan_presented", "feedback_recorded", "user_question_answered", "tool_timed_out", "repeat_reminded", "command_run"] },
       "data": { "type": "object" }
     }
   }

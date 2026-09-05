@@ -1,0 +1,48 @@
+// ============================================================================
+// franxagent/tools/mcp.hsl — MCP 外部工具转发臂（"server/tool" 形态）
+// ============================================================================
+// FranxAgent 原架构对应：knowledge/loader.py 的 tools() "/" 分支 +
+// knowledge/mcps.py 的 MCPStdioClient——config.json 声明 mcp_servers，
+// 路由层把 "server_name/tool_name" 形态的调用转发给对应 stdio 客户端；
+// 未声明的 server → "Error: Unknown MCP tool {name}"。
+// HSL 契约层的诚实边界：
+// 1. 转发臂与配置面完整（router 不纠偏带 "/" 的名字；mcp_servers
+//    由 config 声明驱动裁决）；
+// 2. 真实 stdio JSON-RPC 客户端（initialize 握手 / 长连接 / 多路复用）
+//    需要 Web 适配层管理子进程生命周期——超出 HSL 契约层范围，
+//    已配置的 server 返回明确的范围外说明（模型可见，可改道）。
+// ============================================================================
+
+import { ToolOutcome } from "../types/messages.hsl";
+import { FranxConfig } from "../types/state.hsl";
+
+/// MCP 转发臂：按 config.mcp_servers 裁决 "server/tool" 调用。
+export fn tool_mcp(config: FranxConfig, call_id: String, server: String, tool: String, arguments: String) -> ToolOutcome {
+    let full_name = format!("{}/{}", server, tool);
+    let configured = config.mcp_servers.contains(server.clone());
+    if configured == false {
+        // 原版语义：Error: Unknown MCP tool {tool_name}
+        ToolOutcome {
+            call_id,
+            tool: String::from("mcp"),
+            ok: false,
+            output: format!(
+                "Error: Unknown MCP tool {}（server \"{}\" 未在 config 的 mcp_servers 中声明）",
+                full_name, server
+            ),
+            proposal: Option::None,
+        }
+    } else {
+        // 已配置：转发目标明确，但 stdio 客户端运行时属 web 适配层
+        ToolOutcome {
+            call_id,
+            tool: String::from("mcp"),
+            ok: false,
+            output: format!(
+                "MCP tool {} is configured and routed, but the stdio JSON-RPC client lives in the web adapter layer (out of HSL harness scope); arguments were not dispatched: {}",
+                full_name, arguments
+            ),
+            proposal: Option::None,
+        }
+    }
+}

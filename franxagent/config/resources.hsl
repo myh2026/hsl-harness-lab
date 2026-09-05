@@ -30,7 +30,9 @@ Plain text reply (no tool_calls) ends the turn.
 - command: {"command": "<shell command>"} → stdout/stderr
   DELETION IS FORBIDDEN: rm/del/rmdir/shred are rejected. Move to ./to-delete/ instead and log it.
 - search: {"query": "...", "max_results": 5} → DuckDuckGo results (free, no API key)
-- add_skill: {"name": "snake_case_name", "content": "markdown skill"} → remembered for future retrieval
+- time: {} → current local date and time ("2026-03-14 Saturday 15:30:45")
+- add_skill: {"name": "snake_case_name", "content": "markdown skill"} → written to skills/ and indexed immediately
+- External MCP tools use the format server_name/tool_name (configured servers only)
 
 # Usage principles
 1. Least privilege: use read/write for files; command only for real command-line tasks.
@@ -57,6 +59,6 @@ export static FRANX_CONFIG {
   "tools": {
     "ett": { "model": "glm-4.6v-flash", "max_retries": 20 }
   },
-  "mcp_servers": []
+  "mcp_servers": ["notes-mcp"]
 }
 }

@@ -1,0 +1,107 @@
+// ============================================================================
+// franxagent/memory/compress.hsl — memory()：上下文超限压缩
+// ============================================================================
+// FranxAgent 原架构对应：agent.py 的 memory() + _find_safe_cut_index +
+// 主回路的「上下文超限错误 → 压缩 → 重建 → continue」分支：
+// 1. 先清孤儿 tool 消息（clean_orphans）；
+// 2. 消息数 ≤ 5 → 不动（原版阈值）；
+// 3. 找最早安全切割点：不拆散任何 tool_call/tool_result 配对
+//   （配对 id 的 call 位与 result 位必须同在切点前或同在切点后）；
+// 4. 无安全点 / 安全点太靠边（≤1 或 ≥ len-1）→ 对半切（len/2+1）；
+// 5. 保留首条消息（原版的 system；我们的持久化历史首条 user 开场）
+//    + 切点之后的全部消息，再清一次孤儿（对半切可能拆散配对）。
+// is_context_overlimit：识别提供方的上下文超限错误文本
+// （"context length" / "token" / "too long"，小写包含匹配，与原版一致）。
+// ============================================================================
+
+import { Message } from "../types/messages.hsl";
+import { LlmError } from "../types/errors.hsl";
+import { clean_orphans } from "./persist.hsl";
+
+/// 上下文超限错误识别（原版 except 分支的判定条件）。
+export fn is_context_overlimit(err: LlmError) -> bool {
+    let msg = err.message.to_lowercase();
+    msg.contains(String::from("context length"))
+        || msg.contains(String::from("token"))
+        || msg.contains(String::from("too long"))
+}
+
+/// memory()：删除最旧消息的上下文压缩（纯函数；详见模块头）。
+export fn memory_compress(history: Vec<Message>) -> Vec<Message> {
+    // 1) 先清孤儿
+    let cleaned = clean_orphans(history);
+    // 2) 原版阈值：≤ 5 条不动
+    let len = cleaned.len();
+    if len <= 5 {
+        return cleaned;
+    }
+    // 3) 最早安全切割点（不拆散配对）
+    let cut_opt = find_safe_cut(cleaned.clone());
+    // 4) 无安全点 / 太靠边 → 对半切（len/2 + 1，原版公式）
+    let mut cut: u32 = len / 2 + 1;
+    match cut_opt {
+        Option::Some(c) => {
+            if c > 1 && c < len - 1 {
+                cut = c;
+            }
+        },
+        Option::None => {},
+    }
+    // 5) 保留首条 + 切点后消息，再清一次孤儿
+    let mut out: Vec<Message> = Vec::new();
+    out.push(cleaned[0].clone());
+    for m in cleaned.skip(cut) {
+        out.push(m);
+    }
+    clean_orphans(out)
+}
+
+/// _find_safe_cut_index：最早的安全切割下标（None = 无安全点）。
+/// 安全：对每个配对 id，call 位与 result 位要么都 < cut，要么都 ≥ cut。
+export fn find_safe_cut(history: Vec<Message>) -> Option<u32> {
+    // call 位：assistant 消息下标（按 id 记录；同 id 重复出现取后者，原版 dict 覆写语义）
+    let mut call_positions: HashMap<String, u32> = HashMap::new();
+    let mut result_positions: HashMap<String, u32> = HashMap::new();
+    for pair in history.clone().enumerate() {
+        let idx = pair[0];
+        let m = pair[1];
+        if m.role == String::from("assistant") {
+            for id in m.pair_ids() {
+                call_positions.insert(id, idx);
+            }
+        } else {
+            if m.role == String::from("tool") && m.pair.len() > 0 {
+                result_positions.insert(m.pair.clone(), idx);
+            }
+        }
+    }
+    // 只有双侧都在的 id 才影响安全性（原版 paired_ids = 交集）
+    let mut paired: Vec<String> = Vec::new();
+    for id in call_positions.keys() {
+        if result_positions.contains_key(id.clone()) {
+            paired.push(id);
+        }
+    }
+    // 原版：for cut_idx in range(2, len)
+    let len = history.len();
+    let mut cut: u32 = 2;
+    while cut < len {
+        let mut safe = true;
+        for id in paired.clone() {
+            let call_pos = call_positions.get(id.clone()).unwrap_or(0);
+            let result_pos = result_positions.get(id.clone()).unwrap_or(0);
+            let call_before = call_pos < cut;
+            let result_before = result_pos < cut;
+            if call_before != result_before {
+                // 配对跨越切点 → 不安全
+                safe = false;
+                break;
+            }
+        }
+        if safe {
+            return Option::Some(cut);
+        }
+        cut += 1;
+    }
+    Option::None
+}

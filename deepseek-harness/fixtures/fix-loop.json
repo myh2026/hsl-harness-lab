@@ -1,0 +1,29 @@
+{
+  "acts": [
+    "{\"action\": \"tool\", \"tool\": \"write_file\", \"path\": \"plan-out.md\", \"content\": \"# plan\\nfix variance + median\"}",
+    "{\"action\": \"done\", \"summary\": \"PLAN: 1) fix variance denominator to n-1 2) add median 3) run tests\"}",
+    "{\"action\": \"tool\", \"tool\": \"todo_write\", \"todos\": \"[{\\\"content\\\": \\\"fix variance\\\", \\\"status\\\": \\\"in_progress\\\"}, {\\\"content\\\": \\\"add median\\\", \\\"status\\\": \\\"pending\\\"}]\"}",
+    "{\"action\": \"tool\", \"tool\": \"edit_file\", \"path\": \"stats.ts\", \"old_text\": \"  return s / xs.length;\\n}\\n\\n// TODO: 缺失 median 实现\", \"new_text\": \"  return s / (xs.length - 1);\\n}\\n\\nexport function median(xs: number[]): number {\\n  if (xs.length === 0) return 0;\\n  const sorted = [...xs].sort((a, b) => a - b);\\n  const mid = Math.floor(sorted.length / 2);\\n  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;\\n}\"}",
+    "{\"action\": \"tool\", \"tool\": \"read_file\", \"path\": \"stats.ts\"}",
+    "{\"action\": \"done\", \"summary\": \"plan executed; checkpoint rollback verified (stats.ts reverted to pre-edit state)\"}"
+  ],
+  "reviews": [
+    "{\"verdict\": \"accept\"}"
+  ],
+  "tracks": {
+    "user": [
+      "/plan",
+      "",
+      "",
+      "",
+      "",
+      "/restore",
+      "",
+      "/feedback plan-mode gate and checkpoint rollback behaved as specified",
+      ""
+    ],
+    "approvals": [
+      "allow"
+    ]
+  }
+}

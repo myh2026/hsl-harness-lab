@@ -17,7 +17,7 @@
 import { PoemState, PoemResult, Phase } from "./types/poem.hsl";
 import { PoetModel, LlmPoet, ScriptedPoet } from "./providers/poet.hsl";
 import { Lexicon } from "./prosody/lexicon.hsl";
-import { get_template } from "./prosody/templates.hsl";
+import { get_template, template_keys } from "./prosody/templates.hsl";
 import { validate_draft_shape } from "./prosody/validator.hsl";
 import { WeaveKit, WeaveOutcome, parse_weave_call } from "./tools/weave.hsl";
 import { WRITER_GUIDE, CHECKER_GUIDE, WEAVER_CONFIG } from "./config/resources.hsl";
@@ -30,7 +30,9 @@ graph Stanza(topic: String, template_key: String) -> Result<PoemResult, WeaverEr
     node writer: Box<dyn PoetModel> = make_poet(String::from("writer"))?;
     node checker: Box<dyn PoetModel> = make_poet(String::from("checker"))?;
     node validator: Lexicon = Lexicon::new();
-    node weaver: WeaveKit = WeaveKit::new(Lexicon::new());
+    // weaver 装配 = 四工具执行器 + 词库后端（WeaveKit::open 镜像 app.py
+    // _auto_import：首次缺失时自动导入捆绑样例数据集，见 knowledge/importer.hsl）
+    node weaver: WeaveKit = WeaveKit::open();
 
     // 条件环（G3：环上每条边都带 on Guard）
     edge writer -> validator on Phase::DraftReady;
@@ -49,11 +51,17 @@ graph Stanza(topic: String, template_key: String) -> Result<PoemResult, WeaverEr
     let description = writer.clone().compose(desc_prompt).await?;
     state.description = description;
 
-    // ── Step 2：初稿（仅验行数 / 字数）──
+    // ── Step 2：初稿（仅验行数 / 每行音节数）──
     state.current_step = 2;
+    // zh 恒定字数模板沿用旧提示词（回归保持）；通用模板改用 describe() 内的逐行音节规格
+    let shape_line = if template.chars_per_line > 0 {
+        format!("写出初稿（{} 行，每行 {} 字）。只输出诗行，每行一行。", template.line_count, template.chars_per_line)
+    } else {
+        format!("写出初稿（共 {} 行，逐行音节数按上述格律要求）。只输出诗行，每行一行。", template.line_count)
+    };
     let draft_prompt = format!(
-        "主题描述：{}\n格律模板：{}\n写出初稿（{} 行，每行 {} 字）。只输出诗行，每行一行。",
-        state.description, template.clone().describe(), template.line_count, template.chars_per_line
+        "主题描述：{}\n格律模板：{}\n{}",
+        state.description, template.clone().describe(), shape_line
     );
     let draft_raw = writer.clone().compose(draft_prompt).await?;
     let draft = split_lines(draft_raw);
@@ -224,11 +232,35 @@ export fn main() -> Result<(), WeaverError> {
         const t = String($host.config.task);
         return t === "" ? "秋江夜泊" : t;
     };
-    let template_key: String = native typescript {
-        return "zh-wujue";
-    };
+    // 模板选择：原版来自 UI generate 事件的 template_key；剑本模式经 fixture
+    // config 轨道注入（缺省 zh-wujue —— 与 web 适配层约定一致）
+    let template_key = pick_template_key();
+    emit_templates_catalog(template_keys().len());
     let result = Stanza::run(topic, template_key)?;
     write_artifacts(result)
+}
+
+/// 从 fixture config 轨道读取模板键（未配置 → 缺省 zh-wujue）。
+fn pick_template_key() -> String {
+    let left: u32 = native typescript {
+        return $host.fixture.left("config");
+    };
+    if left > 0 {
+        let key: String = native typescript {
+            return await $host.fixture.next("config");
+        };
+        key
+    } else {
+        String::from("zh-wujue")
+    }
+}
+
+/// 模板目录事件（G6 观测：镜像原版 /api/templates 的 list_dicts 计数）。
+fn emit_templates_catalog(count: u32) {
+    native typescript {
+        $host.events.emit("templates", { count: count, source: "prosody/templates.hsl" });
+        return true;
+    };
 }
 
 fn write_artifacts(result: PoemResult) -> Result<(), WeaverError> {

@@ -1,0 +1,220 @@
+// ============================================================================
+// dsh/tools/jobs.hsl — job_spawn / job_output / job_list / job_kill
+// ============================================================================
+// deepseek-harness 原架构对应：packages/jobs（jobs-local + tool-jobs）——
+// 「kind 无关的后台任务三控制：job_output（增量读，[status: ...] 收尾）、
+// job_list（<id> [<kind>] <status> — <label>）、job_kill（终态 →
+// already-finished，快照随行）；任务完成时属主收到 in-session 通知，
+// 繁忙代理在下一步收到，一次通知而非每任务一回合」。
+// HSL 等价语义披露：宿主无线程/进程级后台原语，job_spawn 采取
+// 「登记后立即执行 + 结算态入表」的同步任务表语义——output/kill 的
+// 契约文案与通知注入行为逐字对齐，任务表存在于 RunState（会话内持久）。
+// ============================================================================
+
+import { Message, ToolResult } from "../types/messages.hsl";
+import { Policy, RunState, Job, DispatchOutcome } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+import { run_bash } from "./shell.hsl";
+import { cap_chars } from "./workspace.hsl";
+
+/// 任务完成通知运载（loop 顶注入 in-session 消息）。
+export struct NoticeDelivery {
+    state: RunState,
+    messages: Vec<Message>,
+    events: Vec<SessionEvent>,
+}
+
+/// job_spawn：登记 + 执行 + 结算（命令经门禁管线先行审批/白名单）。
+export fn job_spawn(policy: Policy, mut state: RunState, command: String) -> DispatchOutcome {
+    if command.trim().len() == 0 {
+        return DispatchOutcome {
+            state,
+            result: ToolResult { call: String::from("job_spawn"), ok: false, output: String::from("command must be a non-empty string"), duration_ms: 0 },
+            events: Vec::new(),
+        };
+    }
+    let id = (state.clone().jobs.len() + 1) as u32;
+    let outcome = run_bash(policy.clone(), command.clone());
+    let result = match outcome {
+        Ok(r) => r,
+        Err(e) => ToolResult { call: format!("bash {}", command), ok: false, output: e, duration_ms: 0 },
+    };
+    let job = Job {
+        id,
+        kind: String::from("bash"),
+        label: command.clone(),
+        status: String::from("exited"),
+        ok: result.ok,
+        output: result.output.clone(),
+        notice_delivered: false,
+    };
+    state.jobs.push(job);
+    DispatchOutcome {
+        state,
+        result: ToolResult {
+            call: format!("job_spawn {}", command),
+            ok: true,
+            output: format!("job {} started (kind: bash, command: {})", id, command),
+            duration_ms: 0,
+        },
+        events: vec![SessionEvent::JobSpawned { id, command }],
+    }
+}
+
+/// job_output：读任务输出（终态任务返回结算输出；每次响应以
+/// `[status: ...]` 收尾，对齐原版契约文案）。
+export fn job_output(policy: Policy, state: RunState, job_id: String, wait: bool, timeout_ms: u32) -> DispatchOutcome {
+    let id = job_id.parse::<u32>().unwrap_or(0);
+    let job = match find_job(state.clone(), id) {
+        Option::Some(j) => j,
+        Option::None => {
+            return DispatchOutcome {
+                state,
+                result: ToolResult {
+                    call: format!("job_output {}", job_id),
+                    ok: false,
+                    output: format!("job {} not found among your background jobs (call job_list first)", job_id),
+                    duration_ms: 0,
+                },
+                events: Vec::new(),
+            };
+        },
+    };
+    if job.status == String::from("running") {
+        let note = if wait {
+            format!("(waited up to {} ms; job still running — read again later)", timeout_ms)
+        } else {
+            String::from("(job still running — read again later or pass wait=true)")
+        };
+        return DispatchOutcome {
+            state,
+            result: ToolResult {
+                call: format!("job_output {}", job_id),
+                ok: true,
+                output: format!("{}\n[status: running]", note),
+                duration_ms: 0,
+            },
+            events: Vec::new(),
+        };
+    }
+    DispatchOutcome {
+        state,
+        result: ToolResult {
+            call: format!("job_output {}", job_id),
+            ok: true,
+            output: format!("{}\n[status: {}]", cap_chars(job.output, policy.max_output_chars), job.status),
+            duration_ms: 0,
+        },
+        events: Vec::new(),
+    }
+}
+
+/// job_list：`<id> [<kind>] <status> — <label>` 每任务一行。
+export fn job_list(state: RunState) -> DispatchOutcome {
+    let mut out = String::from("");
+    for j in state.clone().jobs {
+        out.push_str(format!("{} [{}] {} — {}\n", j.id, j.kind, j.status, j.label).as_str());
+    }
+    let output = if out.len() == 0 {
+        String::from("(no background jobs)")
+    } else {
+        out.trim_end()
+    };
+    DispatchOutcome {
+        state,
+        result: ToolResult { call: String::from("job_list"), ok: true, output, duration_ms: 0 },
+        events: Vec::new(),
+    }
+}
+
+/// job_kill：终态任务 → already-finished + 快照；运行中 → 请求取消。
+export fn job_kill(mut state: RunState, job_id: String, reason: String) -> DispatchOutcome {
+    let id = job_id.parse::<u32>().unwrap_or(0);
+    let job = match find_job(state.clone(), id) {
+        Option::Some(j) => j,
+        Option::None => {
+            return DispatchOutcome {
+                state,
+                result: ToolResult {
+                    call: format!("job_kill {}", job_id),
+                    ok: false,
+                    output: format!("job {} not found among your background jobs (call job_list first)", job_id),
+                    duration_ms: 0,
+                },
+                events: Vec::new(),
+            };
+        },
+    };
+    if job.status != String::from("running") {
+        return DispatchOutcome {
+            state,
+            result: ToolResult {
+                call: format!("job_kill {}", job_id),
+                ok: true,
+                output: format!(
+                    "outcome: already-finished\njob {} [{}] {} — {}\n(kill on a terminal job returns its current snapshot; the optional reason is recorded)",
+                    job.id, job.kind, job.status, job.label
+                ),
+                duration_ms: 0,
+            },
+            events: Vec::new(),
+        };
+    }
+    let mut jobs: Vec<Job> = Vec::new();
+    for j in state.clone().jobs {
+        if j.id == id {
+            jobs.push(Job { id: j.id, kind: j.kind, label: j.label, status: String::from("killed"), ok: j.ok, output: j.output, notice_delivered: true });
+        } else {
+            jobs.push(j);
+        }
+    }
+    state.jobs = jobs;
+    let why = if reason.len() > 0 { format!(" (reason: {})", reason) } else { String::from("") };
+    DispatchOutcome {
+        state,
+        result: ToolResult {
+            call: format!("job_kill {}", job_id),
+            ok: true,
+            output: format!("outcome: cancellation-requested\njob {} settled as killed{}", id, why),
+            duration_ms: 0,
+        },
+        events: Vec::new(),
+    }
+}
+
+/// 完成通知投递（loop 顶调用：已结算且未通知的任务 → in-session 消息，
+/// 一次注入而非每任务一回合；kill/终态读已标记已报告则抑制冗余通知）。
+export fn deliver_notices(mut state: RunState) -> NoticeDelivery {
+    let mut messages: Vec<Message> = Vec::new();
+    let mut events: Vec<SessionEvent> = Vec::new();
+    let mut jobs: Vec<Job> = Vec::new();
+    let mut changed = false;
+    for j in state.clone().jobs {
+        if j.notice_delivered == false && j.status != String::from("running") {
+            messages.push(Message::user(format!(
+                "background job {} ({}: {}) finished [status: {}]. Read its output with job_output.",
+                j.id, j.kind, j.label, j.status
+            )));
+            events.push(SessionEvent::JobNoticeDelivered { id: j.id, status: j.status.clone() });
+            jobs.push(Job { id: j.id, kind: j.kind, label: j.label, status: j.status, ok: j.ok, output: j.output, notice_delivered: true });
+            changed = true;
+        } else {
+            jobs.push(j);
+        }
+    }
+    if changed == false {
+        return NoticeDelivery { state, messages, events };
+    }
+    state.jobs = jobs;
+    NoticeDelivery { state, messages, events }
+}
+
+/// 按 id 找任务。
+fn find_job(state: RunState, id: u32) -> Option<Job> {
+    for j in state.jobs {
+        if j.id == id {
+            return Option::Some(j);
+        }
+    }
+    Option::None
+}

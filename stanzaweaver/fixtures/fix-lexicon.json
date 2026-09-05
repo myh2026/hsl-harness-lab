@@ -1,0 +1,16 @@
+{
+ "tracks": {
+  "config": [
+   "la-hexameter"
+  ],
+  "writer": [
+   "以维吉尔《埃涅阿斯纪》开篇为轴：战争与流亡、命运的重量、海与彼岸。庄严而克制，收在抵达意大利海岸的一行。",
+   "arma virumque cano troiae qui primus ab oris",
+   "{\"tool\": \"search_words\", \"query\": \"arma virumque\", \"limit\": 5}",
+   "{\"tool\": \"submit\", \"title\": \"Aeneidos\"}"
+  ],
+  "checker": [
+   "{\"pass\": true}"
+  ]
+ }
+}

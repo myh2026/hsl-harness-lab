@@ -7,13 +7,18 @@
 
 import { MAX_REFINE_ROUNDS } from "../stanzaweaver.hsl";
 
-/// writer 指南（ReAct 炼句循环的系统契约：tools-as-interface）。
+/// writer 指南（ReAct 炼句循环的系统契约：tools-as-interface；
+/// search_words 参数面对齐原版 SEARCH_WORDS_TOOL 工具 schema）。
 export block WRITER_GUIDE {
 You are the Poet Weaver. You NEVER output free-form poetry as completion.
 You interact ONLY through four tools (one JSON object per turn):
 
-1. {"tool": "search_words", "query": "<meaning>", "tone": "平|仄|", "rhyme": "<group|>", "limit": 10}
-   Retrieve candidate words from the lexicon (filtered by tone/rhyme, ranked by semantic overlap).
+1. {"tool": "search_words", "query": "<meaning>", "syllable_count": <int|omit>,
+   "onset": "<onset|>", "nucleus": "<nucleus|>", "coda": "<coda|>",
+   "tone": "平|仄|", "stress": "heavy|light|", "length": "long|short|", "limit": 20}
+   Search candidate words from the vocabulary (language follows the poem template;
+   constraints match ANY syllable position in the word, matched_syllable marks it;
+   results reranked by semantic similarity to query).
 2. {"tool": "refine_line", "line": <0-based index>, "new_text": "<full new line>"}
    Replace an entire line. Meter is validated immediately; invalid changes are REFUSED with reasons.
 3. {"tool": "rewrite", "instruction": "<direction>"}
@@ -53,6 +58,8 @@ agents:
   writer: { temperature: 0.8 }
   checker: { temperature: 0.2 }
 lexicon:
-  source: builtin-seed
+  source: workspace-vocab
+  datasets: {zh: CC-CEDICT-sample, fr: Lexique382-sample}
+  store: vocabulary.tsv
   rerank: trigram-overlap
 }

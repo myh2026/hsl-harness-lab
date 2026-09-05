@@ -1,16 +1,33 @@
 // ============================================================================
 // dsh/core/registry.hsl — ToolRegistry：工具注册 + 守卫执行管线
 // ============================================================================
-// deepseek-harness 原架构对应：tools 包——「工具注册表 + 带守卫的执行管线，
-// loop 经注册表分发一切工具调用」。HSL 侧：注册表持有能力面
-// （#[capability] 编译期第一闸门），run 前置运行时第二闸门（预算/白名单）。
+// deepseek-harness 原架构对应：tools 包——「工具注册表 + 带守卫的执行管
+// 线，loop 经注册表分发一切工具调用」。HSL 侧：注册表持有能力面
+// （#[capability] 编译期第一闸门），guarded_dispatch 前置运行时第二闸门
+// （白名单）后分发（S6 穷尽 match——新增工具变体 = 编译期处决）。
+// 全量工具面：fs 五件 + glob/grep + str_replace_editor + todo + skill +
+// goal 三件 + web 两件 + subagent + jobs 四件 + ralph + workflow +
+// ask_user（对齐 dsh-base 模型可见注册面）。
 // ============================================================================
 
-import { ToolCall, ToolResult } from "../types/messages.hsl";
+import { ToolCall, ToolResult, TodoItem } from "../types/messages.hsl";
 import { GuardError } from "../types/errors.hsl";
-import { Policy } from "../types/state.hsl";
+import { Policy, RunState, DispatchOutcome } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
 import { read_file, write_file, edit_file, list_files } from "../tools/workspace.hsl";
 import { run_bash } from "../tools/shell.hsl";
+import { run_glob, run_grep } from "../tools/search.hsl";
+import { run_editor } from "../tools/editor.hsl";
+import { todo_write, count_all } from "../tools/todo.hsl";
+import { invoke_skill } from "../tools/skill.hsl";
+import { get_goal, create_goal, update_goal } from "../tools/goal.hsl";
+import { web_search, web_fetch } from "../tools/web.hsl";
+import { run_subagent } from "../tools/subagent.hsl";
+import { job_spawn, job_output, job_list, job_kill } from "../tools/jobs.hsl";
+import { run_ralph } from "../tools/ralph.hsl";
+import { run_workflow } from "../tools/workflow.hsl";
+import { read_image } from "../tools/image.hsl";
+import { ask_user } from "../tools/questions.hsl";
 
 /// 工具注册表：deepseek-harness 的「everything-is-a-plugin」在工具面的投影。
 /// 注册 = 编译期把分发臂写进 match（S6 穷尽）；守卫 = 运行期预算/白名单判定。
@@ -25,53 +42,252 @@ impl ToolRegistry {
         ToolRegistry { policy }
     }
 
-    /// 守卫执行管线：guard → dispatch → normalize（输出封顶）。
-    ///
-    /// guard 判定（运行时第二闸门，与编译期 capability 双闸门互补）：
-    /// - bash 首词必须命中白名单；
-    /// - bash 预算由调用方（主循环）持有，此处只校验白名单。
+    /// 守卫执行管线（子代理复用的同步面）：guard → dispatch → normalize。
     fn guarded_run(self, call: ToolCall, turn: u32) -> Result<ToolResult, GuardError> {
-        if let ToolCall::Bash { command } = call.clone() {
-            let first = first_word(command.clone());
-            let allowed = self.policy.clone().allow.contains(first.clone());
-            if allowed == false {
-                return Err(GuardError::new(
-                    String::from("bash"),
-                    format!("turn {}: 首词 \"{}\" 不在白名单", turn, first),
-                ));
-            }
-        }
-        Ok(self.dispatch(call))
+        let policy = self.policy.clone();
+        check_whitelist(policy, call.clone(), turn)?;
+        Ok(soften(dispatch_sync(self.policy.clone(), call)))
     }
 
-    /// 分发臂：注册表的心脏（S6 穷尽 match，新增工具变体=编译期处决）。
-    fn dispatch(self, call: ToolCall) -> ToolResult {
-        let policy = self.policy.clone();
+    /// 守卫分发管线（主回路入口，带回路状态）：白名单 → dispatch。
+    /// guard 拒绝 ≠ 工具失败：Err(GuardError)（调用方落 ToolGuarded 事件）。
+    async fn guarded_dispatch(mut self, state: RunState, call: ToolCall, turn: u32) -> Result<DispatchOutcome, GuardError> {
+        let policy = state.policy.clone();
+        check_whitelist(policy, call.clone(), turn)?;
+        Ok(self.dispatch(state, call).await)
+    }
+
+    /// 分发臂：注册表的心脏（S6 穷尽 match，新增工具变体 = 编译期处决）。
+    /// 有状态工具（todo / goal / jobs / subagent）随行携带更新后的 RunState。
+    async fn dispatch(mut self, mut state: RunState, call: ToolCall) -> DispatchOutcome {
+        let policy = state.policy.clone();
         match call.clone() {
-            ToolCall::ReadFile { path } => soften(read_file(policy.clone(), path)),
-            ToolCall::WriteFile { path, content } => soften(write_file(policy.clone(), path, content)),
+            // ---- tool-fs ----
+            ToolCall::ReadFile { path } => sync_outcome(state, read_file(policy.clone(), path)),
+            ToolCall::WriteFile { path, content } => sync_outcome(state, write_file(policy.clone(), path, content)),
             ToolCall::EditFile { path, old_text, new_text } => {
-                soften(edit_file(policy.clone(), path, old_text, new_text))
+                sync_outcome(state, edit_file(policy.clone(), path, old_text, new_text))
             }
-            ToolCall::Bash { command } => soften(run_bash(policy.clone(), command)),
-            ToolCall::ListFiles => soften(list_files(policy)),
+            ToolCall::Bash { command } => sync_outcome(state, run_bash(policy.clone(), command)),
+            ToolCall::ListFiles => sync_outcome(state, list_files(policy.clone())),
+            ToolCall::ReadImage { path } => sync_outcome(state, Ok(read_image(path))),
+            // ---- tool-fs-search ----
+            ToolCall::Glob { pattern, path } => sync_outcome(state, run_glob(policy.clone(), pattern, path)),
+            ToolCall::Grep { pattern, path, include } => {
+                sync_outcome(state, run_grep(policy.clone(), pattern, path, include))
+            }
+            // ---- tool-str-replace-editor ----
+            ToolCall::StrReplaceEditor { command, path, file_text, old_str, new_str, insert_line, view_start, view_end } => {
+                sync_outcome(state, run_editor(policy.clone(), command, path, file_text, old_str, new_str, insert_line, view_start, view_end))
+            }
+            // ---- tool-todo（整表替换 + 投影置脏） ----
+            ToolCall::TodoWrite { todos } => {
+                match todo_write(policy.clone(), todos.clone()) {
+                    Ok(result) => {
+                        let counts = count_all(todos.clone());
+                        state.todos = todos;
+                        state.todo_dirty = true;
+                        DispatchOutcome {
+                            state,
+                            result,
+                            events: vec![SessionEvent::TodoUpdated { pending: counts[0], in_progress: counts[1], completed: counts[2] }],
+                        }
+                    },
+                    Err(message) => sync_outcome(state, Err(message)),
+                }
+            },
+            // ---- tool-skill ----
+            ToolCall::SkillInvoke { name } => {
+                let result = invoke_skill(name.clone());
+                let events = if result.ok {
+                    vec![SessionEvent::SkillLoaded { name }]
+                } else {
+                    Vec::new()
+                };
+                sync_outcome_events(state, Ok(result), events)
+            },
+            // ---- tool-goal ----
+            ToolCall::GoalTool { op, objective, goal_id, revision, action, max_rounds, blocked_reason } => {
+                if op == String::from("create") {
+                    create_goal(state, objective, max_rounds)
+                } else if op == String::from("update") {
+                    update_goal(state, goal_id, revision, action, objective, max_rounds, blocked_reason)
+                } else {
+                    get_goal(state)
+                }
+            },
+            // ---- tool-web（provider 声明层） ----
+            ToolCall::WebSearch { query } => {
+                let (result, events) = web_search(policy.clone(), query);
+                sync_outcome_events(state, Ok(result), events)
+            },
+            ToolCall::WebFetch { url } => {
+                let (result, events) = web_fetch(policy.clone(), url);
+                sync_outcome_events(state, Ok(result), events)
+            },
+            // ---- subagent（进程内嵌套 agent-loop） ----
+            ToolCall::Subagent { task } => {
+                let agent = format!("sub-{:03}", state.stats.subagents + 1);
+                let outcome = run_subagent(policy.clone(), self.clone(), task, agent.clone()).await;
+                state.stats.subagents += 1;
+                match outcome {
+                    Ok(child) => {
+                        let result = ToolResult {
+                            call: format!("subagent {}", child.agent),
+                            ok: true,
+                            output: format!(
+                                "child agent {} finished ({} turns, {} tool calls): {}",
+                                child.agent, child.turns, child.tool_calls, child.summary
+                            ),
+                            duration_ms: 0,
+                        };
+                        sync_outcome_events(
+                            state,
+                            Ok(result),
+                            vec![
+                                SessionEvent::SubagentSpawned { agent },
+                                SessionEvent::SubagentReplied { agent: child.agent, chars: child.summary.len() },
+                            ],
+                        )
+                    },
+                    Err(e) => sync_outcome(state, Err(e.message)),
+                }
+            },
+            // ---- tool-jobs（spawn / output / list / kill） ----
+            ToolCall::Jobs { op, job_id, arg, wait, timeout_ms, reason } => {
+                if op == String::from("spawn") {
+                    let mut outcome = job_spawn(policy.clone(), state, arg);
+                    outcome.state.stats.jobs += 1;
+                    outcome
+                } else if op == String::from("output") {
+                    job_output(policy.clone(), state, job_id, wait, timeout_ms)
+                } else if op == String::from("kill") {
+                    job_kill(state, job_id, reason)
+                } else {
+                    job_list(state)
+                }
+            },
+            // ---- tool-ralph（全新子代理接力） ----
+            ToolCall::Ralph { objective, max_rounds } => {
+                let outcome = run_ralph(policy.clone(), objective, max_rounds).await;
+                match outcome {
+                    Ok(r) => {
+                        let result = ToolResult {
+                            call: String::from("ralph"),
+                            ok: true,
+                            output: format!(
+                                "ralph loop {} after {} rounds ({})\nlast report: {}",
+                                r.outcome, r.rounds, r.outcome, r.report
+                            ),
+                            duration_ms: 0,
+                        };
+                        sync_outcome_events(state, Ok(result), vec![SessionEvent::SubagentReplied { agent: String::from("ralph"), chars: r.report.len() }])
+                    },
+                    Err(e) => sync_outcome(state, Err(e.message)),
+                }
+            },
+            // ---- tool-workflow（步骤清单扇出） ----
+            ToolCall::Workflow { steps } => {
+                let outcome = run_workflow(policy.clone(), self.clone(), steps).await;
+                match outcome {
+                    Ok(w) => {
+                        let mut body = String::from("");
+                        let mut idx: u32 = 0;
+                        for r in w.results.clone() {
+                            idx += 1;
+                            body.push_str(format!("{}. {}\n", idx, r).as_str());
+                        }
+                        let result = ToolResult {
+                            call: String::from("workflow"),
+                            ok: true,
+                            output: format!("workflow finished: {} steps\n{}", w.steps, body.trim_end()),
+                            duration_ms: 0,
+                        };
+                        sync_outcome_events(state, Ok(result), vec![SessionEvent::SubagentReplied { agent: String::from("workflow"), chars: body.len() }])
+                    },
+                    Err(e) => sync_outcome(state, Err(e.message)),
+                }
+            },
+            // ---- user-questions ----
+            ToolCall::AskUser { questions } => {
+                let result = ask_user(policy.clone(), questions);
+                let events = if result.ok {
+                    vec![SessionEvent::UserQuestionAnswered { chars: result.output.len() }]
+                } else {
+                    Vec::new()
+                };
+                sync_outcome_events(state, Ok(result), events)
+            },
         }
     }
 
     /// 注册面摘要（人读审计出口）。
     fn describe(self) -> String {
-        let read = ToolCall::ReadFile { path: String::from("") };
-        let write = ToolCall::WriteFile { path: String::from(""), content: String::from("") };
-        let edit = ToolCall::EditFile { path: String::from(""), old_text: String::from(""), new_text: String::from("") };
-        let bash = ToolCall::Bash { command: String::from("") };
-        let list = ToolCall::ListFiles;
         let mut names = String::from("");
-        for call in vec![read, write, edit, bash, list] {
+        for call in registered_calls() {
             names.push_str(call.name().as_str());
             names.push_str(" ");
         }
         format!("registry [ {}] allow={}", names, self.policy.allow.join(","))
     }
+}
+
+/// 白名单守卫（运行时第二闸门；与编译期 capability 双闸门互补）。
+fn check_whitelist(policy: Policy, call: ToolCall, turn: u32) -> Result<(), GuardError> {
+    if let ToolCall::Bash { command } = call.clone() {
+        let first = first_word(command);
+        let allowed = policy.allow.contains(first.clone());
+        if allowed == false {
+            return Err(GuardError::new(
+                String::from("bash"),
+                format!("turn {}: 首词 \"{}\" 不在白名单", turn, first),
+            ));
+        }
+    }
+    if let ToolCall::Jobs { op, arg, job_id: _, wait: _, timeout_ms: _, reason: _ } = call.clone() {
+        if op == String::from("spawn") {
+            let first = first_word(arg);
+            let allowed = policy.allow.contains(first.clone());
+            if allowed == false {
+                return Err(GuardError::new(
+                    String::from("job_spawn"),
+                    format!("turn {}: 首词 \"{}\" 不在白名单", turn, first),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 同步分发（子代理回路用的纯工具面；有状态工具走 async dispatch）。
+fn dispatch_sync(policy: Policy, call: ToolCall) -> Result<ToolResult, String> {
+    match call.clone() {
+        ToolCall::ReadFile { path } => read_file(policy.clone(), path),
+        ToolCall::WriteFile { path, content } => write_file(policy.clone(), path, content),
+        ToolCall::EditFile { path, old_text, new_text } => edit_file(policy.clone(), path, old_text, new_text),
+        ToolCall::Bash { command } => run_bash(policy.clone(), command),
+        ToolCall::ListFiles => list_files(policy.clone()),
+        ToolCall::ReadImage { path } => Ok(read_image(path)),
+        ToolCall::Glob { pattern, path } => run_glob(policy.clone(), pattern, path),
+        ToolCall::Grep { pattern, path, include } => run_grep(policy.clone(), pattern, path, include),
+        ToolCall::StrReplaceEditor { command, path, file_text, old_str, new_str, insert_line, view_start, view_end } => {
+            run_editor(policy.clone(), command, path, file_text, old_str, new_str, insert_line, view_start, view_end)
+        }
+        ToolCall::SkillInvoke { name } => Ok(invoke_skill(name)),
+        _ => Err(format!("tool {} 需要主回路分发（有状态工具）", call.name())),
+    }
+}
+
+/// 无事件同步结果组装（S8：不遮蔽参数名，软化产物另名）。
+fn sync_outcome(state: RunState, result: Result<ToolResult, String>) -> DispatchOutcome {
+    let softened = soften(result);
+    DispatchOutcome { state, result: softened, events: Vec::new() }
+}
+
+/// 带事件同步结果组装。
+fn sync_outcome_events(state: RunState, result: Result<ToolResult, String>, events: Vec<SessionEvent>) -> DispatchOutcome {
+    let softened = soften(result);
+    DispatchOutcome { state, result: softened, events }
 }
 
 /// Result → 守卫管线的软失败归一：工具执行失败不终止 harness，
@@ -95,4 +311,63 @@ fn first_word(command: String) -> String {
         Option::Some(w) => w,
         Option::None => String::from(""),
     }
+}
+
+/// 注册面全清单（describe / schema 渲染共用）。
+export fn registered_calls() -> Vec<ToolCall> {
+    vec![
+        ToolCall::ReadFile { path: String::from("") },
+        ToolCall::WriteFile { path: String::from(""), content: String::from("") },
+        ToolCall::EditFile { path: String::from(""), old_text: String::from(""), new_text: String::from("") },
+        ToolCall::Bash { command: String::from("") },
+        ToolCall::ListFiles,
+        ToolCall::ReadImage { path: String::from("") },
+        ToolCall::Glob { pattern: String::from(""), path: String::from("") },
+        ToolCall::Grep { pattern: String::from(""), path: String::from(""), include: String::from("") },
+        ToolCall::StrReplaceEditor { command: String::from(""), path: String::from(""), file_text: String::from(""), old_str: String::from(""), new_str: String::from(""), insert_line: 0, view_start: 0, view_end: 0 },
+        ToolCall::TodoWrite { todos: Vec::new() },
+        ToolCall::SkillInvoke { name: String::from("") },
+        ToolCall::GoalTool { op: String::from(""), objective: String::from(""), goal_id: String::from(""), revision: 0, action: String::from(""), max_rounds: 0, blocked_reason: String::from("") },
+        ToolCall::WebSearch { query: String::from("") },
+        ToolCall::WebFetch { url: String::from("") },
+        ToolCall::Subagent { task: String::from("") },
+        ToolCall::Jobs { op: String::from(""), job_id: String::from(""), arg: String::from(""), wait: false, timeout_ms: 0, reason: String::from("") },
+        ToolCall::Ralph { objective: String::from(""), max_rounds: 0 },
+        ToolCall::Workflow { steps: String::from("") },
+        ToolCall::AskUser { questions: String::from("") },
+    ]
+}
+
+/// todo 数组解析桥（executor 侧 JSON todos 字符串 → Vec<TodoItem>；
+/// native 只做 JSON.parse + 行序列化，状态校验留在 HSL）。
+export fn parse_todos(raw: String) -> Vec<TodoItem> {
+    let lines = native typescript {
+        try {
+            const arr = JSON.parse(raw);
+            if (!Array.isArray(arr)) return "ERROR: todos must be an array";
+            return arr.map((it) => String(it.content || "") + "\t" + String(it.status || "")).join("\n");
+        } catch (e) {
+            return "ERROR: " + String(e && e.message || e);
+        }
+    };
+    let mut out: Vec<TodoItem> = Vec::new();
+    if lines.starts_with("ERROR: ") {
+        return out;
+    }
+    for line in lines.lines() {
+        if line.trim().len() == 0 {
+            continue;
+        }
+        let parts = line.split("\t");
+        let content = match parts.get(0) {
+            Option::Some(c) => c.clone(),
+            Option::None => String::from(""),
+        };
+        let status = match parts.get(1) {
+            Option::Some(s) => s.clone(),
+            Option::None => String::from("pending"),
+        };
+        out.push(TodoItem { content, status });
+    }
+    out
 }

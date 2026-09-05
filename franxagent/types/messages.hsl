@@ -5,41 +5,81 @@
 // tool_calls 结构）与 USER_GUIDE 的 `tools` 单入口协议。
 // HSL 侧：封闭枚举承载工具词汇；提案（Proposal）是 write 工具
 // proposal-review-overwrite 模式的一等值。
+// v6：Message 增加 pair 字段——assistant 工具回合携带分号连接的
+// tool_call id 集，tool 结果携带单个 tool_call_id（原版 tool_call_id
+// 配对身份的扁平化身，供孤儿清理与上下文压缩的安全切割使用）。
 // ============================================================================
 
 #[derive(Debug, Clone)]
 export struct Message {
     role: String,
     content: String,
+    /// 配对身份（OpenAI tool_call_id 的扁平投影）：
+    /// - assistant 工具回合：分号连接的 call_id 集（"call_1;call_2"）；
+    /// - tool 结果：单个 call_id；
+    /// - 其余角色：空串。
+    pair: String,
 }
 
 impl Message {
     fn system(text: String) -> Message {
-        Message { role: String::from("system"), content: text }
+        Message { role: String::from("system"), content: text, pair: String::from("") }
     }
 
     fn user(text: String) -> Message {
-        Message { role: String::from("user"), content: text }
+        Message { role: String::from("user"), content: text, pair: String::from("") }
     }
 
     fn assistant(text: String) -> Message {
-        Message { role: String::from("assistant"), content: text }
+        Message { role: String::from("assistant"), content: text, pair: String::from("") }
     }
 
     fn tool(text: String) -> Message {
-        Message { role: String::from("tool"), content: text }
+        Message { role: String::from("tool"), content: text, pair: String::from("") }
+    }
+
+    /// assistant 工具回合（pair = 分号连接的 call_id 集）。
+    fn assistant_tools(text: String, pair: String) -> Message {
+        Message { role: String::from("assistant"), content: text, pair }
+    }
+
+    /// tool 结果（pair = call_id，与发起方配对）。
+    fn tool_result(text: String, call_id: String) -> Message {
+        Message { role: String::from("tool"), content: text, pair: call_id }
+    }
+
+    /// 同内容换配对身份（孤儿清理：剥离失配 tool_calls 但保留正文）。
+    fn with_pair(self, pair: String) -> Message {
+        Message { role: self.role, content: self.content, pair }
+    }
+
+    /// 本条消息携带的 call_id 集（空 → 空表）。
+    fn pair_ids(self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        if self.pair.len() > 0 {
+            for id in self.pair.split(String::from(";")) {
+                if id.len() > 0 {
+                    out.push(id);
+                }
+            }
+        }
+        out
     }
 }
 
 /// 工具词汇：`tools` 单入口协议的内层工具（封闭枚举，S6）。
-/// 与 FranxAgent 内建五件套对齐：read / write / command / search / add_skill。
+/// 与 FranxAgent 内建六件套对齐：read / write / command / search /
+/// time / add_skill；另设 Mcp 外部转发臂（"server/tool" 形态，
+/// 对应 loader.tools 的 "/" 分支）。
 #[derive(Debug, Clone)]
 export enum ToolCall {
     Read { path: String },
     Write { path: String, content: String, mode: String, start_line: u32, end_line: u32 },
     Command { command: String },
     Search { query: String, max_results: u32 },
+    Time,
     AddSkill { name: String, content: String },
+    Mcp { server: String, tool: String, arguments: String },
 }
 
 impl ToolCall {
@@ -50,7 +90,9 @@ impl ToolCall {
             ToolCall::Write { path: _, content: _, mode: _, start_line: _, end_line: _ } => String::from("write"),
             ToolCall::Command { command: _ } => String::from("command"),
             ToolCall::Search { query: _, max_results: _ } => String::from("search"),
+            ToolCall::Time => String::from("time"),
             ToolCall::AddSkill { name: _, content: _ } => String::from("add_skill"),
+            ToolCall::Mcp { server, tool, arguments: _ } => format!("{}/{}", server, tool),
         }
     }
 }
@@ -74,7 +116,7 @@ export struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    /// 回填转录的 tool 消息（OpenAI 风格 tool 角色）。
+    /// 回填转录的 tool 消息（OpenAI 风格 tool 角色 + 配对身份）。
     fn to_message(self) -> Message {
         let mut text = String::from("[tool ");
         text.push_str(self.tool.as_str());
@@ -85,7 +127,7 @@ impl ToolOutcome {
             text.push_str(" FAILED\n");
         }
         text.push_str(self.output.as_str());
-        Message::tool(text)
+        Message::tool_result(text, self.call_id)
     }
 }
 
@@ -117,6 +159,8 @@ export enum Turn {
     Observed,
     ProposalReady,
     Remembered,
+    ContextCompressed,
+    TaskTriggered,
     Replied,
     BudgetExhausted,
 }

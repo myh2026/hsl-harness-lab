@@ -1,0 +1,31 @@
+// ============================================================================
+// dsh/loop/tokens.hsl — token-meter（累计 token 计量，进 RunStats/report）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/llm/token-meter——「重放感知的
+// token 计量服务：请求/上下文压力测量、单消息计价、tokenUsage 投影；
+// 纯文本固定启发式；不做任何回路决策」。HSL 侧：chars/4 固定启发式
+// （无分词器，README 披露口径），tokens_in = 每轮喂给模型的转录估算
+// 累计，tokens_out = 模型回复估算累计；压力判定供 compaction 消费。
+// ============================================================================
+
+import { Message } from "../types/messages.hsl";
+
+/// 单文本 token 估算（chars/4 固定启发式）。
+/// 注：尾表达式不可直接以 `(` 开头紧跟块语句——dhv-ts 解析器会把
+/// 块后 `(` 误吞为调用实参（工具链 bug#3，见 PATCHES.md），故经 let 中转。
+export fn estimate(text: String) -> u64 {
+    if text.len() == 0 {
+        return 0;
+    }
+    let chars: u64 = (text.len() + 3) as u64;
+    chars / 4
+}
+
+/// 转录整体 token 估算（逐消息求和）。
+export fn transcript_tokens(transcript: Vec<Message>) -> u64 {
+    let mut total: u64 = 0;
+    for m in transcript {
+        total += estimate(m.content);
+    }
+    total
+}

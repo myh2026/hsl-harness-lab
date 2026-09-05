@@ -1,0 +1,45 @@
+// ============================================================================
+// dsh/loop/planmode.hsl — plan-mode（计划模式的写工具门禁）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/plan/plan-mode——「进入计划模式后
+// 代理先探索与设计，再把成品计划作为审批件呈交用户；批准后开始执行；
+// /plan 进入、/plan off 退出」。原版为 guidance（不收工具）；本复现按
+// 复现任务要求实现为硬门禁：写类工具（create/str_replace/insert/
+// write/edit）在计划模式一律拒绝并提示呈交计划；done 即呈交计划 →
+// 审批（allow → 退出计划模式继续执行；reject → 打回继续规划）。
+// 偏差在 README 能力矩阵披露。
+// ============================================================================
+
+import { ToolCall } from "../types/messages.hsl";
+
+/// 计划模式写门禁：返回 Some(reason) 表示拒绝（变异类动作全门）。
+export fn gate(call: ToolCall, plan_mode: bool) -> Option<String> {
+    if plan_mode == false {
+        return Option::None;
+    }
+    if call.clone().is_mutation() {
+        return Option::Some(format!(
+            "plan mode is active: write tools are gated. Present your plan with a done action for approval, or ask the user for /plan off. (blocked tool: {})",
+            call.clone().name()
+        ));
+    }
+    Option::None
+}
+
+/// 呈交计划的提示（计划模式下 done 的观察文案）。
+export fn presentation_notice(summary: String) -> String {
+    format!(
+        "Plan presented for approval:\n{}\n(plan mode: an approve decision exits plan mode and execution starts; a rejection returns you to planning)",
+        summary
+    )
+}
+
+/// 批准后的注入提示（计划模式 → 执行模式转换的 in-session 消息）。
+export fn approved_notice() -> String {
+    String::from("Plan approved. Plan mode is off — execute the plan now (write tools are unblocked).")
+}
+
+/// 打回后的注入提示。
+export fn rejected_notice() -> String {
+    String::from("The plan was rejected. Keep exploring and present a revised plan with a done action.")
+}

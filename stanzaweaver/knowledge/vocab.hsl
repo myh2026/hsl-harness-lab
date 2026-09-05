@@ -1,0 +1,179 @@
+// ============================================================================
+// stanzaweaver/knowledge/vocab.hsl — 词库访问层（words 表的工作区镜像）
+// ============================================================================
+// StanzaWeaver 原架构对应：src/knowledge/vocabulary.py + src/knowledge/schema.sql
+//   - words 表（text / language / meaning / syllables_json / syllable_count）
+//     + meta 表（数据集版本：dataset_<lang>）+ en_pron 缓存表；
+//   - search_words：language 必滤 + syllable_count 等值 + 逐位约束
+//     EXISTS 语义（约束匹配词内任一音节位，结果标注 matched_syllable）+
+//     rowid 插入序 + SQL LIMIT，再经 embeddings.rerank(query) 重排；
+//   - word_count / has_words（has_dataset 镜像 _check_dataset）。
+// 披露：SQLite 披露为基建 —— HSL 侧以工作区 vocabulary.tsv 文件承载同列
+// schema（W 行 = words 一行：text/language/meaning/syllables/syllable_count；
+// M 行 = meta 一行）；en_pron CMUdict 缓存未移植（en 数据集范围外）。
+// ============================================================================
+
+import { Word, WordHit } from "../types/word.hsl";
+import { SylConstraint } from "../types/syllable.hsl";
+import { rerank } from "./embeddings.hsl";
+
+/// 词库（words 表 + meta 表的工作区镜像）。
+#[derive(Debug, Clone)]
+export struct WordVault {
+    words: Vec<Word>,              // words 表（插入序 = rowid 序）
+    meta: Vec<(String, String)>,   // meta 表：dataset_<lang> = <数据集名>
+}
+
+impl WordVault {
+    /// 打开词库（init_db + 读档镜像；存储缺失 → 空库，导入时机交 importer）。
+    fn open() -> WordVault {
+        let raw = read_store();
+        let mut words: Vec<Word> = Vec::new();
+        let mut meta: Vec<(String, String)> = Vec::new();
+        if raw.len() > 0 {
+            for line in raw.lines() {
+                let t = line.trim();
+                if t.len() == 0 || t.starts_with("#") {
+                    continue;
+                }
+                if t.starts_with("W\t") {
+                    let rest = strip_row_tag(t.clone());
+                    match Word::from_store_row(rest) {
+                        Option::Some(w) => words.push(w),
+                        Option::None => continue,
+                    }
+                } else {
+                    if t.starts_with("M\t") {
+                        let cols = t.split("\t");
+                        if cols.len() >= 3 {
+                            meta.push((cols[1].clone(), cols[2].clone()));
+                        }
+                    }
+                }
+            }
+        }
+        WordVault { words, meta }
+    }
+
+    /// 词条数（原版 word_count；language 空 = 全部）。
+    fn word_count(self, language: String) -> u32 {
+        if language.len() == 0 {
+            return self.words.len();
+        }
+        let mut n: u32 = 0;
+        for w in self.words {
+            if w.language == language {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// 数据集是否已导入（原版 _check_dataset：meta 命中且该语言词条 > 0）。
+    fn has_dataset(self, lang: String, name: String) -> bool {
+        let key = format!("dataset_{}", lang);
+        let mut found = false;
+        for pair in self.meta {
+            if pair.0 == key && pair.1 == name {
+                found = true;
+            }
+        }
+        found && self.word_count(lang) > 0
+    }
+
+    /// 追加词条（insert_words 镜像；函数式更新）。
+    fn with_words(self, words: Vec<Word>) -> WordVault {
+        let mut all = self.words.clone();
+        all.append(words);
+        WordVault { words: all, meta: self.meta.clone() }
+    }
+
+    /// 记录数据集版本（_set_dataset 镜像）。
+    fn with_dataset(self, lang: String, name: String) -> WordVault {
+        let key = format!("dataset_{}", lang);
+        let mut meta = self.meta.clone();
+        let mut replaced = false;
+        let mut i: u32 = 0;
+        while i < meta.len() {
+            if meta[i].0 == key {
+                let mut row = meta[i].clone();
+                row.1 = name.clone();
+                meta.remove(i);
+                meta.insert(i, row);
+                replaced = true;
+            }
+            i += 1;
+        }
+        if replaced == false {
+            meta.push((key, name));
+        }
+        WordVault { words: self.words.clone(), meta }
+    }
+
+    /// 落盘（words 表 + meta 表的工作区镜像；见模块头披露）。
+    fn save(self) {
+        let mut out = String::from("# stanza-vocab-v1 — words/meta 表的工作区 TSV 镜像（SQLite 披露为基建）\n");
+        for pair in self.meta {
+            out.push_str(format!("M\t{}\t{}\n", pair.0, pair.1).as_str());
+        }
+        for w in self.words {
+            out.push_str(format!("W\t{}\n", w.to_store_row()).as_str());
+        }
+        native typescript {
+            $host.fs.write("vocabulary.tsv", out);
+            return true;
+        };
+    }
+
+    /// 按约束搜索候选词（原版 search_words 语义，见模块头）：
+    /// language 必滤 → syllable_count 等值 → 逐位约束 EXISTS（matched_syllable
+    /// 标注首个匹配位）→ 插入序 → 截断 limit → query 重排（降级 n-gram）。
+    fn search(self, language: String, query: String, syllable_count: Option<u32>, constraint: SylConstraint, limit: u32) -> Vec<WordHit> {
+        let mut hits: Vec<WordHit> = Vec::new();
+        let has_constraint = constraint.clone().is_any_set();
+        for word in self.words {
+            if word.language != language {
+                continue;
+            }
+            if syllable_count.is_some() {
+                if word.syllable_count() != syllable_count.unwrap_or(0) {
+                    continue;
+                }
+            }
+            let matched = word.clone().matched_syllable(constraint.clone());
+            if has_constraint && matched.is_none() {
+                continue;
+            }
+            hits.push(WordHit { word, matched });
+        }
+        // 原版：ORDER BY rowid LIMIT ?（插入序先截断，再重排）
+        let mut limited: Vec<WordHit> = Vec::new();
+        for h in hits {
+            if limited.len() >= limit {
+                break;
+            }
+            limited.push(h);
+        }
+        if query.len() > 0 && limited.len() > 0 {
+            limited = rerank(query, limited, limit);
+        }
+        limited
+    }
+}
+
+/// 读工作区存储（缺失/读取失败 → 空串；$host.fs 路径监狱内）。
+fn read_store() -> String {
+    native typescript {
+        try {
+            return $host.fs.read("vocabulary.tsv");
+        } catch (e) {
+            return "";
+        }
+    }
+}
+
+/// 剥离行类型标签（"W\t..." → "..."）。
+fn strip_row_tag(row: String) -> String {
+    let chars = row.chars();
+    chars.skip(2).collect::<String>()
+}

@@ -4,6 +4,9 @@
 // FranxAgent 原架构对应：agent.py 的 OpenAI 客户端（流式 + thinking 开关，
 // HSL 侧收敛为整回合非流式——流式推送是前端关注点，不在契约层）+
 // ScriptedModel 的 fixture 驱动确定性轨道。
+// v6：native 块内捕获提供方异常（含 fixture 故障注入的 context-length
+// 错误）→ 归一为 LlmError 软错误——主回路得以识别「上下文超限」并
+// 触发压缩重试（原版 continue 分支），其余错误照常向上传播。
 // ============================================================================
 
 import { Message } from "../types/messages.hsl";
@@ -30,25 +33,37 @@ impl OpenAIChatModel {
 
 impl ChatModel for OpenAIChatModel {
     async fn chat(self, messages: Vec<Message>) -> Result<String, LlmError> {
-        let raw: String = native typescript {
+        let r = native typescript {
             const msgs = messages.map((m) => ({ role: m.role, content: m.content }));
-            const r = await $host.llm.complete({
-                messages: msgs,
-                temperature: self.temperature,
-                maxTokens: 1024,
-            });
-            if (r === undefined || r === null) throw new Error("empty completion");
-            return r;
+            try {
+                const completion = await $host.llm.complete({
+                    messages: msgs,
+                    temperature: self.temperature,
+                    maxTokens: 1024,
+                });
+                if (completion === undefined || completion === null) {
+                    return { ok: false, message: "empty completion" };
+                }
+                return { ok: true, text: String(completion) };
+            } catch (e) {
+                // 提供方异常（网络 / 限流 / 上下文超限……）归一为软错误，
+                // 交主回路分类处置
+                return { ok: false, message: String(e && e.message || e) };
+            }
         };
-        if raw.len() == 0 {
-            Err(LlmError::new(502, String::from("empty completion")))
+        if r.ok {
+            if r.text.len() == 0 {
+                Err(LlmError::new(502, String::from("empty completion")))
+            } else {
+                Ok(r.text)
+            }
         } else {
-            Ok(raw)
+            Err(LlmError::new(502, r.message))
         }
     }
 }
 
-/// 剧本模型（fixture 轨道驱动；track 参数化：acts / reviews / …）。
+/// 剧本模型（fixture 轨道驱动；track 参数化：acts / task_acts / …）。
 #[derive(Debug, Clone)]
 export struct ScriptedChatModel {
     track: String,
@@ -62,13 +77,24 @@ impl ScriptedChatModel {
 
 impl ChatModel for ScriptedChatModel {
     async fn chat(self, messages: Vec<Message>) -> Result<String, LlmError> {
-        let raw: String = native typescript {
-            return await $host.fixture.next(self.track);
+        let r = native typescript {
+            try {
+                const act = await $host.fixture.next(self.track);
+                return { ok: true, text: String(act) };
+            } catch (e) {
+                // 轨道耗尽 / 故障注入（error/deny）→ 软错误；
+                // 故障消息按原样透传（含 context-length 类文本，供主回路识别）
+                return { ok: false, message: String(e && e.message || e) };
+            }
         };
-        if raw.len() == 0 {
-            Err(LlmError::new(503, String::from("fixture exhausted")))
+        if r.ok {
+            if r.text.len() == 0 {
+                Err(LlmError::new(503, String::from("fixture exhausted")))
+            } else {
+                Ok(r.text)
+            }
         } else {
-            Ok(raw)
+            Err(LlmError::new(503, r.message))
         }
     }
 }

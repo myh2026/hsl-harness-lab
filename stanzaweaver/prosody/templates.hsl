@@ -1,60 +1,641 @@
 // ============================================================================
-// stanzaweaver/prosody/templates.hsl — 格律模板注册表
+// stanzaweaver/prosody/templates.hsl — 格律模板注册表（五语言全量）
 // ============================================================================
-// StanzaWeaver 原架构对应：templates/（zh.py 五绝七绝五律七律 + en.py
-// 十四行诗等，Python 类定义，可无限扩展）。HSL 侧：封闭注册表
-// （key → MeterTemplate），get 按 key 装配（穷尽 match）。
+// StanzaWeaver 原架构对应：src/templates/{zh,en,fr,it,la}.py 的全部 17 个
+// 模板定义（register 键 → PoetryTemplate 子类）与 templates/__init__.py 的
+// list_dicts 序列化形状（key/name/language/lines/syllables_per_line/
+// syllable_constraints/display_name）。
+//
+// Task 6-c 移植口径：
+//   - 逐模板移植原版数据：name / language / lines / syllables_per_line
+//     （syl_spec，定值或区间）/ get_syllable_constraints（constraints 逐行
+//     逐位）/ rule_description（注入提示词）；validate_full 的押韵要求数据化
+//     为 rhyme_groups（标签 + 行号组）、整行叠句数据化为 refrain_groups。
+//   - 原版键用下划线（zh_wujue）；HSL 侧沿用连字符键（zh-wujue，与既有
+//     复现及 web 适配层约定一致），en-couplet 对应原版 en_heroic_couplet。
+//   - 兼容字段（chars_per_line / tone_pattern / rhyme_lines /
+//     syllables_per_line）保住现行 zh/en 校验路径 —— zh 五绝/七绝/律诗沿用
+//     HSL 侧逐字平仄谱（比原版「二四六分明」更强的判定，已披露）；相见欢
+//     词谱按原版逐位 constraints 走通用路径。
+//   - 原版 validate_full 的跨行专属规则（叠句词序细节、维拉内拉 A/B 互异、
+//     意语第 10 音节重读、拉丁音步扫描、canzone 韵脚上限等）未逐条移植，
+//     见 README 偏差披露。
 // ============================================================================
 
-import { MeterTemplate } from "../types/poem.hsl";
+import { MeterTemplate, SylSpec } from "../types/poem.hsl";
+import { SylConstraint } from "../types/syllable.hsl";
 import { WeaverError } from "../types/errors.hsl";
 
-/// 模板注册表：get(key) 装配（S6 穷尽——新增模板必须显式扩这里）。
-export fn get_template(key: String) -> Result<MeterTemplate, WeaverError> {
-    if key == String::from("zh-wujue") {
-        Ok(MeterTemplate {
-            key: String::from("zh-wujue"),
-            name: String::from("五言绝句"),
-            lang: String::from("zh"),
-            line_count: 4,
-            chars_per_line: 5,
-            tone_pattern: vec![
-                String::from("仄仄平平仄"),
-                String::from("平平仄仄平"),
-                String::from("平平平仄仄"),
-                String::from("仄仄仄平平"),
-            ],
-            rhyme_lines: vec![1, 3],
-            syllables_per_line: 5,
-        })
-    } else if key == String::from("zh-qijue") {
-        Ok(MeterTemplate {
-            key: String::from("zh-qijue"),
-            name: String::from("七言绝句"),
-            lang: String::from("zh"),
-            line_count: 4,
-            chars_per_line: 7,
-            tone_pattern: vec![
-                String::from("仄仄平平仄仄平"),
-                String::from("平平仄仄仄平平"),
-                String::from("平平仄仄平平仄"),
-                String::from("仄仄平平仄仄平"),
-            ],
-            rhyme_lines: vec![0, 1, 3],
-            syllables_per_line: 7,
-        })
-    } else if key == String::from("en-couplet") {
-        Ok(MeterTemplate {
-            key: String::from("en-couplet"),
-            name: String::from("Heroic Couplet"),
-            lang: String::from("en"),
-            line_count: 2,
-            chars_per_line: 0,
-            tone_pattern: Vec::new(),
-            rhyme_lines: vec![0, 1],
-            syllables_per_line: 10,
-        })
+/// 语言显示名（原版 _LANGUAGE_LABELS —— list_dicts 的 display_name 组成部分）。
+fn language_label(lang: String) -> String {
+    if lang == String::from("zh") {
+        String::from("汉语")
+    } else if lang == String::from("en") {
+        String::from("英语")
+    } else if lang == String::from("it") {
+        String::from("意大利语")
+    } else if lang == String::from("fr") {
+        String::from("法语")
+    } else if lang == String::from("la") {
+        String::from("古典拉丁语")
     } else {
-        Err(WeaverError::new(String::from("template"), format!("未知模板 \"{}\"（可用：zh-wujue / zh-qijue / en-couplet）", key)))
+        lang
     }
+}
+
+/// 模板显示名（原版 list_dicts 的 display_name = "name（语言）"）。
+export fn display_name(t: MeterTemplate) -> String {
+    format!("{}（{}）", t.name, language_label(t.language.clone()))
+}
+
+// ── zh：五言绝句 / 七言绝句 / 五言律诗 / 七言律诗 / 相见欢 ──
+
+/// zh_wujue 五言绝句：4 行 5 字，二四字定平仄，偶句平声韵。
+fn tpl_zh_wujue() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("zh-wujue"),
+        name: String::from("五言绝句"),
+        language: String::from("zh"),
+        line_count: 4,
+        chars_per_line: 5,
+        tone_pattern: vec![
+            String::from("仄仄平平仄"),
+            String::from("平平仄仄平"),
+            String::from("平平平仄仄"),
+            String::from("仄仄仄平平"),
+        ],
+        rhyme_lines: vec![1, 3],
+        syllables_per_line: 5,
+        syl_spec: vec![SylSpec::exact(5), SylSpec::exact(5), SylSpec::exact(5), SylSpec::exact(5)],
+        constraints: Vec::new(),
+        rhyme_groups: vec![(String::from("押韵(二四行)"), vec![1, 3])],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每句第2、4字平仄相间；每联上下句第2、4字平仄相对；下一联首句与上一联对句第2、4字平仄相粘；偶数句押平声韵，首句尾字可押韵(平)可不押韵(仄)；忌三平尾、孤平。"),
+    }
+}
+
+/// zh_qijue 七言绝句：4 行 7 字，二四六字定平仄，偶句平声韵（首句入韵谱）。
+fn tpl_zh_qijue() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("zh-qijue"),
+        name: String::from("七言绝句"),
+        language: String::from("zh"),
+        line_count: 4,
+        chars_per_line: 7,
+        tone_pattern: vec![
+            String::from("仄仄平平仄仄平"),
+            String::from("平平仄仄仄平平"),
+            String::from("平平仄仄平平仄"),
+            String::from("仄仄平平仄仄平"),
+        ],
+        rhyme_lines: vec![0, 1, 3],
+        syllables_per_line: 7,
+        syl_spec: vec![SylSpec::exact(7), SylSpec::exact(7), SylSpec::exact(7), SylSpec::exact(7)],
+        constraints: Vec::new(),
+        rhyme_groups: vec![(String::from("押韵(二四行)"), vec![1, 3])],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每句第2、4、6字平仄相间；每联上下句第2、4、6字平仄相对；下一联首句与上一联对句第2、4、6字平仄相粘；偶数句押平声韵，首句尾字可押韵(平)可不押韵(仄)；忌三平尾、孤平。"),
+    }
+}
+
+/// zh_wulv 五言律诗：8 行 5 字，四联，偶句平声韵（对仗由检查 AI 负责）。
+fn tpl_zh_wulv() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("zh-wulv"),
+        name: String::from("五言律诗"),
+        language: String::from("zh"),
+        line_count: 8,
+        chars_per_line: 5,
+        tone_pattern: vec![
+            String::from("仄仄平平仄"),
+            String::from("平平仄仄平"),
+            String::from("平平平仄仄"),
+            String::from("仄仄仄平平"),
+            String::from("仄仄平平仄"),
+            String::from("平平仄仄平"),
+            String::from("平平平仄仄"),
+            String::from("仄仄仄平平"),
+        ],
+        rhyme_lines: vec![1, 3, 5, 7],
+        syllables_per_line: 5,
+        syl_spec: vec![
+            SylSpec::exact(5), SylSpec::exact(5), SylSpec::exact(5), SylSpec::exact(5),
+            SylSpec::exact(5), SylSpec::exact(5), SylSpec::exact(5), SylSpec::exact(5),
+        ],
+        constraints: Vec::new(),
+        rhyme_groups: vec![(String::from("押韵(二四六八行)"), vec![1, 3, 5, 7])],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每句第2、4字平仄相间；每联上下句第2、4字平仄相对；下一联首句与上一联对句第2、4字平仄相粘；偶数句押平声韵，首句尾字可押韵(平)可不押韵(仄)；忌三平尾、孤平。"),
+    }
+}
+
+/// zh_qilv 七言律诗：8 行 7 字，四联，偶句平声韵（首句入韵谱）。
+fn tpl_zh_qilv() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("zh-qilv"),
+        name: String::from("七言律诗"),
+        language: String::from("zh"),
+        line_count: 8,
+        chars_per_line: 7,
+        tone_pattern: vec![
+            String::from("仄仄平平仄仄平"),
+            String::from("平平仄仄仄平平"),
+            String::from("平平仄仄平平仄"),
+            String::from("仄仄平平仄仄平"),
+            String::from("仄仄平平仄仄平"),
+            String::from("平平仄仄仄平平"),
+            String::from("平平仄仄平平仄"),
+            String::from("仄仄平平仄仄平"),
+        ],
+        rhyme_lines: vec![0, 1, 3, 5, 7],
+        syllables_per_line: 7,
+        syl_spec: vec![
+            SylSpec::exact(7), SylSpec::exact(7), SylSpec::exact(7), SylSpec::exact(7),
+            SylSpec::exact(7), SylSpec::exact(7), SylSpec::exact(7), SylSpec::exact(7),
+        ],
+        constraints: Vec::new(),
+        rhyme_groups: vec![(String::from("押韵(二四六八行)"), vec![0, 1, 3, 5, 7])],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每句第2、4、6字平仄相间；每联上下句第2、4、6字平仄相对；下一联首句与上一联对句第2、4、6字平仄相粘；偶数句押平声韵，首句尾字可押韵(平)可不押韵(仄)；忌三平尾、孤平。"),
+    }
+}
+
+/// zh_xiangjianhuan 相见欢（双调三十六字）：上阕三平韵，下阕两仄韵换韵再转回平韵。
+/// 原版 get_syllable_constraints 为词牌固定平仄谱（"中" = 自由位 → 空约束）。
+fn tpl_zh_xiangjianhuan() -> MeterTemplate {
+    let f = SylConstraint::free();
+    let p = SylConstraint::tone_only(String::from("平"));
+    let z = SylConstraint::tone_only(String::from("仄"));
+    MeterTemplate {
+        key: String::from("zh-xiangjianhuan"),
+        name: String::from("相见欢"),
+        language: String::from("zh"),
+        line_count: 7,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 0,
+        syl_spec: vec![
+            SylSpec::exact(6), SylSpec::exact(3), SylSpec::exact(9),
+            SylSpec::exact(3), SylSpec::exact(3), SylSpec::exact(3), SylSpec::exact(9),
+        ],
+        constraints: vec![
+            vec![f.clone(), p.clone(), f.clone(), z.clone(), p.clone(), p.clone()],
+            vec![z.clone(), p.clone(), p.clone()],
+            vec![f.clone(), z.clone(), f.clone(), p.clone(), f.clone(), z.clone(), z.clone(), p.clone(), p.clone()],
+            vec![f.clone(), f.clone(), z.clone()],
+            vec![f.clone(), p.clone(), z.clone()],
+            vec![z.clone(), p.clone(), p.clone()],
+            vec![f.clone(), z.clone(), f.clone(), p.clone(), f.clone(), z.clone(), z.clone(), p.clone(), p.clone()],
+        ],
+        rhyme_groups: vec![
+            (String::from("押韵(上阕·平韵)"), vec![0, 1, 2]),
+            (String::from("押韵(下阕·仄韵·换韵)"), vec![3, 4]),
+            (String::from("押韵(下阕·平韵·换回)"), vec![5, 6]),
+        ],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：上阕3句三平韵（中平中仄平平/仄平平/中仄中平平仄仄平平）；下阕4句先两仄韵（中中仄/中平仄）换韵、再转回平韵（仄平平/中仄中平平仄仄平平），下阕平韵须与上阕同部；上下阕末句末三字不宜全平。"),
+    }
+}
+
+// ── en：莎士比亚商籁体 / 维拉内拉诗 / 英雄双行体 ──
+
+/// 抑扬格逐位约束（原版 en._l/_h：奇数位轻、偶数位重）。
+fn iambic_line() -> Vec<SylConstraint> {
+    vec![
+        SylConstraint::stress_only(String::from("light")),
+        SylConstraint::stress_only(String::from("heavy")),
+        SylConstraint::stress_only(String::from("light")),
+        SylConstraint::stress_only(String::from("heavy")),
+        SylConstraint::stress_only(String::from("light")),
+        SylConstraint::stress_only(String::from("heavy")),
+        SylConstraint::stress_only(String::from("light")),
+        SylConstraint::stress_only(String::from("heavy")),
+        SylConstraint::stress_only(String::from("light")),
+        SylConstraint::stress_only(String::from("heavy")),
+    ]
+}
+
+/// en_sonnet 莎士比亚商籁体：14 行抑扬格五音步，韵式 ABAB CDCD EFEF GG。
+fn tpl_en_sonnet() -> MeterTemplate {
+    let mut constraints: Vec<Vec<SylConstraint>> = Vec::new();
+    let line = iambic_line();
+    let mut i: u32 = 0;
+    while i < 14 {
+        constraints.push(line.clone());
+        i += 1;
+    }
+    let mut spec: Vec<SylSpec> = Vec::new();
+    i = 0;
+    while i < 14 {
+        spec.push(SylSpec::exact(10));
+        i += 1;
+    }
+    MeterTemplate {
+        key: String::from("en-sonnet"),
+        name: String::from("莎士比亚商籁体"),
+        language: String::from("en"),
+        line_count: 14,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 10,
+        syl_spec: spec,
+        constraints,
+        rhyme_groups: vec![
+            (String::from("A"), vec![0, 2]),
+            (String::from("B"), vec![1, 3]),
+            (String::from("C"), vec![4, 6]),
+            (String::from("D"), vec![5, 7]),
+            (String::from("E"), vec![8, 10]),
+            (String::from("F"), vec![9, 11]),
+            (String::from("G"), vec![12, 13]),
+        ],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每行抑扬格五音步（10音节，重音在偶数位，次重音亦算重读）；韵式 ABAB CDCD EFEF GG；每组四行内A/B两韵必须不同；押韵须为严格重音押韵：韵脚必须落在主重音或次重音音节上，且该音节起全部音素（含重音层级）完全一致。"),
+    }
+}
+
+/// en_villanelle 维拉内拉诗：19 行，韵式 ABA…ABAA，两叠句循环，音节数不限。
+fn tpl_en_villanelle() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("en-villanelle"),
+        name: String::from("维拉内拉诗"),
+        language: String::from("en"),
+        line_count: 19,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 0,
+        syl_spec: Vec::new(),
+        constraints: Vec::new(),
+        rhyme_groups: vec![
+            (String::from("A"), vec![0, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]),
+            (String::from("B"), vec![1, 4, 7, 10, 13, 16]),
+        ],
+        refrain_groups: vec![
+            vec![0, 5, 11, 17],
+            vec![2, 8, 14, 18],
+        ],
+        rule_description: String::from("格律规则：全诗19行（5个三行联句+1个四行联句）；韵式 ABA ABA ABA ABA ABA ABAA；第1行(A1)在第6、12、18行原样重复，第3行(A2)在第9、15、19行原样重复；每行至少4个重读音节，总音节数不限（次重音亦算重读）；押韵须为严格重音押韵：韵脚落在主重音或次重音音节上，该音节起全部音素（含重音层级）完全一致。"),
+    }
+}
+
+/// en_heroic_couplet 英雄双行体：两行抑扬格五音步，AA 严格重音押韵。
+/// （HSL 键 en-couplet 沿用既有复现键；原版键 en_heroic_couplet。）
+fn tpl_en_couplet() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("en-couplet"),
+        name: String::from("英雄双行体"),
+        language: String::from("en"),
+        line_count: 2,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: vec![0, 1],
+        syllables_per_line: 10,
+        syl_spec: vec![SylSpec::exact(10), SylSpec::exact(10)],
+        constraints: vec![iambic_line(), iambic_line()],
+        rhyme_groups: vec![(String::from("AA"), vec![0, 1])],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每行抑扬格五音步（10音节），全行重音音节数不少于4（次重音亦算重读）；两行末字押同韵（AA），押韵须为严格重音押韵：韵脚落在主重音或次重音音节上，该音节起全部音素（含重音层级）完全一致。"),
+    }
+}
+
+// ── fr：回旋诗 / 三韵叠句诗 / 叙事歌 ──
+
+/// fr_rondeau 回旋诗：15 行三节，韵式 AABBA AAB AABBA，叠句在第 9、15 行末尾
+/// （叠句为「第 1 行开头 4 词」复现 —— 非整行叠句，未数据化，披露）。
+fn tpl_fr_rondeau() -> MeterTemplate {
+    let mut spec: Vec<SylSpec> = Vec::new();
+    let mut i: u32 = 0;
+    while i < 15 {
+        spec.push(SylSpec::range(8, 10));
+        i += 1;
+    }
+    MeterTemplate {
+        key: String::from("fr-rondeau"),
+        name: String::from("回旋诗"),
+        language: String::from("fr"),
+        line_count: 15,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 0,
+        syl_spec: spec,
+        constraints: Vec::new(),
+        rhyme_groups: vec![
+            (String::from("A"), vec![0, 1, 4, 5, 6, 8, 9, 10, 13, 14]),
+            (String::from("B"), vec![2, 3, 7, 11, 12]),
+        ],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：15行，分三节（5+4+6）；韵式 AABBA AAB AABBA（仅用A、B两韵）；每行8音节（可放宽至10，但全诗统一）；第1行首半句在第9行和第15行末尾原样重复为叠句。"),
+    }
+}
+
+/// fr_triolet 三韵叠句诗：8 行，韵式 ABaAabAB，第 1/4/7 行与 2/8 行为叠句。
+fn tpl_fr_triolet() -> MeterTemplate {
+    let mut spec: Vec<SylSpec> = Vec::new();
+    let mut i: u32 = 0;
+    while i < 8 {
+        spec.push(SylSpec::exact(8));
+        i += 1;
+    }
+    MeterTemplate {
+        key: String::from("fr-triolet"),
+        name: String::from("三韵叠句诗"),
+        language: String::from("fr"),
+        line_count: 8,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 8,
+        syl_spec: spec,
+        constraints: Vec::new(),
+        rhyme_groups: vec![
+            (String::from("A"), vec![0, 2, 3, 4, 6]),
+            (String::from("B"), vec![1, 5, 7]),
+        ],
+        refrain_groups: vec![
+            vec![0, 3, 6],
+            vec![1, 7],
+        ],
+        rule_description: String::from("格律规则：8行，每行8音节；韵式 ABaAabAB：第1、4、7行同为A叠句原样重复，第2、8行同为B叠句原样重复；第3、5行押A韵（a），第6行押B韵（b）。"),
+    }
+}
+
+/// fr_ballade 叙事歌：28 行（3 节 8 行 + 4 行跋），ababbcbc 韵式，末行叠句。
+fn tpl_fr_ballade() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("fr-ballade"),
+        name: String::from("叙事歌"),
+        language: String::from("fr"),
+        line_count: 28,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 0,
+        syl_spec: Vec::new(),
+        constraints: Vec::new(),
+        rhyme_groups: vec![
+            (String::from("A"), vec![0, 2, 8, 10, 16, 18]),
+            (String::from("B"), vec![1, 3, 4, 6, 9, 11, 12, 14, 17, 19, 20, 22, 24, 26]),
+            (String::from("C"), vec![5, 7, 13, 15, 21, 23, 25, 27]),
+        ],
+        refrain_groups: vec![vec![7, 15, 23, 27]],
+        rule_description: String::from("格律规则：28行（3个8行诗节+1个4行跋）；每节韵式 ababbcbc，三节及跋使用相同的A、B、C三个韵脚；每节末行（第8、16、24行）与跋末行（第28行）为完全相同的叠句；全诗每行音节数统一为8或10音节。"),
+    }
+}
+
+// ── it：三行体 / 八行体 / 歌谣 ──
+
+/// it_terza_rima 三行体：14 行十一音节句，链式循环押韵 ABA BCB CDC DED EE。
+fn tpl_it_terza_rima() -> MeterTemplate {
+    let mut spec: Vec<SylSpec> = Vec::new();
+    let mut i: u32 = 0;
+    while i < 14 {
+        spec.push(SylSpec::exact(11));
+        i += 1;
+    }
+    MeterTemplate {
+        key: String::from("it-terza-rima"),
+        name: String::from("三行体"),
+        language: String::from("it"),
+        line_count: 14,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 11,
+        syl_spec: spec,
+        constraints: Vec::new(),
+        rhyme_groups: vec![
+            (String::from("ABA"), vec![0, 2]),
+            (String::from("BCB"), vec![1, 3, 5]),
+            (String::from("CDC"), vec![4, 6, 8]),
+            (String::from("DED"), vec![7, 9, 11]),
+            (String::from("EE"), vec![10, 12, 13]),
+        ],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每行11音节（跨词元音连读 sinalefe 合并计数）；每行第10个音节必须重读（十一音节句定义特征）；韵式 ABA BCB CDC DED EE（链式循环押韵，换韵时与前韵不同部）。"),
+    }
+}
+
+/// it_ottava_rima 八行体：8 行十一音节句，韵式 ABABABCC。
+fn tpl_it_ottava_rima() -> MeterTemplate {
+    let mut spec: Vec<SylSpec> = Vec::new();
+    let mut i: u32 = 0;
+    while i < 8 {
+        spec.push(SylSpec::exact(11));
+        i += 1;
+    }
+    MeterTemplate {
+        key: String::from("it-ottava-rima"),
+        name: String::from("八行体"),
+        language: String::from("it"),
+        line_count: 8,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 11,
+        syl_spec: spec,
+        constraints: Vec::new(),
+        rhyme_groups: vec![
+            (String::from("A"), vec![0, 2, 4]),
+            (String::from("B"), vec![1, 3, 5]),
+            (String::from("CC"), vec![6, 7]),
+        ],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：每行11音节（跨词元音连读 sinalefe 合并计数）；每行第10个音节必须重读；韵式 ABABABCC（前6行交替韵，末两行对句韵 CC）。"),
+    }
+}
+
+/// it_canzone 歌谣：13 行（11/7 音节交错），奇数行末非重读、偶数行与末行重读。
+/// 韵脚规则（≤4 个 / 连续 ≤2 / 末三行各异）非组式 —— 未数据化，披露。
+fn tpl_it_canzone() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("it-canzone"),
+        name: String::from("歌谣"),
+        language: String::from("it"),
+        line_count: 13,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 0,
+        syl_spec: vec![
+            SylSpec::exact(11), SylSpec::exact(7), SylSpec::exact(11), SylSpec::exact(7),
+            SylSpec::exact(11), SylSpec::exact(7), SylSpec::exact(11), SylSpec::exact(7),
+            SylSpec::exact(11), SylSpec::exact(7), SylSpec::exact(11), SylSpec::exact(7),
+            SylSpec::exact(7),
+        ],
+        constraints: Vec::new(),
+        rhyme_groups: Vec::new(),
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：奇数行（1、3、5、7、9、11）为11音节（endecasillabo femminile），第10音节重读、第11音节非重读；偶数行（2、4、6、8、10、12）与第13行为7音节（settenario femminile），末音节重读；全诗使用 A、B、C、D 四个韵脚，同一韵脚连续出现不得超过两次，末三行韵脚各不相同。"),
+    }
+}
+
+// ── la：六步格 / 哀歌双行体 / 十一音节诗 ──
+
+/// la_hexameter 六步格：单行，第 1-4 音步扬抑抑/扬扬自由替换，第 5 音步
+/// 必须扬抑抑格，第 6 音步 2 音节（音步扫描逻辑未移植，披露）。
+fn tpl_la_hexameter() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("la-hexameter"),
+        name: String::from("六步格"),
+        language: String::from("la"),
+        line_count: 1,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 0,
+        syl_spec: vec![SylSpec::range(13, 17)],
+        constraints: Vec::new(),
+        rhyme_groups: Vec::new(),
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：共6音步；第1-4音步可为扬抑抑格(长短短)或扬扬格(长长)自由替换；第5音步必须为扬抑抑格(长短短)；第6音步为扬扬格或扬抑格，末音节可长可短；音长判定：词典标注优先，无标注时双元音及元音后跟两个及以上辅音(含跨词)为长音。"),
+    }
+}
+
+/// la_distichon 哀歌双行体：第 1 行六步格，第 2 行五步格（末 6 音节两完整
+/// 扬抑抑格 + 中部 caesura），两行末字押韵（AA）。
+fn tpl_la_distichon() -> MeterTemplate {
+    MeterTemplate {
+        key: String::from("la-distichon"),
+        name: String::from("哀歌双行体"),
+        language: String::from("la"),
+        line_count: 2,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 0,
+        syl_spec: vec![SylSpec::range(13, 17), SylSpec::range(11, 13)],
+        constraints: Vec::new(),
+        rhyme_groups: vec![(String::from("AA"), vec![0, 1])],
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：第1行完全遵循六步格规则；第2行五步格：前2.5音步可为扬抑抑格或扬扬格（自由），中间必有停顿，后2.5音步必须为两个完整的扬抑抑格（长短短长短短）收尾；两行末字必须押韵（AA）。"),
+    }
+}
+
+/// la_hendecasyllabus 十一音节诗：5 音步 11 音节，固定音步模式
+/// （第 1 音步首音节必长；第 2 音步固定扬抑抑；第 3-5 扬抑）。
+fn tpl_la_hendecasyllabus() -> MeterTemplate {
+    let l = SylConstraint::length_only(String::from("long"));
+    let s = SylConstraint::length_only(String::from("short"));
+    let f = SylConstraint::free();
+    MeterTemplate {
+        key: String::from("la-hendecasyllabus"),
+        name: String::from("十一音节诗"),
+        language: String::from("la"),
+        line_count: 1,
+        chars_per_line: 0,
+        tone_pattern: Vec::new(),
+        rhyme_lines: Vec::new(),
+        syllables_per_line: 11,
+        syl_spec: vec![SylSpec::exact(11)],
+        constraints: vec![vec![
+            l.clone(), f.clone(), l.clone(), s.clone(), l.clone(),
+            l.clone(), s.clone(), l.clone(), s.clone(), l.clone(), s.clone(),
+        ]],
+        rhyme_groups: Vec::new(),
+        refrain_groups: Vec::new(),
+        rule_description: String::from("格律规则：共5音步11音节；第1音步为扬扬格或扬抑格（首音节必长）；第2音步固定扬抑抑格(长短短)；第3-5音步均为扬抑格(长短)；全行第5与第6音节之间必须是音步边界（不得跨词）；第3、5、6、8、10音节（全行）必须为长音。"),
+    }
+}
+
+/// 注册表（原版 register_* 的全部键；S6 穷尽——新增模板必须显式扩这里）。
+fn registry() -> Vec<(String, MeterTemplate)> {
+    vec![
+        (String::from("zh-wujue"), tpl_zh_wujue()),
+        (String::from("zh-qijue"), tpl_zh_qijue()),
+        (String::from("zh-wulv"), tpl_zh_wulv()),
+        (String::from("zh-qilv"), tpl_zh_qilv()),
+        (String::from("zh-xiangjianhuan"), tpl_zh_xiangjianhuan()),
+        (String::from("en-sonnet"), tpl_en_sonnet()),
+        (String::from("en-villanelle"), tpl_en_villanelle()),
+        (String::from("en-couplet"), tpl_en_couplet()),
+        (String::from("fr-rondeau"), tpl_fr_rondeau()),
+        (String::from("fr-triolet"), tpl_fr_triolet()),
+        (String::from("fr-ballade"), tpl_fr_ballade()),
+        (String::from("it-terza-rima"), tpl_it_terza_rima()),
+        (String::from("it-ottava-rima"), tpl_it_ottava_rima()),
+        (String::from("it-canzone"), tpl_it_canzone()),
+        (String::from("la-hexameter"), tpl_la_hexameter()),
+        (String::from("la-distichon"), tpl_la_distichon()),
+        (String::from("la-hendecasyllabus"), tpl_la_hendecasyllabus()),
+    ]
+}
+
+/// 全部模板键（目录事件 / 前端下拉用）。
+export fn template_keys() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pair in registry() {
+        out.push(pair.0);
+    }
+    out
+}
+
+/// 模板目录 JSON（原版 list_dicts 输出形状：
+/// [{"key","name","language","lines","syllables_per_line",
+///   "syllable_constraints","display_name"}, ...]）。
+export fn list_dicts_json() -> String {
+    let mut out = String::from("[");
+    let mut first: bool = true;
+    for pair in registry() {
+        let t = pair.1;
+        // syllables_per_line：定值 → 数字；区间 → [min, max]（原版 int | tuple 序列化）
+        let mut spec_str = String::from("[");
+        let mut first_s: bool = true;
+        for sp in t.syl_spec.clone() {
+            if first_s == false {
+                spec_str.push_str(", ");
+            }
+            first_s = false;
+            if sp.min == sp.max {
+                spec_str.push_str(sp.min.to_string().as_str());
+            } else {
+                spec_str.push_str(format!("[{}, {}]", sp.min, sp.max).as_str());
+            }
+        }
+        spec_str.push_str("]");
+        // syllable_constraints：逐行约束（原版 constraint dict 的 JSON 形状）
+        let mut cstr = String::from("[");
+        let mut first_c: bool = true;
+        for line_c in t.constraints.clone() {
+            if first_c == false {
+                cstr.push_str(", ");
+            }
+            first_c = false;
+            let mut line_str = String::from("[");
+            let mut first_l: bool = true;
+            for c in line_c {
+                if first_l == false {
+                    line_str.push_str(", ");
+                }
+                first_l = false;
+                line_str.push_str(c.to_json().as_str());
+            }
+            line_str.push_str("]");
+            cstr.push_str(line_str.as_str());
+        }
+        cstr.push_str("]");
+        if first == false {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push_str(format!(
+            "{{\"key\": \"{}\", \"name\": \"{}\", \"language\": \"{}\", \"lines\": {}, \"syllables_per_line\": {}, \"syllable_constraints\": {}, \"display_name\": \"{}\"}}",
+            pair.0, t.name, t.language, t.line_count, spec_str, cstr, display_name(t)
+        ).as_str());
+    }
+    out.push_str("]");
+    out
+}
+
+/// 按 key 装配模板（未知 key → 逐字列出可用键）。
+export fn get_template(key: String) -> Result<MeterTemplate, WeaverError> {
+    for pair in registry() {
+        if pair.0 == key {
+            return Ok(pair.1);
+        }
+    }
+    Err(WeaverError::new(String::from("template"), format!("未知模板 \"{}\"（可用：{}）", key, template_keys().join(" / "))))
 }

@@ -1,0 +1,19 @@
+{
+ "acts": [
+  "{\"action\": \"tool\", \"tool\": \"write_file\", \"path\": \"big.md\", \"content\": \"# big context\\nAAAA 0000\\nAAAA 1111\\nAAAA 2222\\nAAAA 3333\\nAAAA 4444\\nAAAA 5555\\nAAAA 6666\\nAAAA 7777\\nAAAA 8888\\nAAAA 9999\\nBBBB 0000\\nBBBB 1111\\nBBBB 2222\\nBBBB 3333\\nBBBB 4444\\nBBBB 5555\\nBBBB 6666\\nBBBB 7777\\nBBBB 8888\\nBBBB 9999\\nCCCC 0000\\nCCCC 1111\\nCCCC 2222\\nCCCC 3333\\nCCCC 4444\\nCCCC 5555\\nCCCC 6666\\nCCCC 7777\\nCCCC 8888\\nCCCC 9999\\nDDDD 0000\\nDDDD 1111\\nDDDD 2222\\nDDDD 3333\\nDDDD 4444\\nDDDD 5555\\nDDDD 6666\\nDDDD 7777\\nDDDD 8888\\nDDDD 9999\\nEEEE 0000\\nEEEE 1111\\nEEEE 2222\\nEEEE 3333\\nEEEE 4444\\nEEEE 5555\\nEEEE 6666\\nEEEE 7777\\nEEEE 8888\\nEEEE 9999\\nend of file\"}",
+  "{\"action\": \"tool\", \"tool\": \"read_file\", \"path\": \"big.md\"}",
+  "{\"action\": \"tool\", \"tool\": \"read_file\", \"path\": \"big.md\"}",
+  "{\"action\": \"tool\", \"tool\": \"read_file\", \"path\": \"big.md\"}",
+  "{\"action\": \"tool\", \"tool\": \"read_file\", \"path\": \"stats.test.ts\"}",
+  "{\"action\": \"tool\", \"tool\": \"list_files\"}",
+  "{\"action\": \"done\", \"summary\": \"context pressure exercised: prune + compact kept the session runnable\"}"
+ ],
+ "reviews": [
+  "{\"verdict\": \"accept\"}"
+ ],
+ "tracks": {
+  "compact": [
+   "Earlier history: the assistant wrote big.md (a large synthetic file), read it back three times, and inspected the workspace. Nothing else of consequence happened before this point."
+  ]
+ }
+}

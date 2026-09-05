@@ -1,13 +1,20 @@
 // ============================================================================
 // dsh/agents/executor.hsl — 执行器：模型输出解析（严格 JSON 协议）
 // ============================================================================
-// deepseek-harness 原架构对应：agent-loop 的 step 解析层。HSL 侧：
-// $host.json.fields 以 HashMap<String,String> 进入 HSL（N2 类型纪律：
-// 不让动态对象图穿透）；协议违规走 Err（调用方反馈重试）。
+// deepseek-harness 原架构对应：agent-loop 的 step 解析层（tool 调用的
+// 参数 schema → 工具词汇）。HSL 侧：$host.json.fields 以
+// HashMap<String,String> 进入 HSL（N2 类型纪律：不让动态对象图穿透）；
+// 协议违规走 Err（调用方反馈重试）。
+// 全量工具面：fs 五件 + glob/grep + str_replace_editor + todo + skill +
+// goal 三件 + web 两件 + subagent + jobs 四件 + ralph + workflow +
+// ask_user（与 ToolCall 封闭枚举一一对应；新增工具 = 编译期处决点）。
+// 数值/布尔字段以字符串到达（json.fields 语义），parse::<T>() 归一
+// （null → "" → 缺省值，等价原版「null placeholder 视为省略」）。
 // ============================================================================
 
 import { ToolCall, Action } from "../types/messages.hsl";
 import { DshError } from "../types/errors.hsl";
+import { parse_todos } from "../core/registry.hsl";
 
 /// 模型输出 → Action。
 export fn parse_action(raw: String) -> Result<Action, DshError> {
@@ -36,35 +43,209 @@ export fn parse_action(raw: String) -> Result<Action, DshError> {
 
 fn parse_tool(fields: HashMap<String, String>) -> Result<Action, DshError> {
     let tool = fields.get("tool").unwrap_or(String::from(""));
-    if tool == String::from("read_file") {
-        Ok(Action::Tool { call: ToolCall::ReadFile { path: require_field(fields, "path")? } })
-    } else if tool == String::from("write_file") {
-        Ok(Action::Tool {
-            call: ToolCall::WriteFile {
+    let call = match tool.as_str() {
+        // ---- tool-fs ----
+        "read_file" => ToolCall::ReadFile { path: require_field(fields, "path")? },
+        "write_file" => ToolCall::WriteFile {
+            path: require_field(fields, "path")?,
+            content: require_field(fields, "content")?,
+        },
+        "edit_file" => ToolCall::EditFile {
+            path: require_field(fields, "path")?,
+            old_text: require_field(fields, "old_text")?,
+            new_text: require_field(fields, "new_text")?,
+        },
+        "bash" => ToolCall::Bash { command: require_field(fields, "command")? },
+        "list_files" => ToolCall::ListFiles,
+        "read_image" => ToolCall::ReadImage { path: require_field(fields, "path")? },
+        // ---- tool-fs-search ----
+        "glob" => ToolCall::Glob {
+            pattern: require_field(fields, "pattern")?,
+            path: optional(fields, "path", "."),
+        },
+        "grep" => ToolCall::Grep {
+            pattern: require_field(fields, "pattern")?,
+            path: optional(fields, "path", "."),
+            include: optional(fields, "include", ""),
+        },
+        // ---- tool-str-replace-editor ----
+        "str_replace_editor" => {
+            let (view_start, view_end) = view_range(fields);
+            ToolCall::StrReplaceEditor {
+                command: require_field(fields, "command")?,
                 path: require_field(fields, "path")?,
-                content: require_field(fields, "content")?,
-            },
-        })
-    } else if tool == String::from("edit_file") {
-        Ok(Action::Tool {
-            call: ToolCall::EditFile {
-                path: require_field(fields, "path")?,
-                old_text: require_field(fields, "old_text")?,
-                new_text: require_field(fields, "new_text")?,
-            },
-        })
-    } else if tool == String::from("bash") {
-        Ok(Action::Tool { call: ToolCall::Bash { command: require_field(fields, "command")? } })
-    } else if tool == String::from("list_files") {
-        Ok(Action::Tool { call: ToolCall::ListFiles })
-    } else {
-        Err(DshError::new(String::from("parse"), format!("未知工具 \"{}\"", tool)))
-    }
+                file_text: optional(fields, "file_text", ""),
+                old_str: optional(fields, "old_str", ""),
+                new_str: optional(fields, "new_str", ""),
+                insert_line: opt_i64(fields, "insert_line"),
+                view_start,
+                view_end,
+            }
+        },
+        // ---- tool-todo ----
+        "todo_write" => ToolCall::TodoWrite { todos: parse_todos(require_field(fields, "todos")?) },
+        // ---- tool-skill ----
+        "skill" => ToolCall::SkillInvoke { name: require_field(fields, "name")? },
+        // ---- tool-goal 三件 ----
+        "get_goal" => ToolCall::GoalTool {
+            op: String::from("get"),
+            objective: String::from(""),
+            goal_id: String::from(""),
+            revision: 0,
+            action: String::from(""),
+            max_rounds: 0,
+            blocked_reason: String::from(""),
+        },
+        "create_goal" => ToolCall::GoalTool {
+            op: String::from("create"),
+            objective: require_field(fields, "objective")?,
+            goal_id: String::from(""),
+            revision: 0,
+            action: String::from(""),
+            max_rounds: opt_u32(fields, "max_rounds"),
+            blocked_reason: String::from(""),
+        },
+        "update_goal" => ToolCall::GoalTool {
+            op: String::from("update"),
+            objective: optional(fields, "objective", ""),
+            goal_id: require_field(fields, "goal_id")?,
+            revision: opt_u32(fields, "revision"),
+            action: require_field(fields, "action")?,
+            max_rounds: opt_u32(fields, "max_rounds"),
+            blocked_reason: optional(fields, "blocked_reason", ""),
+        },
+        // ---- tool-web ----
+        "web_search" => ToolCall::WebSearch { query: require_field(fields, "query")? },
+        "web_fetch" => ToolCall::WebFetch { url: require_field(fields, "url")? },
+        // ---- subagent ----
+        "subagent" => ToolCall::Subagent { task: require_field(fields, "task")? },
+        // ---- tool-jobs 四件 ----
+        "job_spawn" => ToolCall::Jobs {
+            op: String::from("spawn"),
+            job_id: String::from(""),
+            arg: require_field(fields, "command")?,
+            wait: false,
+            timeout_ms: 0,
+            reason: String::from(""),
+        },
+        "job_output" => ToolCall::Jobs {
+            op: String::from("output"),
+            job_id: require_field(fields, "job_id")?,
+            arg: String::from(""),
+            wait: opt_bool(fields, "wait"),
+            timeout_ms: opt_u32(fields, "timeout_ms"),
+            reason: String::from(""),
+        },
+        "job_list" => ToolCall::Jobs {
+            op: String::from("list"),
+            job_id: String::from(""),
+            arg: String::from(""),
+            wait: false,
+            timeout_ms: 0,
+            reason: String::from(""),
+        },
+        "job_kill" => ToolCall::Jobs {
+            op: String::from("kill"),
+            job_id: require_field(fields, "job_id")?,
+            arg: String::from(""),
+            wait: false,
+            timeout_ms: 0,
+            reason: optional(fields, "reason", ""),
+        },
+        // ---- tool-ralph / tool-workflow ----
+        "ralph" => ToolCall::Ralph {
+            objective: require_field(fields, "objective")?,
+            max_rounds: opt_u32(fields, "max_rounds"),
+        },
+        "workflow" => ToolCall::Workflow { steps: require_field(fields, "steps")? },
+        // ---- user-questions ----
+        "ask_user" => ToolCall::AskUser { questions: require_field(fields, "questions")? },
+        other => {
+            return Err(DshError::new(String::from("parse"), format!("未知工具 \"{}\"", other)));
+        },
+    };
+    Ok(Action::Tool { call })
 }
 
+/// 必填字段（缺失 → 协议违规 Err）。
 fn require_field(fields: HashMap<String, String>, key: String) -> Result<String, DshError> {
     match fields.get(key) {
         Option::Some(v) => Ok(v),
         Option::None => Err(DshError::new(String::from("parse"), format!("缺少字段 \"{}\"", key))),
     }
+}
+
+/// 可选字段（缺省值；null → "" → 缺省）。
+fn optional(fields: HashMap<String, String>, key: String, fallback: String) -> String {
+    match fields.get(key) {
+        Option::Some(v) => {
+            if v.len() == 0 {
+                fallback
+            } else {
+                v
+            }
+        },
+        Option::None => fallback,
+    }
+}
+
+/// 可选数值字段（缺省 0）。
+fn opt_i64(fields: HashMap<String, String>, key: String) -> i64 {
+    match fields.get(key) {
+        Option::Some(v) => v.parse::<i64>().unwrap_or(0),
+        Option::None => 0,
+    }
+}
+
+/// 可选无符号字段（缺省 0）。
+fn opt_u32(fields: HashMap<String, String>, key: String) -> u32 {
+    match fields.get(key) {
+        Option::Some(v) => v.parse::<u32>().unwrap_or(0),
+        Option::None => 0,
+    }
+}
+
+/// 可选布尔字段（"true" → true；其余 false）。
+fn opt_bool(fields: HashMap<String, String>, key: String) -> bool {
+    match fields.get(key) {
+        Option::Some(v) => v == String::from("true"),
+        Option::None => false,
+    }
+}
+
+/// view_range 解析："[1, 10]"（JSON 数组字符串化）→ (1, 10)。
+/// 也接受显式 view_start / view_end 字段；缺省 (0, 0) = 全文。
+fn view_range(fields: HashMap<String, String>) -> (i64, i64) {
+    let raw = match fields.get("view_range") {
+        Option::Some(v) => v,
+        Option::None => String::from(""),
+    };
+    let body = strip_brackets(raw.trim());
+    if body.len() == 0 {
+        (opt_i64(fields, "view_start"), opt_i64(fields, "view_end"))
+    } else {
+        let parts = body.split(",");
+        let start = match parts.get(0) {
+            Option::Some(s) => s.trim().parse::<i64>().unwrap_or(0),
+            Option::None => 0,
+        };
+        let end = match parts.get(1) {
+            Option::Some(e) => e.trim().parse::<i64>().unwrap_or(0),
+            Option::None => 0,
+        };
+        (start, end)
+    }
+}
+
+/// 剥掉首尾的方括号（"[1, 10]" → "1, 10"）。
+fn strip_brackets(raw: String) -> String {
+    let head = match raw.strip_prefix("[") {
+        Option::Some(rest) => rest,
+        Option::None => raw.clone(),
+    };
+    let tail = match head.strip_suffix("]") {
+        Option::Some(rest) => rest,
+        Option::None => head,
+    };
+    tail.trim().to_string()
 }

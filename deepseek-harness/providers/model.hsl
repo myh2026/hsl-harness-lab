@@ -66,10 +66,16 @@ impl ScriptedModel {
 impl ModelProvider for ScriptedModel {
     async fn act(self, transcript: Vec<Message>) -> Result<String, ProviderError> {
         let raw: String = native typescript {
+            // 角色路由：actor → acts 轨道；reviewer → reviews 轨道；
+            // 其余（subagent / ralph / compact …）→ 与角色同名的 fixture 轨道
+            // （Fixture v2 多轨道剧本，嵌套 agent-loop 各自独立消费序列）。
+            if (self.role === "actor") {
+                return await $host.fixture.nextAct();
+            }
             if (self.role === "reviewer") {
                 return await $host.fixture.nextReview();
             }
-            return await $host.fixture.nextAct();
+            return await $host.fixture.next(self.role);
         };
         if raw.len() == 0 {
             Err(ProviderError::new(503, String::from("fixture exhausted")))

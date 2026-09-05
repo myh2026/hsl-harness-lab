@@ -1,0 +1,260 @@
+// ============================================================================
+// stanzaweaver/prosody/french.hsl — 法语音节分析器（简化移植）
+// ============================================================================
+// StanzaWeaver 原架构对应：src/prosody/french.py 的 FrenchAnalyzer 核心
+// （_syllabify_word / syllabify_line / count_syllables / rhyme_key）：
+//   - 二/三合元音合并（ou/eau/ain/ien…）与鼻化元音；
+//   - qu 后 u 恒静音；gu 后接 e/i/y 时 u 静音；
+//   - 词尾静音 e 省略（弱尾音节：后随仅静音辅音、非唯一音节、onset < 2）；
+//   - 整行切分：跨词省音（前元音 + 后元音 → 合并）与联诵（前尾辅音 → 后 onset）；
+//   - 韵脚 key = 词末发音元音核（鼻化归并：前部 → "an"，后部 → "on"）。
+// HSL 侧逐规则移植（Syllable 的 onset/nucleus/coda 对齐原结构）；
+// 披露：分音符（naïf 的 ï）等边角规则未移植（原版亦仅声明未在切分中使用）。
+// ============================================================================
+
+import { Syllable } from "../types/syllable.hsl";
+
+/// 法语字母（清洗保留集：小写 + 重音 + œ/æ）。
+fn is_fr_letter(ch: String) -> bool {
+    "abcdefghijklmnopqrstuvwxyzàâäéèêëîïôöùûüæœÿ".contains(ch)
+}
+
+/// 法语元音（含重音与 œ/æ/y —— 原版 _VOWELS）。
+fn is_fr_vowel(ch: String) -> bool {
+    "aeiouyàâäéèêëîïôöùûüæœÿ".contains(ch)
+}
+
+/// 三合元音 / 三字母核（原版 _FR_DIGRAPHS 的 3 字符项）。
+fn is_fr_trigraph(s: String) -> bool {
+    s == String::from("eau") || s == String::from("yeu") || s == String::from("yen")
+        || s == String::from("oui") || s == String::from("eui") || s == String::from("ien")
+        || s == String::from("oin") || s == String::from("ain") || s == String::from("ein")
+}
+
+/// 二合元音 / 鼻化元音（原版 _FR_DIGRAPHS 的 2 字符项）。
+fn is_fr_digraph(s: String) -> bool {
+    s == String::from("ou") || s == String::from("au") || s == String::from("an")
+        || s == String::from("en") || s == String::from("on") || s == String::from("in")
+        || s == String::from("un") || s == String::from("ai") || s == String::from("ei")
+        || s == String::from("eu") || s == String::from("oi") || s == String::from("ui")
+        || s == String::from("ia") || s == String::from("ie") || s == String::from("io")
+        || s == String::from("iu") || s == String::from("ua") || s == String::from("ue")
+        || s == String::from("uo") || s == String::from("ay") || s == String::from("ey")
+        || s == String::from("œu") || s == String::from("œ") || s == String::from("am")
+        || s == String::from("em") || s == String::from("im") || s == String::from("om")
+        || s == String::from("um")
+}
+
+/// gu 后 u 的静音条件（后接 e/i/y —— 原版 _SILENT_GU_FOLLOW）。
+fn is_fr_silent_gu_follow(ch: String) -> bool {
+    "eéèêëiîïy".contains(ch)
+}
+
+/// 前部鼻化归并（→ "an" —— 原版 _NASAL_FRONT）。
+fn is_fr_nasal_front(nuc: String) -> bool {
+    nuc == String::from("an") || nuc == String::from("en") || nuc == String::from("in")
+        || nuc == String::from("un") || nuc == String::from("ain") || nuc == String::from("ein")
+        || nuc == String::from("ien") || nuc == String::from("oin") || nuc == String::from("am")
+        || nuc == String::from("em") || nuc == String::from("im") || nuc == String::from("um")
+}
+
+/// 后部鼻化归并（→ "on" —— 原版 _NASAL_BACK）。
+fn is_fr_nasal_back(nuc: String) -> bool {
+    nuc == String::from("on") || nuc == String::from("om")
+}
+
+/// 词清洗：去标点（含省音撇号 l'→l）并转小写（原版 _clean_word）。
+fn clean_fr_word(word: String) -> String {
+    let lowered = word.to_lowercase();
+    let mut out = String::new();
+    for ch in lowered.chars() {
+        if is_fr_letter(ch) {
+            out.push_str(ch.as_str());
+        }
+    }
+    out
+}
+
+/// 位置 i 的 'u' 是否静音（qu 后恒静音；gu 后接 e/i/y 静音 —— 原版 _is_silent_u）。
+fn fr_silent_u(chars: Vec<String>, i: u32) -> bool {
+    let ch = chars.get(i).unwrap_or(String::from(""));
+    if ch != String::from("u") || i == 0 {
+        return false;
+    }
+    let prev = chars.get(i - 1).unwrap_or(String::from(""));
+    if prev == String::from("q") {
+        return true;
+    }
+    if prev == String::from("g") && i + 1 < chars.len() {
+        let next = chars.get(i + 1).unwrap_or(String::from(""));
+        return is_fr_silent_gu_follow(next);
+    }
+    false
+}
+
+/// 串内是否全为词尾静音辅音（s/t/x/p —— 原版 _MUTE_FINALS；空串为真）。
+fn all_fr_mute(s: String) -> bool {
+    let mut all = true;
+    for ch in s.chars() {
+        if "stxp".contains(ch) == false {
+            all = false;
+        }
+    }
+    all
+}
+
+/// 按词切分音节（二/三合元音 + qu/gu 静音 u + 词尾静音 e —— 原版 _syllabify_word）。
+export fn fr_syllabify_word(word: String) -> Vec<Syllable> {
+    let w = clean_fr_word(word);
+    if w.len() == 0 {
+        return vec![Syllable {
+            onset: String::from(""),
+            nucleus: String::from("?"),
+            coda: String::from(""),
+            tone: String::from(""),
+            stress: String::from(""),
+            length: String::from(""),
+        }];
+    }
+    let chars = w.chars();
+    let n = chars.len();
+    // 元音核扫描：(start, end, 核文本)
+    let mut nuclei: Vec<(u32, u32, String)> = Vec::new();
+    let mut i: u32 = 0;
+    while i < n {
+        let ch = chars.get(i).unwrap_or(String::from(""));
+        if is_fr_vowel(ch.clone()) && fr_silent_u(chars.clone(), i) == false {
+            let mut matched = String::from("");
+            if i + 3 <= n {
+                let seg3 = chars.clone().skip(i).take(3).collect::<String>();
+                if is_fr_trigraph(seg3.clone()) {
+                    matched = seg3;
+                }
+            }
+            if matched.len() == 0 && i + 2 <= n {
+                let seg2 = chars.clone().skip(i).take(2).collect::<String>();
+                if is_fr_digraph(seg2.clone()) {
+                    matched = seg2;
+                }
+            }
+            if matched.len() == 0 {
+                matched = ch;
+            }
+            nuclei.push((i, i + matched.len(), matched.clone()));
+            i += matched.len();
+        } else {
+            i += 1;
+        }
+    }
+    // 组装音节：核前辅音归 onset，核间辅音归 coda（原版 _build_syllables）
+    let mut syls: Vec<Syllable> = Vec::new();
+    let mut prev_end: u32 = 0;
+    for pair in nuclei.clone().enumerate() {
+        let idx = pair[0];
+        let start = pair[1].0;
+        let end = pair[1].1;
+        let nuc = pair[1].2;
+        let next_start: u32 = if idx + 1 < nuclei.len() {
+            nuclei[idx + 1].0
+        } else {
+            n
+        };
+        let onset = chars.clone().skip(prev_end).take(start - prev_end).collect::<String>();
+        let coda = chars.clone().skip(end).take(next_start - end).collect::<String>();
+        syls.push(Syllable {
+            onset,
+            nucleus: nuc,
+            coda,
+            tone: String::from(""),
+            stress: String::from(""),
+            length: String::from(""),
+        });
+        prev_end = end;
+    }
+    // 词尾静音 e 省略（原版 _apply_final_e）
+    if syls.len() > 0 {
+        let last = syls[syls.len() - 1].clone();
+        if last.nucleus == String::from("e") {
+            let last_end = nuclei[nuclei.len() - 1].1;
+            let after = chars.clone().skip(last_end).collect::<String>();
+            if (after.len() == 0 || all_fr_mute(after)) && syls.len() != 1 && last.onset.len() < 2 {
+                let _ = syls.pop();
+            }
+        }
+    }
+    syls
+}
+
+/// 整行切分：逐词切分 + 跨词省音/联诵（原版 syllabify_line）。
+export fn fr_syllabify_line(line: String) -> Vec<Syllable> {
+    let mut out: Vec<Syllable> = Vec::new();
+    for word in line.split_whitespace() {
+        let mut syls = fr_syllabify_word(word.clone());
+        if syls.len() == 0 {
+            continue;
+        }
+        if out.len() > 0 {
+            let prev = match out.pop() {
+                Option::Some(s) => s,
+                Option::None => syls[0].clone(),
+            };
+            let curr_first = syls[0].clone();
+            if prev.coda.len() == 0 && curr_first.onset.len() == 0 {
+                // 省音：前词末元音与后词首元音合并（前音节被吸收，已 pop）
+            } else {
+                if prev.coda.len() > 0 && curr_first.onset.len() == 0 {
+                    // 联诵：前词尾辅音成为后词首音节 onset
+                    let mut fixed = curr_first.clone();
+                    fixed.onset = prev.coda.clone();
+                    syls.remove(0);
+                    syls.insert(0, fixed);
+                    let mut prev_fixed = prev.clone();
+                    prev_fixed.coda = String::from("");
+                    out.push(prev_fixed);
+                } else {
+                    out.push(prev);
+                }
+            }
+        }
+        out.append(syls.clone());
+    }
+    out
+}
+
+/// 行音节数（含跨词省音/联诵合并 —— 原版 count_syllables）。
+export fn fr_count_syllables(line: String) -> u32 {
+    fr_syllabify_line(line).len()
+}
+
+/// 元音核归并到押韵等价类（原版 _normalize_nucleus）。
+fn normalize_fr_nucleus(nuc: String) -> String {
+    if is_fr_nasal_front(nuc.clone()) {
+        return String::from("an");
+    }
+    if is_fr_nasal_back(nuc.clone()) {
+        return String::from("on");
+    }
+    nuc
+}
+
+/// 法语韵脚 key：词末发音元音核（鼻化归并；无法切分返回空 —— 原版 rhyme_key）。
+export fn fr_rhyme_key(word: String) -> String {
+    let syls = fr_syllabify_word(word.clone());
+    if syls.len() == 0 {
+        return String::from("");
+    }
+    let last = syls[syls.len() - 1].clone();
+    if last.nucleus == String::from("?") {
+        return String::from("");
+    }
+    normalize_fr_nucleus(last.nucleus)
+}
+
+/// 行末词（韵脚判定用；清洗在 fr_syllabify_word 内完成）。
+export fn fr_last_word(line: String) -> String {
+    let words = line.split_whitespace();
+    match words.last() {
+        Option::Some(w) => w.clone(),
+        Option::None => String::from(""),
+    }
+}

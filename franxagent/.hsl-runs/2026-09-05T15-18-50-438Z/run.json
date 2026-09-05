@@ -1,0 +1,7 @@
+{
+  "ts": "2026-09-05T15:18:50.457Z",
+  "ok": false,
+  "panic": "import 失败：\"scan_knowledge_files\" 未被 /home/z/my-project/hsl-projects/franxagent/knowledge/index.hsl export（M3）",
+  "model": "scripted",
+  "task": ""
+}

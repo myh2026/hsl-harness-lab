@@ -1,0 +1,70 @@
+// ============================================================================
+// stanzaweaver/knowledge/embeddings.hsl — 候选词重排（向量相似度的降级实现）
+// ============================================================================
+// StanzaWeaver 原架构对应：src/knowledge/embeddings.py 的 rerank ——
+// sentence-transformers（paraphrase-multilingual-MiniLM-L12-v2）对
+// query 与词条文本做归一化向量点积，降序重排，模型不可用时静默保持原序。
+//
+// HSL 侧降级语义（如实披露）：嵌入模型属运行期重依赖（下载权重 + 推理），
+// 以字符三元组重叠相似度替代 —— query vs 词条 text+meaning（与
+// prosody/lexicon.hsl 同一约定）；同分保持声明序（镜像原版失败降级的
+// 确定性）。契约一致：空 query / 空候选 → 原样返回；截断至 top_k。
+// ============================================================================
+
+import { WordHit } from "../types/word.hsl";
+
+/// 按语义相似度重排候选词（rerank 契约见模块头）。
+export fn rerank(query: String, candidates: Vec<WordHit>, top_k: u32) -> Vec<WordHit> {
+    if query.len() == 0 || candidates.len() == 0 {
+        return candidates;
+    }
+    let q_tris = trigrams(query.clone());
+    let mut pool = candidates.clone();
+    let mut ranked: Vec<WordHit> = Vec::new();
+    // 选择排序（降序；同分取先声明者 —— 确定性）
+    while pool.len() > 0 {
+        let mut best_idx: u32 = 0;
+        let mut best_score: f64 = -1.0;
+        for pair in pool.clone().enumerate() {
+            let word = pair[1].word.clone();
+            let doc_tris = trigrams(format!("{} {}", word.text, word.meaning));
+            let score = overlap(q_tris.clone(), doc_tris);
+            if score > best_score {
+                best_score = score;
+                best_idx = pair[0];
+            }
+        }
+        let picked = pool.remove(best_idx);
+        ranked.push(picked);
+    }
+    let take_n = if top_k < ranked.len() { top_k } else { ranked.len() };
+    ranked.take(take_n)
+}
+
+/// 字符三元组（与 prosody/lexicon.hsl 同一实现约定）。
+fn trigrams(text: String) -> Vec<String> {
+    let chars = text.chars();
+    let mut out: Vec<String> = Vec::new();
+    let n = chars.len();
+    let mut i: u32 = 0;
+    while i + 2 < n {
+        out.push(chars.clone().skip(i).take(3).collect::<String>());
+        i += 1;
+    }
+    out
+}
+
+/// 三元组重叠率（hits / 总量 —— 与 lexicon.hsl 同一公式）。
+fn overlap(a: Vec<String>, b: Vec<String>) -> f64 {
+    if a.len() == 0 || b.len() == 0 {
+        return 0.0;
+    }
+    let mut hits: u32 = 0;
+    for tri in a {
+        if b.contains(tri) {
+            hits += 1;
+        }
+    }
+    let total = a.len() + b.len();
+    (hits as f64) / (total as f64)
+}

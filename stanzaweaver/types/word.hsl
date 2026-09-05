@@ -1,0 +1,120 @@
+// ============================================================================
+// stanzaweaver/types/word.hsl — 词条（词库存储层的行模型）
+// ============================================================================
+// StanzaWeaver 原架构对应：src/models/word.py 的 Word
+// （text / language / syllables: list[Syllable] / meaning，
+// syllable_count = len(syllables)）与 src/knowledge/schema.sql 的 words 表
+// （text, language, meaning, syllables_json, syllable_count）。
+// HSL 侧：同名结构 + 存储行编解码（to_store_row / from_store_row 把一行
+// 词库存储镜像为 words 表的一行 —— syllables 列为管道分隔的音节字段串）。
+// ============================================================================
+
+import { Syllable, SylConstraint } from "./syllable.hsl";
+
+/// 一个词条：文本 / 语言 / 音节切分 / 释义。
+#[derive(Debug, Clone)]
+export struct Word {
+    text: String,                // 中文原样 / 英文小写
+    language: String,            // zh/en/fr/it/la
+    syllables: Vec<Syllable>,    // 音节切分（多音字每个读音独立成条）
+    meaning: String,             // 释义（zh 来自 CC-CEDICT，fr 为音标）
+}
+
+impl Word {
+    /// 音节数（原版 syllable_count 属性；无切分时按 1 计——与 insert_words 一致）。
+    fn syllable_count(self) -> u32 {
+        let n = self.syllables.len();
+        if n == 0 { 1 } else { n }
+    }
+
+    /// 是否含任一音节满足全部给定约束（search_words 的 EXISTS 语义）。
+    /// 返回首个匹配位的下标；无匹配返回 None（matched_syllable 对齐）。
+    fn matched_syllable(self, c: SylConstraint) -> Option<u32> {
+        if c.is_any_set() == false {
+            return Option::None;
+        }
+        for pair in self.syllables.enumerate() {
+            if pair[1].clone().matches(c.clone()) {
+                return Option::Some(pair[0]);
+            }
+        }
+        Option::None
+    }
+
+    /// 词条的 JSON 渲染（原版 search_words 返回字典的形状：
+    /// {"text", "language", "meaning", "syllables": [...], "matched_syllable"}）。
+    fn to_json(self, matched: Option<u32>) -> String {
+        let mut out = format!("{{\"text\": {}, \"language\": {}, \"meaning\": {}, \"syllables\": [",
+            json_str(self.text.clone()), json_str(self.language.clone()), json_str(self.meaning.clone()));
+        let mut first: bool = true;
+        for syl in self.syllables.clone() {
+            if first == false {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(format!("{{\"onset\": {}, \"nucleus\": {}, \"coda\": {}, \"tone\": {}, \"stress\": {}, \"length\": {}}}",
+                json_str(syl.clone().onset), json_str(syl.clone().nucleus), json_str(syl.clone().coda),
+                json_str(syl.clone().tone), json_str(syl.clone().stress), json_str(syl.clone().length)).as_str());
+        }
+        out.push_str("], \"matched_syllable\": ");
+        match matched {
+            Option::Some(idx) => out.push_str(idx.to_string().as_str()),
+            Option::None => out.push_str("null"),
+        }
+        out.push_str("}");
+        out
+    }
+
+    /// 存储行（words 表一行的 TSV 镜像）：
+    /// text \t language \t meaning \t syllables \t syllable_count
+    /// 其中 syllables = 以空格分隔的 "onset|nucleus|coda|tone|stress|length"。
+    fn to_store_row(self) -> String {
+        let mut syl_fields: Vec<String> = Vec::new();
+        for syl in self.syllables.clone() {
+            syl_fields.push(syl.to_store_field());
+        }
+        let meaning_safe = self.meaning.clone()
+            .replace(String::from("\t"), String::from(" "))
+            .replace(String::from("\n"), String::from(" "));
+        format!("{}\t{}\t{}\t{}\t{}",
+            self.text.clone(), self.language.clone(), meaning_safe,
+            syl_fields.join(" "), self.syllable_count())
+    }
+
+    /// 从存储行还原（to_store_row 的逆；列数不足的行返回 None）。
+    fn from_store_row(row: String) -> Option<Word> {
+        let cols = row.split("\t");
+        if cols.len() < 5 {
+            return Option::None;
+        }
+        let text = cols.get(0).unwrap_or(String::from(""));
+        let language = cols.get(1).unwrap_or(String::from(""));
+        let meaning = cols.get(2).unwrap_or(String::from(""));
+        let syl_enc = cols.get(3).unwrap_or(String::from(""));
+        let mut syllables: Vec<Syllable> = Vec::new();
+        if syl_enc.len() > 0 {
+            for field in syl_enc.split(" ") {
+                if field.len() > 0 {
+                    syllables.push(Syllable::from_store_field(field));
+                }
+            }
+        }
+        Option::Some(Word { text, language, syllables, meaning })
+    }
+}
+
+/// JSON 字符串字面量（最小转义：反斜杠/引号/换行）。
+fn json_str(s: String) -> String {
+    let escaped = s.replace(String::from("\\"), String::from("\\\\"))
+        .replace(String::from("\""), String::from("\\\""))
+        .replace(String::from("\n"), String::from("\\n"));
+    format!("\"{}\"", escaped)
+}
+
+/// 检索命中（search_words 的返回行：词条 + 匹配音节位；
+/// 原版 search_words 返回字典列表中的 matched_syllable 字段）。
+#[derive(Debug, Clone)]
+export struct WordHit {
+    word: Word,
+    matched: Option<u32>,   // 首个满足逐位约束的音节下标；无约束或无匹配 → None
+}

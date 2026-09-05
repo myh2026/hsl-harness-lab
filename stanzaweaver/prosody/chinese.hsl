@@ -1,0 +1,196 @@
+// ============================================================================
+// stanzaweaver/prosody/chinese.hsl — 中文拼音音节表（importer 的共享底座）
+// ============================================================================
+// StanzaWeaver 原架构对应：src/prosody/chinese.py 的共享数据表
+// （FINAL_TO_PARTS 韵母拆解 / CHINESE_INITIALS 声母表 / 平仄声调映射）
+// 与 src/knowledge/importer.py 的 _YW_MAP（y/w 零声母拼写还原）。
+// importer 按此表把 CC-CEDICT 的拼音串拆为 onset/nucleus/coda + 平仄。
+//
+// 披露：原版整行分析经 pypinyin 按上下文消歧多音字（弹琴→tán、银行→háng），
+// HSL 侧仅移植拼音串的确定性拆解（词条级，不依赖外部库）——多音字消歧
+// 由 CC-CEDICT 的多读音分条承载。
+// ============================================================================
+
+import { Syllable } from "../types/syllable.hsl";
+
+/// 声调 → 平仄（原版 importer tone_map：1/2/5 声 → 平，3/4 声 → 仄）。
+fn tone_label(tone_num: String) -> String {
+    if tone_num == String::from("1") || tone_num == String::from("2") || tone_num == String::from("5") {
+        String::from("平")
+    } else if tone_num == String::from("3") || tone_num == String::from("4") {
+        String::from("仄")
+    } else {
+        String::from("")
+    }
+}
+
+/// 声母表（长度降序 —— 长声母 zh/ch/sh 优先匹配；原版 sorted by len desc）。
+fn initial_table() -> Vec<String> {
+    vec![
+        String::from("zh"), String::from("ch"), String::from("sh"),
+        String::from("b"), String::from("p"), String::from("m"), String::from("f"),
+        String::from("d"), String::from("t"), String::from("n"), String::from("l"),
+        String::from("g"), String::from("k"), String::from("h"),
+        String::from("j"), String::from("q"), String::from("x"),
+        String::from("r"), String::from("z"), String::from("c"), String::from("s"),
+        String::from("y"), String::from("w"),
+    ]
+}
+
+/// 韵母拆解表（原版 FINAL_TO_PARTS：韵母 → (韵腹, 韵尾)）。
+fn final_to_parts(f: String) -> (String, String) {
+    let table: Vec<(String, (String, String))> = vec![
+        (String::from("a"), (String::from("a"), String::from(""))),
+        (String::from("o"), (String::from("o"), String::from(""))),
+        (String::from("e"), (String::from("e"), String::from(""))),
+        (String::from("i"), (String::from("i"), String::from(""))),
+        (String::from("u"), (String::from("u"), String::from(""))),
+        (String::from("v"), (String::from("v"), String::from(""))),
+        (String::from("ü"), (String::from("ü"), String::from(""))),
+        (String::from("er"), (String::from("er"), String::from(""))),
+        (String::from("ai"), (String::from("ai"), String::from(""))),
+        (String::from("ei"), (String::from("ei"), String::from(""))),
+        (String::from("ao"), (String::from("ao"), String::from(""))),
+        (String::from("ou"), (String::from("ou"), String::from(""))),
+        (String::from("iu"), (String::from("iu"), String::from(""))),
+        (String::from("ui"), (String::from("ui"), String::from(""))),
+        (String::from("an"), (String::from("a"), String::from("n"))),
+        (String::from("en"), (String::from("e"), String::from("n"))),
+        (String::from("in"), (String::from("i"), String::from("n"))),
+        (String::from("un"), (String::from("u"), String::from("n"))),
+        (String::from("vn"), (String::from("v"), String::from("n"))),
+        (String::from("ün"), (String::from("ü"), String::from("n"))),
+        (String::from("ang"), (String::from("a"), String::from("ng"))),
+        (String::from("eng"), (String::from("e"), String::from("ng"))),
+        (String::from("ing"), (String::from("i"), String::from("ng"))),
+        (String::from("ong"), (String::from("o"), String::from("ng"))),
+        (String::from("ia"), (String::from("ia"), String::from(""))),
+        (String::from("ie"), (String::from("ie"), String::from(""))),
+        (String::from("ua"), (String::from("ua"), String::from(""))),
+        (String::from("uo"), (String::from("uo"), String::from(""))),
+        (String::from("ve"), (String::from("ve"), String::from(""))),
+        (String::from("üe"), (String::from("üe"), String::from(""))),
+        (String::from("iao"), (String::from("iao"), String::from(""))),
+        (String::from("uai"), (String::from("uai"), String::from(""))),
+        (String::from("ian"), (String::from("ia"), String::from("n"))),
+        (String::from("uan"), (String::from("ua"), String::from("n"))),
+        (String::from("van"), (String::from("va"), String::from("n"))),
+        (String::from("üan"), (String::from("üa"), String::from("n"))),
+        (String::from("iang"), (String::from("ia"), String::from("ng"))),
+        (String::from("uang"), (String::from("ua"), String::from("ng"))),
+        (String::from("iong"), (String::from("io"), String::from("ng"))),
+        (String::from("ueng"), (String::from("ue"), String::from("ng"))),
+    ];
+    for pair in table {
+        if pair.0 == f {
+            return pair.1;
+        }
+    }
+    (f, String::from(""))
+}
+
+/// y/w 零声母拼写还原为 pypinyin 风格韵母（原版 importer _YW_MAP）。
+fn yw_map(f: String) -> String {
+    let table: Vec<(String, String)> = vec![
+        (String::from("yu"), String::from("ü")),
+        (String::from("yue"), String::from("üe")),
+        (String::from("yun"), String::from("ün")),
+        (String::from("yuan"), String::from("üan")),
+        (String::from("yi"), String::from("i")),
+        (String::from("ya"), String::from("ia")),
+        (String::from("yan"), String::from("ian")),
+        (String::from("yang"), String::from("iang")),
+        (String::from("yao"), String::from("iao")),
+        (String::from("ye"), String::from("ie")),
+        (String::from("yong"), String::from("iong")),
+        (String::from("you"), String::from("iu")),
+        (String::from("ying"), String::from("ing")),
+        (String::from("wu"), String::from("u")),
+        (String::from("wa"), String::from("ua")),
+        (String::from("wo"), String::from("uo")),
+        (String::from("wai"), String::from("uai")),
+        (String::from("wei"), String::from("ui")),
+        (String::from("wan"), String::from("uan")),
+        (String::from("wen"), String::from("uen")),
+        (String::from("wang"), String::from("uang")),
+        (String::from("weng"), String::from("ueng")),
+    ];
+    for pair in table {
+        if pair.0 == f {
+            return pair.1;
+        }
+    }
+    f
+}
+
+/// 拼音 token 是否合法（原版 `[a-züv]+[1-5]?` 大小写不敏感；
+/// 空 token / 其他字符 / 多个数字均不合法）。importer 逐读音过滤用。
+export fn is_valid_pinyin_token(tok: String) -> bool {
+    if tok.len() == 0 {
+        return false;
+    }
+    let lowered = tok.to_lowercase();
+    let chars = lowered.chars();
+    let n = chars.len();
+    let mut letters: u32 = 0;
+    for pair in chars.enumerate() {
+        let ch = pair[1];
+        let is_last = pair[0] + 1 == n;
+        if "abcdefghijklmnopqrstuvwxyzüv".contains(ch) {
+            letters += 1;
+        } else {
+            if is_last && "12345".contains(ch) {
+                continue;
+            }
+            return false;
+        }
+    }
+    letters > 0
+}
+
+/// 单个拼音 token（如 "ni3"）→ 音节（原版 importer._parse_pinyin 的单步）。
+fn parse_pinyin_token(raw: String) -> Syllable {
+    let mut tone_num = String::from("");
+    let lowered = raw.to_lowercase();
+    let chars = lowered.chars();
+    let n = chars.len();
+    let last_ch = chars.skip(n - 1).take(1).collect::<String>();
+    let mut base = lowered.clone();
+    if "12345".contains(last_ch.clone()) {
+        tone_num = last_ch;
+        base = chars.take(n - 1).collect::<String>();
+    }
+    // 声母剥离（长声母优先；base == init 的整体拼读不剥离）
+    let mut onset = String::from("");
+    let mut final_part = base.clone();
+    for init in initial_table() {
+        if base.clone().starts_with(init.clone()) && base != init {
+            onset = init;
+            let bc = base.chars();
+            final_part = bc.skip(init.len()).collect::<String>();
+            break;
+        }
+    }
+    // y/w 零声母还原
+    if onset.len() == 0 && (final_part.clone().starts_with(String::from("y")) || final_part.clone().starts_with(String::from("w"))) {
+        final_part = yw_map(final_part);
+    }
+    let parts = final_to_parts(final_part);
+    Syllable {
+        onset,
+        nucleus: parts.0,
+        coda: parts.1,
+        tone: tone_label(tone_num),
+        stress: String::from(""),
+        length: String::from(""),
+    }
+}
+
+/// 拼音 token 列表 → 音节列表（词条的一个读音）。
+export fn parse_pinyin(raw_list: Vec<String>) -> Vec<Syllable> {
+    let mut out: Vec<Syllable> = Vec::new();
+    for raw in raw_list {
+        out.push(parse_pinyin_token(raw));
+    }
+    out
+}

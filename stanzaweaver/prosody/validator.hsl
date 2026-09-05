@@ -1,14 +1,30 @@
 // ============================================================================
 // stanzaweaver/prosody/validator.hsl — 符号层：格律校验（零 AI 开销）
 // ============================================================================
-// StanzaWeaver 原架构对应：prosody/（meter_validator.py + chinese.py 等）——
-// 「逐音节声调约束 + 三平尾 + 孤平 + 押韵校验，纯 Python 确定性执行」。
-// HSL 侧：全部纯 HSL 判定——行数 / 字数 / 逐字平仄 / 韵脚 / 三平尾 /
-// 孤平；违规逐条列出（ReAct 循环的模型可见反馈）。
+// StanzaWeaver 原架构对应：src/prosody/（meter_validator.py + 各语言分析器）
+// ——「逐音节声调/重音/长短约束 + 押韵 + 三平尾 + 孤平，纯确定性执行」。
+//
+// 双路径（Task 6-c）：
+//   A. zh 旧路径（回归保持）：language=zh 且模板带固定平仄谱
+//      （zh-wujue/qijue/wulv/qilv）→ 行数/字数/逐字平仄/三平尾/孤平/韵组，
+//      报错文案与既有复现逐字一致（weave-moon 剧本的拒绝场景依赖于此）；
+//      HSL 侧逐位平仄谱比原版「二四六分明」更强，已披露。
+//   B. 通用路径（五语言模板全量）：对齐原版 MeterValidator 的四层检查 ——
+//      行数 / 逐行音节数（SylSpec 定值或区间；zh=汉字数、fr=法语切分含
+//      省音联诵、en/it/la=元音组启发式）/ 逐位约束（SylConstraint，未知
+//      属性放行——镜像「查无此字不误报」）/ 韵组 + 叠句组（数据化移植
+//      各模板 validate_full 的押韵与叠句要求）。原版「任一切分变体满足即
+//      通过」的多变体组合搜索未移植（HSL 侧单变体判定），披露。
+// ============================================================================
+// 披露（语言分析器覆盖面）：zh 平仄查内置 lexicon（pypinyin 未移植）；
+// fr 走 prosody/french.hsl 简化切分；en/it/la 音节数用元音组启发式，
+// 重音/长短属性未知 → 相应逐位约束软放行（约束数据已移植，判定待分析器）。
 // ============================================================================
 
 import { MeterTemplate } from "../types/poem.hsl";
 import { Lexicon } from "./lexicon.hsl";
+import { Syllable, SylConstraint } from "../types/syllable.hsl";
+import { fr_syllabify_line, fr_rhyme_key, fr_last_word } from "./french.hsl";
 
 /// 校验结果（违规清单空 = 通过）。
 #[derive(Debug, Clone)]
@@ -17,85 +33,68 @@ export struct MeterReport {
     violations: Vec<String>,
 }
 
-/// 全量格律校验（初稿只验行数/字数；submit 前必须全量通过）。
-/// zh：逐字平仄 + 韵脚同韵组 + 三平尾 + 孤平；
-/// en：音节数（元音组计数）+ 尾韵（尾三字符弱匹配）。
+/// 是否走 zh 旧路径（固定平仄谱模板 —— 回归保持）。
+fn is_zh_legacy(template: MeterTemplate) -> bool {
+    template.language == String::from("zh") && template.tone_pattern.len() > 0
+}
+
+/// 全量格律校验（初稿只验行数/音节数；submit 前必须全量通过）。
 export fn validate_full(template: MeterTemplate, lexicon: Lexicon, lines: Vec<String>) -> MeterReport {
-    let mut violations: Vec<String> = Vec::new();
-    // 1) 行数
-    if lines.len() != template.line_count {
-        violations.push(format!("行数 {} ≠ 模板 {} 行", lines.len(), template.line_count));
+    if is_zh_legacy(template.clone()) {
+        validate_full_zh_legacy(template, lexicon, lines)
+    } else {
+        validate_full_generic(template, lexicon, lines)
     }
-    // 2) 每行字数 / 音节数
-    for pair in lines.enumerate() {
-        let line = pair[1].clone();
-        let line_no = pair[0] + 1;
-        if template.lang == String::from("zh") {
-            if line.len() != template.chars_per_line {
-                violations.push(format!("第 {} 行字数 {} ≠ {}", line_no, line.len(), template.chars_per_line));
-            }
-        } else {
-            let syllables = count_syllables(line.clone());
-            if syllables != template.syllables_per_line {
-                violations.push(format!("第 {} 行音节数 {} ≠ {}", line_no, syllables, template.syllables_per_line));
-            }
+}
+
+/// 初稿校验（只验行数 / 每行音节数 —— Step 2 的宽松门槛，
+/// 原版 MeterValidator.validate_count_only）。
+export fn validate_draft_shape(template: MeterTemplate, lines: Vec<String>) -> MeterReport {
+    if template.language == String::from("zh") && template.chars_per_line > 0 {
+        // 旧路径（回归保持）：行数 + 每行字数
+        let mut violations: Vec<String> = Vec::new();
+        if lines.len() != template.line_count {
+            violations.push(format!("行数 {} ≠ 模板 {} 行", lines.len(), template.line_count));
         }
-    }
-    // 3) 逐字平仄（zh）
-    if template.lang == String::from("zh") {
         for pair in lines.enumerate() {
             let line = pair[1].clone();
-            let line_idx = pair[0];
-            if template.tone_pattern.len() > line_idx {
-                let pattern = template.tone_pattern[line_idx].clone();
-                violations.append(check_tone_line(lexicon.clone(), line, line_idx, pattern));
-            }
-        }
-        // 4) 三平尾 / 孤平（每行独立判定）
-        for pair in lines.enumerate() {
-            violations.append(check_tail_rules(lexicon.clone(), pair[1].clone(), pair[0]));
-        }
-        // 5) 韵脚
-        violations.append(check_rhyme(lexicon.clone(), template.clone(), lines.clone()));
-    } else {
-        // en：尾韵弱匹配（尾三个字符同则视为押韵）
-        violations.append(check_en_rhyme(template.clone(), lines.clone()));
-    }
-    MeterReport { valid: violations.len() == 0, violations }
-}
-
-/// 初稿校验（只验行数 / 字数——Step 2 的宽松门槛）。
-export fn validate_draft_shape(template: MeterTemplate, lines: Vec<String>) -> MeterReport {
-    let mut violations: Vec<String> = Vec::new();
-    if lines.len() != template.line_count {
-        violations.push(format!("行数 {} ≠ 模板 {} 行", lines.len(), template.line_count));
-    }
-    for pair in lines.enumerate() {
-        let line = pair[1].clone();
-        let line_no = pair[0] + 1;
-        if template.lang == String::from("zh") {
+            let line_no = pair[0] + 1;
             if line.len() != template.chars_per_line {
                 violations.push(format!("第 {} 行字数 {} ≠ {}", line_no, line.len(), template.chars_per_line));
             }
-        } else {
-            let syllables = count_syllables(line.clone());
-            if syllables != template.syllables_per_line {
-                violations.push(format!("第 {} 行音节数 {} ≠ {}", line_no, syllables, template.syllables_per_line));
-            }
         }
+        MeterReport { valid: violations.len() == 0, violations }
+    } else {
+        // 通用路径：行数 + 逐行音节数（SylSpec；空 = 不限）
+        let mut violations: Vec<String> = Vec::new();
+        if lines.len() != template.line_count {
+            violations.push(format!("行数不匹配: 期望 {} 行, 实际 {} 行", template.line_count, lines.len()));
+        }
+        let spec = template.syl_spec.clone();
+        let min_n = if lines.len() < spec.len() { lines.len() } else { spec.len() };
+        let mut i: u32 = 0;
+        while i < min_n {
+            let expected = spec[i].clone();
+            let actual = count_line_syllables(template.clone(), lines[i].clone());
+            if expected.accepts(actual) == false {
+                violations.push(format!("第 {} 行音节数不匹配: 期望 {}, 实际 {}", i + 1, expected.show(), actual));
+            }
+            i += 1;
+        }
+        MeterReport { valid: violations.len() == 0, violations }
     }
-    MeterReport { valid: violations.len() == 0, violations }
 }
 
-/// 单行校验（refine_line 的门槛——与原实现一致：
-/// 「程序会自动校验该句的音节数和逐位约束，不通过则拒绝修改」）。
+/// 单行校验（refine_line 的门槛 —— 与原版语义一致：
+/// 音节数 + 逐位约束，不通过则拒绝修改；跨行规则留待 submit 全量校验）。
 export fn validate_line(template: MeterTemplate, lexicon: Lexicon, line_idx: u32, text: String) -> MeterReport {
-    let mut violations: Vec<String> = Vec::new();
-    if line_idx >= template.line_count {
-        violations.push(format!("行号 {} 超出模板（0 起算，共 {} 行）", line_idx, template.line_count));
-        return MeterReport { valid: false, violations };
-    }
-    if template.lang == String::from("zh") {
+    if is_zh_legacy(template.clone()) {
+        // 旧路径（回归保持）：字数 + 逐字平仄 + 三平尾/孤平
+        let mut violations: Vec<String> = Vec::new();
+        if line_idx >= template.line_count {
+            violations.push(format!("行号 {} 超出模板（0 起算，共 {} 行）", line_idx, template.line_count));
+            return MeterReport { valid: false, violations };
+        }
         if text.len() != template.chars_per_line {
             violations.push(format!("字数 {} ≠ {}", text.len(), template.chars_per_line));
         }
@@ -104,12 +103,66 @@ export fn validate_line(template: MeterTemplate, lexicon: Lexicon, line_idx: u32
             violations.append(check_tone_line(lexicon.clone(), text.clone(), line_idx, pattern));
         }
         violations.append(check_tail_rules(lexicon.clone(), text.clone(), line_idx));
+        MeterReport { valid: violations.len() == 0, violations }
     } else {
-        let syllables = count_syllables(text.clone());
-        if syllables != template.syllables_per_line {
-            violations.push(format!("音节数 {} ≠ {}", syllables, template.syllables_per_line));
+        // 通用路径（原版 MeterValidator.validate_line 文案）
+        let mut violations: Vec<String> = Vec::new();
+        if line_idx >= template.line_count {
+            violations.push(format!("行号 {} 超出模板（0 起算，共 {} 行）", line_idx, template.line_count));
+            return MeterReport { valid: false, violations };
+        }
+        let spec = template.syl_spec.clone();
+        if line_idx < spec.len() {
+            let expected = spec[line_idx].clone();
+            let actual = count_line_syllables(template.clone(), text.clone());
+            if expected.accepts(actual) == false {
+                violations.push(format!("音节数不匹配: 期望 {}, 实际 {}", expected.show(), actual));
+            }
+        }
+        let constraints = template.constraints.clone();
+        if line_idx < constraints.len() {
+            let line_c = constraints[line_idx].clone();
+            if line_c.len() > 0 {
+                let syls = line_syllables(template.clone(), lexicon.clone(), text.clone());
+                violations.append(check_line_constraints(syls, line_c, line_idx, false));
+            }
+        }
+        MeterReport { valid: violations.len() == 0, violations }
+    }
+}
+
+// ── A. zh 旧路径（既有复现的判定与文案，逐字保持） ──
+
+fn validate_full_zh_legacy(template: MeterTemplate, lexicon: Lexicon, lines: Vec<String>) -> MeterReport {
+    // 前置：is_zh_legacy 保证 language == zh 且 tone_pattern 非空
+    let mut violations: Vec<String> = Vec::new();
+    // 1) 行数
+    if lines.len() != template.line_count {
+        violations.push(format!("行数 {} ≠ 模板 {} 行", lines.len(), template.line_count));
+    }
+    // 2) 每行字数
+    for pair in lines.enumerate() {
+        let line = pair[1].clone();
+        let line_no = pair[0] + 1;
+        if line.len() != template.chars_per_line {
+            violations.push(format!("第 {} 行字数 {} ≠ {}", line_no, line.len(), template.chars_per_line));
         }
     }
+    // 3) 逐字平仄
+    for pair in lines.enumerate() {
+        let line = pair[1].clone();
+        let line_idx = pair[0];
+        if template.tone_pattern.len() > line_idx {
+            let pattern = template.tone_pattern[line_idx].clone();
+            violations.append(check_tone_line(lexicon.clone(), line, line_idx, pattern));
+        }
+    }
+    // 4) 三平尾 / 孤平（每行独立判定）
+    for pair in lines.enumerate() {
+        violations.append(check_tail_rules(lexicon.clone(), pair[1].clone(), pair[0]));
+    }
+    // 5) 韵脚
+    violations.append(check_rhyme(lexicon.clone(), template.clone(), lines.clone()));
     MeterReport { valid: violations.len() == 0, violations }
 }
 
@@ -212,7 +265,249 @@ fn line_tail_rhyme(lexicon: Lexicon, lines: Vec<String>, idx: u32) -> String {
     }
 }
 
-/// 英文音节数（元音组计数的启发式——CMUdict 的符号化简化）。
+// ── B. 通用路径（五语言模板全量） ──
+
+fn validate_full_generic(template: MeterTemplate, lexicon: Lexicon, lines: Vec<String>) -> MeterReport {
+    let mut violations: Vec<String> = Vec::new();
+    // 1) 行数（原版文案）
+    if lines.len() != template.line_count {
+        violations.push(format!("行数不匹配: 期望 {} 行, 实际 {} 行", template.line_count, lines.len()));
+    }
+    // 2) 逐行音节数（SylSpec 定值/区间）
+    let spec = template.syl_spec.clone();
+    let min_n = if lines.len() < spec.len() { lines.len() } else { spec.len() };
+    let mut i: u32 = 0;
+    while i < min_n {
+        let expected = spec[i].clone();
+        let actual = count_line_syllables(template.clone(), lines[i].clone());
+        if expected.accepts(actual) == false {
+            violations.push(format!("第 {} 行音节数不匹配: 期望 {}, 实际 {}", i + 1, expected.show(), actual));
+        }
+        i += 1;
+    }
+    // 3) 逐位约束（未知属性放行）
+    let constraints = template.constraints.clone();
+    if constraints.len() > 0 {
+        let mut li: u32 = 0;
+        while li < lines.len() {
+            if li >= constraints.len() {
+                break;
+            }
+            let line_c = constraints[li].clone();
+            if line_c.len() > 0 {
+                let syls = line_syllables(template.clone(), lexicon.clone(), lines[li].clone());
+                violations.append(check_line_constraints(syls, line_c, li, true));
+            }
+            li += 1;
+        }
+    }
+    // 4) 韵组（rhyme_groups：组内行韵脚一致——数据化移植各模板押韵要求）
+    violations.append(check_rhyme_groups(template.clone(), lexicon.clone(), lines.clone()));
+    // 5) 叠句组（refrain_groups：组内行文本归一相等）
+    violations.append(check_refrain_groups(template.clone(), lines.clone()));
+    MeterReport { valid: violations.len() == 0, violations }
+}
+
+/// 一行的音节数（语言分支）：zh=汉字数；fr=法语切分（省音/联诵）；
+/// en/it/la=元音组启发式（静音 e 修正 —— 现行 en 实现的推广）。
+fn count_line_syllables(template: MeterTemplate, line: String) -> u32 {
+    if template.language == String::from("zh") {
+        // 原版 ChineseAnalyzer.count_syllables：CJK 汉字数即音节数
+        let mut n: u32 = 0;
+        for ch in line.chars() {
+            if is_cjk(ch) {
+                n += 1;
+            }
+        }
+        n
+    } else {
+        if template.language == String::from("fr") {
+            fr_syllabify_line(line).len()
+        } else {
+            count_syllables(line)
+        }
+    }
+}
+
+/// 一行的音节序列（逐位约束判定用；属性见模块头披露）：
+/// zh=逐字（tone 查 lexicon，未知 "?"）；fr=法语切分；en/it/la=元音组伪音节。
+fn line_syllables(template: MeterTemplate, lexicon: Lexicon, line: String) -> Vec<Syllable> {
+    if template.language == String::from("zh") {
+        let mut out: Vec<Syllable> = Vec::new();
+        for ch in line.chars() {
+            if is_cjk(ch.clone()) {
+                out.push(Syllable {
+                    onset: String::from(""),
+                    nucleus: String::from(""),
+                    coda: String::from(""),
+                    tone: lexicon.clone().tone_of(ch),
+                    stress: String::from(""),
+                    length: String::from(""),
+                });
+            }
+        }
+        out
+    } else {
+        if template.language == String::from("fr") {
+            fr_syllabify_line(line)
+        } else {
+            // en/it/la：元音组伪音节（stress/length 未知 → 逐位约束软放行）
+            pseudo_syllables(line)
+        }
+    }
+}
+
+/// 单行逐位约束检查（行内文案；prefix_line=true 时带行号——全量校验用）。
+fn check_line_constraints(syls: Vec<Syllable>, line_c: Vec<SylConstraint>, line_idx: u32, prefix_line: bool) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if syls.len() == 0 {
+        if prefix_line {
+            out.push(format!("第 {} 行无音节，无法满足逐位约束", line_idx + 1));
+        } else {
+            out.push(String::from("无音节，无法满足逐位约束"));
+        }
+        return out;
+    }
+    let min_n = if syls.len() < line_c.len() { syls.len() } else { line_c.len() };
+    let mut j: u32 = 0;
+    while j < min_n {
+        let actual = syls[j].clone();
+        let c = line_c[j].clone();
+        if c.is_any_set() && actual.clone().matches(c.clone()) == false {
+            let head = if prefix_line {
+                format!("第 {} 行第 {} 音节不匹配", line_idx + 1, j + 1)
+            } else {
+                format!("第 {} 音节不匹配", j + 1)
+            };
+            out.push(format!("{}: 要求{}, 实际{}", head, c.describe(), actual.describe()));
+        }
+        j += 1;
+    }
+    out
+}
+
+/// 是否 CJK 汉字（原版 tokenize_line 的过滤范围：CJK 统一表意 + 扩展 A）。
+fn is_cjk(ch: String) -> bool {
+    let code = char_code(ch);
+    (code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3400 && code <= 0x4dbf)
+}
+
+/// 字符的码点（native 桥；用于 CJK 范围判定）。
+fn char_code(ch: String) -> u32 {
+    native typescript {
+        const c = ch.codePointAt(0);
+        return c === undefined ? 0 : c;
+    };
+}
+
+/// 韵组校验（数据化移植：原版 fr/it/zh 模板 validate_full 的
+/// _check_rhyme_group —— 组内任两行韵脚一致；无法判韵的行软跳过）。
+fn check_rhyme_groups(template: MeterTemplate, lexicon: Lexicon, lines: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for group in template.rhyme_groups.clone() {
+        let label = group.0;
+        let idxs = group.1;
+        if idxs.len() < 2 {
+            continue;
+        }
+        // 收集可判韵的行（原版：k 为空的行不入 keys）
+        let mut keys: Vec<(u32, String)> = Vec::new();
+        for idx in idxs {
+            if idx >= lines.len() {
+                continue;
+            }
+            let k = line_rhyme_key(template.clone(), lexicon.clone(), lines.clone(), idx);
+            if k.len() > 0 && k != String::from("?") {
+                keys.push((idx, k));
+            }
+        }
+        if keys.len() < 2 {
+            continue;
+        }
+        let base_idx = keys[0].0;
+        let base = keys[0].1.clone();
+        for pair in keys {
+            if pair.0 == base_idx {
+                continue;
+            }
+            if pair.1 != base {
+                out.push(format!("押韵{}不匹配: 第{}行韵脚为'{}'，第{}行韵脚为'{}'", label, base_idx + 1, base, pair.0 + 1, pair.1));
+            }
+        }
+    }
+    out
+}
+
+/// 行韵脚 key（语言分支）：zh=尾字韵组（lexicon）；fr=词末元音核（鼻化归并）；
+/// en=尾三字符弱匹配；it/la=韵脚分析未移植 → 空串（组检查软放行）。
+fn line_rhyme_key(template: MeterTemplate, lexicon: Lexicon, lines: Vec<String>, idx: u32) -> String {
+    match lines.get(idx) {
+        Option::Some(line) => {
+            if template.language == String::from("zh") {
+                let chars = line.chars();
+                let n = chars.len();
+                if n == 0 {
+                    String::from("?")
+                } else {
+                    let tail = chars.skip(n - 1).take(1).collect::<String>();
+                    lexicon.rhyme_of(tail)
+                }
+            } else {
+                if template.language == String::from("fr") {
+                    fr_rhyme_key(fr_last_word(line.clone()))
+                } else {
+                    if template.language == String::from("en") {
+                        line.chars().rev().take(3).collect::<String>()
+                    } else {
+                        String::from("")
+                    }
+                }
+            }
+        },
+        Option::None => String::from(""),
+    }
+}
+
+/// 叠句组校验（组内行文本归一相等 —— 数据化移植 triolet/ballade/villanelle
+/// 的叠句要求；归一化取原版 _norm_refrain 语义：折叠空白 + 小写）。
+fn check_refrain_groups(template: MeterTemplate, lines: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for group in template.refrain_groups.clone() {
+        if group.len() < 2 {
+            continue;
+        }
+        let first = group[0];
+        match lines.get(first) {
+            Option::Some(base) => {
+                let base_n = normalize_refrain(base.clone());
+                for idx in group {
+                    match lines.get(idx) {
+                        Option::Some(line) => {
+                            if normalize_refrain(line.clone()) != base_n.clone() {
+                                out.push(format!("叠句不匹配: 第{}行与第{}行文本不一致", first + 1, idx + 1));
+                            }
+                        },
+                        Option::None => {
+                            out.push(format!("第{}行缺失", idx + 1));
+                        },
+                    }
+                }
+            },
+            Option::None => {
+                out.push(format!("第{}行缺失", first + 1));
+            },
+        }
+    }
+    out
+}
+
+/// 叠句归一化（折叠空白 + 小写 —— 原版 _norm_refrain）。
+fn normalize_refrain(line: String) -> String {
+    line.split_whitespace().join(" ").to_lowercase()
+}
+
+/// 英文音节数（元音组计数的启发式——CMUdict 的符号化简化；
+/// 通用路径下亦作 it/la 的降级计数，披露见模块头）。
 fn count_syllables(line: String) -> u32 {
     let lowered = line.to_lowercase();
     let words = lowered.split_whitespace();
@@ -244,33 +539,46 @@ fn word_syllables(word: String) -> u32 {
     count
 }
 
-/// 英文尾韵弱匹配。
-fn check_en_rhyme(template: MeterTemplate, lines: Vec<String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if template.rhyme_lines.len() < 2 {
-        return out;
-    }
-    let first = template.rhyme_lines[0];
-    match lines.get(first) {
-        Option::Some(base) => {
-            let base_tail = base.chars().rev().take(3).collect::<String>();
-            for idx in template.rhyme_lines {
-                match lines.get(idx) {
-                    Option::Some(line) => {
-                        let tail = line.chars().rev().take(3).collect::<String>();
-                        if tail != base_tail {
-                            out.push(format!("第 {} 行尾音节与第 {} 行不押韵", idx + 1, first + 1));
-                        }
-                    },
-                    Option::None => {
-                        out.push(format!("第 {} 行缺失", idx + 1));
-                    },
+/// en/it/la 伪音节（元音组切分；onset/coda 归核间辅音，属性未知）。
+fn pseudo_syllables(line: String) -> Vec<Syllable> {
+    let lowered = line.to_lowercase();
+    let mut out: Vec<Syllable> = Vec::new();
+    for w in lowered.split_whitespace() {
+        let chars = w.chars();
+        let n = chars.len();
+        let mut onset = String::new();
+        let mut nucleus = String::from("");
+        let mut coda = String::new();
+        let mut in_nucleus = false;
+        let mut i: u32 = 0;
+        while i < n {
+            let ch = chars.get(i).unwrap_or(String::from(""));
+            if "aeiouy".contains(ch.clone()) {
+                if in_nucleus {
+                    nucleus.push_str(ch.as_str());
+                } else {
+                    nucleus = ch.clone();
+                    in_nucleus = true;
+                }
+            } else {
+                if in_nucleus {
+                    coda.push_str(ch.as_str());
+                } else {
+                    onset.push_str(ch.as_str());
                 }
             }
-        },
-        Option::None => {
-            out.push(format!("第 {} 行缺失", first + 1));
-        },
+            i += 1;
+        }
+        if nucleus.len() > 0 {
+            out.push(Syllable {
+                onset,
+                nucleus,
+                coda,
+                tone: String::from(""),
+                stress: String::from(""),
+                length: String::from(""),
+            });
+        }
     }
     out
 }

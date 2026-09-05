@@ -1,0 +1,207 @@
+// ============================================================================
+// dsh/tools/goal.hsl — get_goal / create_goal / update_goal + 回合驱动
+// ============================================================================
+// deepseek-harness 原架构对应：packages/goal（goal 服务 + tool-goal +
+// goal-round-driver）——「模型可推断长期目标并创建 goal；更新必须携带
+// 事先读取的精确 id 与 revision；完成/受阻也接受当前 goal 回合的自动
+// 续行；blocked 阈值（默认 3）约束自主回合过早报阻；驱动器在 agent
+// 空闲且有活跃 goal 且有剩余回合容量时自动开下一回合」。
+// HSL 侧：goal 服务状态 = RunState.goal（Option<Goal>）；工具三入口 +
+// round driver 的回合提示注入；紧凑 JSON 记录输出对齐原版面。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+import { RunState, Goal, DispatchOutcome } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+
+/// blocked 自报阈值（原版默认 3：自主回合过早报阻被拒绝）。
+const BLOCKED_THRESHOLD: u32 = 3;
+
+/// get_goal：读当前 goal（无 goal → `{ goal: null }`）。
+export fn get_goal(state: RunState) -> DispatchOutcome {
+    let output = match state.clone().goal {
+        Option::Some(g) => render_record(g),
+        Option::None => String::from("{ goal: null }"),
+    };
+    DispatchOutcome {
+        state,
+        result: ToolResult {
+            call: String::from("get_goal"),
+            ok: true,
+            output,
+            duration_ms: 0,
+        },
+        events: Vec::new(),
+    }
+}
+
+/// create_goal：从直接人类回合创建（转录中存在用户消息即视为有人回合；
+/// 简化口径，README 披露）。max_rounds=0 → 缺省 4。
+export fn create_goal(mut state: RunState, objective: String, max_rounds: u32) -> DispatchOutcome {
+    if objective.trim().len() == 0 {
+        return denied(state, String::from("create_goal"), String::from("objective must be a non-empty string"));
+    }
+    let already = match state.clone().goal {
+        Option::Some(_) => true,
+        Option::None => false,
+    };
+    if already {
+        return denied(state, String::from("create_goal"), String::from("a goal is already current; update or complete it first"));
+    }
+    let human_turn = state.clone().transcript.iter().any(|m| m.role == String::from("user"));
+    if human_turn == false {
+        return denied(state, String::from("create_goal"), String::from("create_goal requires a direct human turn on a top-level agent"));
+    }
+    let cap = if max_rounds > 0 { max_rounds } else { 4 };
+    let goal = Goal {
+        id: String::from("g-1"),
+        revision: 1,
+        objective: objective.trim(),
+        max_rounds: cap,
+        phase: String::from("active"),
+        rounds: 0,
+        blocked_reason: String::from(""),
+    };
+    state.goal = Option::Some(goal.clone());
+    let output = render_record(goal);
+    DispatchOutcome {
+        state,
+        result: ToolResult {
+            call: String::from("create_goal"),
+            ok: true,
+            output,
+            duration_ms: 0,
+        },
+        events: vec![SessionEvent::GoalCreated { id: String::from("g-1"), objective: objective.trim() }],
+    }
+}
+
+/// update_goal：edit / pause / resume / complete / blocked（携带精确
+/// goal_id + revision；blocked 需理由且受回合阈值约束）。
+export fn update_goal(state: RunState, goal_id: String, revision: u32, action: String, objective: String, max_rounds: u32, blocked_reason: String) -> DispatchOutcome {
+    let current = state.clone().goal;
+    let goal = match current {
+        Option::Some(g) => g,
+        Option::None => {
+            return denied(state, String::from("update_goal"), String::from("no current goal to update"));
+        },
+    };
+    if goal.id != goal_id {
+        return denied(state, String::from("update_goal"), format!("goal id mismatch: requested {} but current is {}", goal_id, goal.id));
+    }
+    if goal.revision != revision {
+        return denied(state, String::from("update_goal"), format!("goal revision mismatch: requested {} but current is {} (call get_goal and copy the exact revision)", revision, goal.revision));
+    }
+    if action == String::from("edit") {
+        if objective.trim().len() == 0 {
+            return denied(state, String::from("update_goal"), String::from("edit requires a replacement objective"));
+        }
+        return apply(state, goal.id.clone(), goal.revision + 1, objective.trim(), if max_rounds > 0 { max_rounds } else { goal.max_rounds }, goal.phase.clone(), goal.rounds, String::from(""), String::from("edit"));
+    }
+    if action == String::from("pause") {
+        return apply(state, goal.id.clone(), goal.revision + 1, goal.objective.clone(), goal.max_rounds, String::from("paused"), goal.rounds, String::from(""), String::from("pause"));
+    }
+    if action == String::from("resume") {
+        return apply(state, goal.id.clone(), goal.revision + 1, goal.objective.clone(), goal.max_rounds, String::from("active"), goal.rounds, String::from(""), String::from("resume"));
+    }
+    if action == String::from("complete") {
+        return apply(state, goal.id.clone(), goal.revision + 1, goal.objective.clone(), goal.max_rounds, String::from("completed"), goal.rounds, String::from(""), String::from("complete"));
+    }
+    if action == String::from("blocked") {
+        if blocked_reason.trim().len() == 0 {
+            return denied(state, String::from("update_goal"), String::from("blocked requires blocked_reason"));
+        }
+        if goal.rounds < BLOCKED_THRESHOLD {
+            return denied(state, String::from("update_goal"), format!("cannot report blocked before goal round {} (current round {})", BLOCKED_THRESHOLD, goal.rounds));
+        }
+        return apply(state, goal.id.clone(), goal.revision + 1, goal.objective.clone(), goal.max_rounds, String::from("blocked"), goal.rounds, blocked_reason.trim(), String::from("blocked"));
+    }
+    denied(state, String::from("update_goal"), format!("action must be one of edit/pause/resume/complete/blocked, got \"{}\"", action))
+}
+
+/// 回合驱动判定：done + 审查通过后是否自动开下一 goal 回合。
+/// 返回 Some(round prompt) 时主循环注入续行提示（rounds+1、
+/// GoalRoundStarted 事件由 advance_round 落账）。
+export fn goal_round_due(state: RunState) -> Option<String> {
+    let goal = state.clone().goal;
+    let g = match goal {
+        Option::Some(g) => g,
+        Option::None => return Option::None,
+    };
+    if g.phase != String::from("active") {
+        return Option::None;
+    }
+    if g.rounds >= g.max_rounds {
+        return Option::None;
+    }
+    let next = g.rounds + 1;
+    Option::Some(format!(
+        "goal round {}/{}: continue working toward the objective: {}\nOnly goal-sourced rounds count against the round cap. When the objective is met, call update_goal with action \"complete\".",
+        next,
+        g.max_rounds,
+        g.objective
+    ))
+}
+
+/// 回合记账（round driver 开回合时调用；rounds+1）。
+export fn advance_round(mut state: RunState) -> (RunState, SessionEvent) {
+    let goal = match state.clone().goal {
+        Option::Some(g) => g,
+        Option::None => Goal { id: String::from("-"), revision: 0, objective: String::from(""), max_rounds: 0, phase: String::from(""), rounds: 0, blocked_reason: String::from("") },
+    };
+    let next = goal.rounds + 1;
+    let updated = Goal { id: goal.id, revision: goal.revision, objective: goal.objective, max_rounds: goal.max_rounds, phase: goal.phase, rounds: next, blocked_reason: goal.blocked_reason };
+    state.goal = Option::Some(updated);
+    (state, SessionEvent::GoalRoundStarted { round: next, cap: goal.max_rounds })
+}
+
+/// 应用一次更新（唯一状态写入口）。
+fn apply(mut state: RunState, id: String, revision: u32, objective: String, max_rounds: u32, phase: String, rounds: u32, blocked_reason: String, action: String) -> DispatchOutcome {
+    let goal = Goal { id: id.clone(), revision, objective: objective.clone(), max_rounds, phase: phase.clone(), rounds, blocked_reason: blocked_reason.clone() };
+    state.goal = Option::Some(goal.clone());
+    DispatchOutcome {
+        state,
+        result: ToolResult {
+            call: String::from("update_goal"),
+            ok: true,
+            output: render_record(goal),
+            duration_ms: 0,
+        },
+        events: vec![SessionEvent::GoalUpdated { id, action, phase }],
+    }
+}
+
+/// 软拒绝（工具参数/权限错误 → ok=false 观察文案，不落 Guard 事件）。
+fn denied(state: RunState, call: String, message: String) -> DispatchOutcome {
+    DispatchOutcome {
+        state,
+        result: ToolResult {
+            call,
+            ok: false,
+            output: message,
+            duration_ms: 0,
+        },
+        events: Vec::new(),
+    }
+}
+
+/// 紧凑 JSON 记录（对齐原版 get_goal 输出面）。
+fn render_record(goal: Goal) -> String {
+    let armed = goal.phase == String::from("active") && goal.rounds < goal.max_rounds;
+    let blocker = if goal.blocked_reason.len() > 0 {
+        format!("\"{}\"", goal.blocked_reason)
+    } else {
+        String::from("null")
+    };
+    format!(
+        "{{ goal: {{ goal_id: \"{}\", revision: {}, objective: \"{}\", phase: \"{}\", rounds_started: {}, round_cap: {}, blocker: {}, continuation_armed: {} }} }}",
+        goal.id,
+        goal.revision,
+        goal.objective,
+        goal.phase,
+        goal.rounds,
+        goal.max_rounds,
+        blocker,
+        armed
+    )
+}

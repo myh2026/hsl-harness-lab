@@ -3,43 +3,43 @@
     {
       "key": "dsh",
       "name": "deepseek-harness",
-      "origFiles": 89,
-      "origLoc": 21842,
-      "hslFiles": 16,
-      "hslLoc": 1317,
-      "nativeTsLoc": 19,
+      "origFiles": 277,
+      "origLoc": 58833,
+      "hslFiles": 39,
+      "hslLoc": 4992,
+      "nativeTsLoc": 14,
       "replicaLoc": 2261,
       "origUiLoc": 0,
-      "rate": 0.9397033238714403
+      "rate": 0.9151496609045944
     },
     {
       "key": "franx",
       "name": "FranxAgent",
       "origFiles": 29,
       "origLoc": 5120,
-      "hslFiles": 14,
-      "hslLoc": 1403,
+      "hslFiles": 21,
+      "hslLoc": 2770,
       "nativeTsLoc": 0,
       "replicaLoc": 0,
       "origUiLoc": 3541,
-      "rate": 0.7259765625
+      "rate": 0.458984375
     },
     {
       "key": "stanza",
       "name": "StanzaWeaver",
       "origFiles": 35,
       "origLoc": 6782,
-      "hslFiles": 9,
-      "hslLoc": 1212,
+      "hslFiles": 16,
+      "hslLoc": 3518,
       "nativeTsLoc": 0,
       "replicaLoc": 0,
       "origUiLoc": 2266,
-      "rate": 0.8212916543792391
+      "rate": 0.48127396048363313
     }
   ],
   "total": {
-    "origLoc": 33744,
-    "hslLoc": 3932,
-    "rate": 0.8834755808440019
+    "origLoc": 70735,
+    "hslLoc": 11280,
+    "rate": 0.8405315614617941
   }
 }

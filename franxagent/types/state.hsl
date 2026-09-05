@@ -2,8 +2,12 @@
 // franxagent/types/state.hsl — 配置 / 轮统计 / 会话状态 / 会话报告
 // ============================================================================
 // FranxAgent 原架构对应：config.json（language/api_key/base_url/model/
-// temperature/thinking/knowledge_k）+ agent.py 的消息持久化与预算。
-// HSL 侧：FranxConfig::from_config 经 $host.config 装配（S1 零隐式转换）。
+// temperature/thinking/knowledge_k/mcp_servers）+ agent.py 的消息持久化
+// 与预算。HSL 侧：FranxConfig::from_config 经 $host.config 装配
+//（S1 零隐式转换）。
+// v6：TurnStats 增加 compressions（上下文压缩计数）；FranxConfig 增加
+// mcp_servers（config.json 的 mcp_servers 声明）与 model_track（剧本
+// 轨道名——定时任务会话用独立轨道 task_acts，主会话用 acts）。
 // ============================================================================
 
 import { Message } from "./messages.hsl";
@@ -12,6 +16,15 @@ import { FranxError } from "./errors.hsl";
 export const DEFAULT_MAX_TURNS: u32 = 16;
 export const DEFAULT_KNOWLEDGE_K: u32 = 5;
 export const DEFAULT_MAX_OUTPUT: u32 = 4_000;
+export const DEFAULT_CONTEXT_RETRIES: u32 = 3;
+
+/// config.json 的 mcp_servers 声明（运行时注册表镜像；tools 元数据里
+/// 的 server_name/tool_name 外部工具形态由此配置驱动）。
+/// 注：真实 MCP stdio 客户端属 web 适配层（mcps.py 的子进程管理），
+/// HSL 契约层只到「配置声明 + 路由转发」为止——见 tools/mcp.hsl。
+export const MCP_SERVERS: Vec<String> = vec![
+    String::from("notes-mcp"),
+];
 
 /// 会话配置（config.json 的 HSL 投影）。
 #[derive(Debug, Clone)]
@@ -26,6 +39,8 @@ export struct FranxConfig {
     task: String,
     allow: Vec<String>,
     approval: String,
+    mcp_servers: Vec<String>,
+    model_track: String,
 }
 
 impl FranxConfig {
@@ -63,6 +78,8 @@ impl FranxConfig {
             task,
             allow,
             approval,
+            mcp_servers: MCP_SERVERS.clone(),
+            model_track: String::from("acts"),
         })
     }
 }
@@ -79,11 +96,12 @@ export struct TurnStats {
     failures: u32,
     corrections: u32,
     memories: u32,
+    compressions: u32,
 }
 
 impl TurnStats {
     fn zero() -> TurnStats {
-        TurnStats { turns: 0, tool_calls: 0, commands: 0, proposals: 0, approved: 0, rejected: 0, failures: 0, corrections: 0, memories: 0 }
+        TurnStats { turns: 0, tool_calls: 0, commands: 0, proposals: 0, approved: 0, rejected: 0, failures: 0, corrections: 0, memories: 0, compressions: 0 }
     }
 }
 
@@ -93,6 +111,21 @@ export struct SessionState {
     config: FranxConfig,
     history: Vec<Message>,
     stats: TurnStats,
+}
+
+/// 知识库增量索引观测（check_and_update 的统计出口）。
+#[derive(Debug, Clone)]
+export struct KnowledgeStats {
+    docs: u32,
+    indexed: u32,
+    skipped: u32,
+    orphans_dropped: u32,
+}
+
+impl KnowledgeStats {
+    fn zero() -> KnowledgeStats {
+        KnowledgeStats { docs: 0, indexed: 0, skipped: 0, orphans_dropped: 0 }
+    }
 }
 
 /// 会话报告（出口产物）。
@@ -110,6 +143,8 @@ export struct SessionReport {
     corrections: u32,
     failures: u32,
     memories: u32,
+    compressions: u32,
+    knowledge: KnowledgeStats,
     reply: String,
     history_lines: u32,
     ok: bool,

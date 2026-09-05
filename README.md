@@ -70,9 +70,11 @@ DHV_TS=/path/to/hsl/toolchain/dhv-ts/src/main.ts bash mathphys/run-tests.sh
 `web/`（原版 UI 复刻 + Bun 适配服务器）+ `fixtures/`（确定性剧本）。
 
 `.toolchain/` 为 vendored dhv-ts 参考解释器（已包含 `toolchain-patches/`
-中的两处上游 bug 修复：`mut self` 解析 + native 块正则字面量），
+中的**四处**上游 bug 修复：`mut self` 解析、native 块正则字面量、
+语句边界换行粘调用、内置 Option/Result 缺 clone——前两处已合入上游
+main（PR #1），后两处见补丁 diff），
 克隆本仓库即可直接 `bun .toolchain/dhv-ts/src/main.ts check <project>/<entry>.hsl`，
-无需另外检出工具链仓库。
+无需另外检出工具链仓库。每包 `run-tests.sh` 一键全量回归。
 
 压缩率口径与统计脚本见 `stats/`（原始后端源码字符数 → HSL 源码字符数，
 不含两端 web UI 与测试资产）。

@@ -6,7 +6,7 @@
 // 拼接序）+ assemble 全量渲染 + with_variables 编译期插值协作。
 // ============================================================================
 
-import { ToolCall } from "../types/messages.hsl";
+import { registered_calls } from "./registry.hsl";
 import { SYSTEM_PROMPT, REVIEW_RUBRIC } from "../config/resources.hsl";
 
 /// 提示词分节（order 升序拼接；同 order 保持声明序）。
@@ -74,19 +74,46 @@ impl SystemPrompt {
 }
 
 /// 工具 schema 渲染：封闭枚举 ToolCall 的调用面（S6 保证 schema 与
-/// 分发器永不漂移——新增变体时这里编译期报错）。
+/// 分发器永不漂移——新增变体时 registered_calls 编译期直面）。
+/// schema 渲染与 registered_calls() 同源：注册面即 schema 面。
 fn render_tool_schemas() -> String {
-    let read = ToolCall::ReadFile { path: String::from("<relative path>") };
-    let write = ToolCall::WriteFile { path: String::from("<relative path>"), content: String::from("<full file content>") };
-    let edit = ToolCall::EditFile { path: String::from("<relative path>"), old_text: String::from("<exact existing text>"), new_text: String::from("<replacement>") };
-    let bash = ToolCall::Bash { command: String::from("<shell command>") };
-    let list = ToolCall::ListFiles;
     let mut out = String::from("");
-    for call in vec![read, write, edit, bash, list] {
-        out.push_str(call.name().as_str());
+    for call in registered_calls() {
+        out.push_str(schema_line(call.name()).as_str());
         out.push_str("\n");
     }
     out
+}
+
+/// 单工具 schema 行（模型可见调用格式；与 executor 解析层互为镜像）。
+fn schema_line(name: String) -> String {
+    match name.as_str() {
+        "read_file" => String::from("- read_file: {\"action\": \"tool\", \"tool\": \"read_file\", \"path\": \"<relative path>\"}"),
+        "write_file" => String::from("- write_file: {\"action\": \"tool\", \"tool\": \"write_file\", \"path\": \"<relative path>\", \"content\": \"<full file content>\"}"),
+        "edit_file" => String::from("- edit_file: {\"action\": \"tool\", \"tool\": \"edit_file\", \"path\": \"<relative path>\", \"old_text\": \"<exact existing text>\", \"new_text\": \"<replacement>\"}"),
+        "bash" => String::from("- bash: {\"action\": \"tool\", \"tool\": \"bash\", \"command\": \"<shell command>\"}"),
+        "list_files" => String::from("- list_files: {\"action\": \"tool\", \"tool\": \"list_files\"}"),
+        "read_image" => String::from("- read_image: {\"action\": \"tool\", \"tool\": \"read_image\", \"path\": \"<image path>\"}（受限面：本宿主无解码能力，返回元信息+披露）"),
+        "glob" => String::from("- glob: {\"action\": \"tool\", \"tool\": \"glob\", \"pattern\": \"<glob pattern>\", \"path\": \"<search path>\"}"),
+        "grep" => String::from("- grep: {\"action\": \"tool\", \"tool\": \"grep\", \"pattern\": \"<regex>\", \"path\": \"<search path>\", \"include\": \"<glob filter>\"}"),
+        "str_replace_editor" => String::from("- str_replace_editor: {\"action\": \"tool\", \"tool\": \"str_replace_editor\", \"command\": \"view|create|str_replace|insert\", \"path\": \"<path>\", \"file_text\": \"<create full text>\", \"old_str\": \"<str_replace literal>\", \"new_str\": \"<replacement>\", \"insert_line\": <0-based line>, \"view_range\": [<start>, <end>]}"),
+        "todo_write" => String::from("- todo_write: {\"action\": \"tool\", \"tool\": \"todo_write\", \"todos\": [{\"content\": \"<non-empty unique>\", \"status\": \"pending|in_progress|completed\"}]}（整表替换；单 in_progress 纪律）"),
+        "skill" => String::from("- skill: {\"action\": \"tool\", \"tool\": \"skill\", \"name\": \"<skill name>\"}（目录见 <available_skills> 分节）"),
+        "get_goal" => String::from("- get_goal: {\"action\": \"tool\", \"tool\": \"get_goal\"}"),
+        "create_goal" => String::from("- create_goal: {\"action\": \"tool\", \"tool\": \"create_goal\", \"objective\": \"<objective>\", \"max_rounds\": <cap>}（需直接人类回合；一 goal 一次）"),
+        "update_goal" => String::from("- update_goal: {\"action\": \"tool\", \"tool\": \"update_goal\", \"goal_id\": \"<exact id>\", \"revision\": <exact revision>, \"action\": \"edit|pause|resume|complete|blocked\", \"objective\": \"<edit 替换>\", \"max_rounds\": <cap>, \"blocked_reason\": \"<blocked 理由>\"}"),
+        "web_search" => String::from("- web_search: {\"action\": \"tool\", \"tool\": \"web_search\", \"query\": \"<query>\"}（来源标注外部不可信）"),
+        "web_fetch" => String::from("- web_fetch: {\"action\": \"tool\", \"tool\": \"web_fetch\", \"url\": \"<url>\"}（非 2xx 也是结果）"),
+        "subagent" => String::from("- subagent: {\"action\": \"tool\", \"tool\": \"subagent\", \"task\": \"<delegated task>\"}（独立会话切片；父只见终报）"),
+        "job_spawn" => String::from("- job_spawn: {\"action\": \"tool\", \"tool\": \"job_spawn\", \"command\": \"<command>\"}（后台任务表）"),
+        "job_output" => String::from("- job_output: {\"action\": \"tool\", \"tool\": \"job_output\", \"job_id\": \"<id>\", \"wait\": <bool>, \"timeout_ms\": <ms>}"),
+        "job_list" => String::from("- job_list: {\"action\": \"tool\", \"tool\": \"job_list\"}"),
+        "job_kill" => String::from("- job_kill: {\"action\": \"tool\", \"tool\": \"job_kill\", \"job_id\": \"<id>\", \"reason\": \"<optional>\"}"),
+        "ralph" => String::from("- ralph: {\"action\": \"tool\", \"tool\": \"ralph\", \"objective\": \"<immutable objective>\", \"max_rounds\": <cap>}（全新子代理接力；COMPLETE:/BLOCKED: 前缀）"),
+        "workflow" => String::from("- workflow: {\"action\": \"tool\", \"tool\": \"workflow\", \"steps\": \"<每行一步>\"}（顺序扇出；前台阻塞）"),
+        "ask_user" => String::from("- ask_user: {\"action\": \"tool\", \"tool\": \"ask_user\", \"questions\": \"<question set>\"}（挂起等人类作答）"),
+        other => format!("- {}: (schema 待登记)", other),
+    }
 }
 
 /// 审查者提示词（review 闸门独立装配，与主提示词同源不同实例）。

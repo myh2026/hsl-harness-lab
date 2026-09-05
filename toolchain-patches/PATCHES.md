@@ -45,15 +45,91 @@ DuckDuckGo 检索即真实用例）都会撞上。
 见仓库 `hsl-projects/.toolchain/dhv-ts/src/lexer.ts` 的
 `scanRawBody`（含 `isRegexStart` 辅助方法），带 BUGFIX 注释标记。
 
-## 应用方式
+## 补丁 3：语句边界换行粘调用（parser.ts，v0.2.57）
 
-```bash
-git clone https://github.com/myh2026/harness-specification-language.git
-cd harness-specification-language/toolchain
-# 按上述补丁修改 dhv-ts/src/parser.ts 与 dhv-ts/src/lexer.ts
-# 然后即可运行本复现：
-bun dhv-ts/src/main.ts run <本项目的入口 .hsl> --model scripted --fixture <fixtures/*.json> ...
+**现象**：块型表达式语句（`if` / `match` / 原生块）之后的下一行若以
+`(` 开头（最典型：函数末尾的元组返回值 `(docs, versions)`），运行期报
+`不可调用的值：unit`。
+
+**根因**：`parsePostfix` 的后缀调用链对 `(` 无行界判定——表达式结束后
+新行上的 `(...)` 被贪婪粘成「对前一表达式结果的调用」：
+
+```hsl
+if r.ok { ... }      // 语句（自终结）
+(docs, versions)     // ← 被误解析为 if结果(docs, versions)
 ```
+
+if 表达式求值为 unit（无 else），调用 unit → 崩溃。等价于 JS
+「没有 ASI 的换行陷阱」。本复现 FranxAgent 的 `load_sidecar()`
+（元组返回 + 前置 if 语句）最小复现：
+
+```hsl
+fn f() -> (u32, u32) {
+    if true { let x = 1; }
+    (1, 2)   // ← 粘调用
+}
+```
+
+**修复**（`parser.ts` `parsePostfix` 裸 `(` 后缀分支）：
+
+```diff
+       if (this.atP('(')) {
++        // v0.2.57（Bug #3 换行粘调用）：`(` 位于新行 → 不粘接前一表达式
++        const prevTok = this.i > 0 ? this.toks[this.i - 1]! : null;
++        if (prevTok && this.peek().line > prevTok.line) return expr;
+         this.next();
+```
+
+合法多行调用不受影响：`(` 与被调者同行（`foo(\n  arg\n)`）依旧成立；
+以 `.` 开头的新行方法链不受影响。
+
+**回归**：53 官方 fixtures + 3 官方示例 + 三复现全量（check/run/emit）。
+
+## 补丁 4：内置 Option/Result 缺 `clone` 方法（builtins.ts，v0.2.57）
+
+**现象**：`let b = a.clone()`（a 为 `Option<u32>`）运行期报
+`Option 没有方法 "clone"`；而自定义 `#[derive(Clone)]` 枚举可 clone。
+
+**根因**：方法解析表里用户枚举走通用 `clone`（cloneValue 深拷贝），
+但 `OPTION_METHODS` / `RESULT_METHODS` 只登记了 `cloned()`（Rust 里
+那是 `Option<&T>` 的另一方法）而没有 `clone`。Rust 语义：
+`Option<T: Clone>` 实现 `Clone`——内置枚举反而比用户枚举弱，属不一致。
+
+本复现 StanzaWeaver 词库命中路径的 `hit.matched.clone()`
+（`Option<u32>`）最小复现：
+
+```hsl
+let a: Option<u32> = Option::Some(1);
+let b = a.clone();   // ← Option 没有方法 "clone"
+```
+
+**修复**（`builtins.ts` 两个方法表各加一行）：
+
+```diff
+ export const OPTION_METHODS: Record<string, BuiltinMethod> = {
+   ...
+   cloned: { ... },
++  // v0.2.57（Bug #4）：Option 缺 clone（与用户枚举对齐）
++  clone: { fn: (r) => cloneValue(r) },
+ };
+```
+
+（`RESULT_METHODS` 同补。）
+
+## 语言设计观察（补充）
+
+6. **尾表达式分号语义静默吞返回值**：`fn f() -> T { ...; X; }`（尾表达式
+   带分号）把 T 返回变成 unit，而 **check 不校验尾表达式与声明返回类型
+   的一致性**——本复现 StanzaWeaver 的 refine_line 被拒分支因此静默返回
+   unit（运行期在 `.draft` 解引用处才爆）。建议 check 增加
+   「路径返回类型 vs 声明返回类型」穷尽校验（Rust 的 E0308 等价物）；
+7. **emit 的退出码把顾问性 X-1 警告当硬失败**（exit 1）：混合语言
+   project 声明（python graph + ts 模型 + rust 规则）下跨语言引用
+   是固有形态，X-1 只应是诊断；建议区分 `--strict-warnings` 才转非零；
+8. **fixture faults 是回路能力的天然测试钩子**：上下文超限压缩
+   （FranxAgent memory()）经 `faults: [{target: "fixture.next:acts",
+   nth: N, kind: "error"}]` 注入即可确定性触发——建议在 guide 的
+   测试章节收录此模式。
 
 ## 语言设计观察（复现过程中的其他体会）
 

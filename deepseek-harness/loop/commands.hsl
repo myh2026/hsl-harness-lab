@@ -1,0 +1,144 @@
+// ============================================================================
+// dsh/loop/commands.hsl — commands 框架（斜杠命令分支）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/interaction/commands + 各命令插件
+// ——「用户在交互 UI 输入 /command [input] 直接对代理执行：不创建模型
+// 消息，结果由 adapter 渲染，绝不进入模型历史；命令注册名/描述/处理
+// 器；每次运行计入会话日志」。HSL 侧注册命令集：
+//   /compact [reason]  → compaction 按需压缩（command-compact）
+//   /feedback <remark> → 反馈记录（command-feedback）
+//   /goal <objective>  → 用户侧 goal 创建（command-goal）
+//   /plan [off]        → 计划模式开关（plan-mode）
+//   /restore           → 回滚最后检查点（checkpoint 能力的测试入口）
+//   /<skill-name>      → 技能直唤注入（skill 的 /name token 协议）
+// 未知命令 → 提示文案（同样不进模型历史）。
+// 命令不耗模型回合（主循环 turns 不因命令递增）。
+// ============================================================================
+
+import { Message } from "../types/messages.hsl";
+import { RunState } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+import { split_command } from "./channel.hsl";
+import { compact_now } from "./compaction.hsl";
+import { record as record_feedback } from "./feedback.hsl";
+import { restore_last } from "./checkpoint.hsl";
+import { create_goal } from "../tools/goal.hsl";
+import { strip_frontmatter, discover_skills } from "../tools/skill.hsl";
+
+/// 命令产物：state/transcript 更新 + 事件 + adapter 通告（不进模型历史）。
+export struct CommandOutcome {
+    state: RunState,
+    transcript: Vec<Message>,
+    events: Vec<SessionEvent>,
+    notice: String,
+}
+
+/// 分发一条斜杠命令（commands 框架入口；不耗模型回合）。
+export async fn run_command(mut state: RunState, transcript: Vec<Message>, input: String) -> CommandOutcome {
+    let (cmd, arg) = split_command(input.clone());
+    let mut events: Vec<SessionEvent> = Vec::new();
+    events.push(SessionEvent::CommandRun { command: cmd.clone() });
+    match cmd.as_str() {
+        "compact" => {
+            let outcome = compact_now(state.clone().policy, transcript).await;
+            if outcome.compacted {
+                state.stats.compactions += 1;
+            }
+            for e in outcome.events.clone() {
+                events.push(e);
+            }
+            let notice = if outcome.compacted {
+                outcome.notice
+            } else {
+                String::from("Compaction is unavailable: the conversation has no older span to condense (mid-turn runs are also refused).")
+            };
+            CommandOutcome { state, transcript: outcome.transcript, events, notice }
+        },
+        "feedback" => {
+            let (state_after, evs, notice) = record_feedback(state, arg);
+            for e in evs {
+                events.push(e);
+            }
+            CommandOutcome { state: state_after, transcript, events, notice }
+        },
+        "goal" => {
+            if arg.len() == 0 {
+                return CommandOutcome { state, transcript, events, notice: String::from("Usage: /goal <objective>") };
+            }
+            let outcome = create_goal(state, arg.clone(), 0);
+            let mut out_events = events;
+            for e in outcome.events.clone() {
+                out_events.push(e);
+            }
+            CommandOutcome { state: outcome.state, transcript, events: out_events, notice: format!("Goal created: {}", arg) }
+        },
+        "plan" => {
+            let turning_off = arg == String::from("off");
+            state.plan_mode = turning_off == false;
+            events.push(SessionEvent::PlanModeChanged { active: state.plan_mode });
+            let notice = if turning_off {
+                String::from("Plan mode is off. Write tools are unblocked.")
+            } else if arg.len() > 0 {
+                format!("Plan mode is on (note: {}). The agent explores and designs first; write tools are gated until you approve its plan.", arg)
+            } else {
+                String::from("Plan mode is on. The agent explores and designs first; write tools are gated until you approve its plan.")
+            };
+            CommandOutcome { state, transcript, events, notice }
+        },
+        "restore" => {
+            let (state_after, evs, notice) = restore_last(state);
+            for e in evs {
+                events.push(e);
+            }
+            CommandOutcome { state: state_after, transcript, events, notice }
+        },
+        other => {
+            // /<skill-name> 直唤（skill 的用户侧入口）
+            let hit = invoke_skill_by_name(other);
+            match hit {
+                Option::Some(instructions) => {
+                    let mut next = transcript.clone();
+                    next.push(Message::user(format!("[skill {}] {}", other, instructions)));
+                    CommandOutcome { state, transcript: next, events, notice: format!("Skill \"{}\" loaded into the step.", other) }
+                },
+                Option::None => {
+                    let known = known_commands();
+                    CommandOutcome { state, transcript, events, notice: format!("Unknown command: /{} (known: {})", other, known) }
+                },
+            }
+        },
+    }
+}
+
+/// 技能直唤：命中即返回剥壳指令体。
+fn invoke_skill_by_name(name: String) -> Option<String> {
+    let entries = discover_skills();
+    for e in entries {
+        if e.name == name {
+            let path = format!("skills/{}.md", name);
+            let body = native typescript {
+                try {
+                    return await $host.fs.read(path);
+                } catch {
+                    return "";
+                }
+            };
+            return Option::Some(strip_frontmatter(body));
+        }
+    }
+    Option::None
+}
+
+/// 已知命令清单（未知命令提示用）。
+fn known_commands() -> String {
+    let mut out = String::from("/compact, /feedback, /goal, /plan, /plan off, /restore");
+    let entries = discover_skills();
+    if entries.len() > 0 {
+        out.push_str(", plus skill names: ");
+        for e in entries {
+            out.push_str(format!("/{}, ", e.name).as_str());
+        }
+        out = out.trim_end().strip_suffix(",").unwrap_or(out.trim_end()).to_string();
+    }
+    out
+}

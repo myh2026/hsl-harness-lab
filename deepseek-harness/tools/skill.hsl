@@ -1,0 +1,152 @@
+// ============================================================================
+// dsh/tools/skill.hsl — skill 目录发现 / 按名装载（skill + tool-skill）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/skill——「技能 = skills 目录里的
+// 可发现指令单元：会话启动即得目录（名称 + 封顶描述），按名装载全文；
+// 用户也可以 /<name> 直接触发注入」。HSL 侧：目录发现（skills/ 下 .md）
+// + frontmatter 描述解析 + 按名装载（剥 frontmatter），全为纯字符串工程。
+// 偏差披露：原版目录变动会追加「完整替换目录」事件；本复现目录在
+// 回合中途不变（工作区 skills/ 为静态资源），发布事件仅在装载时一次。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+
+/// 技能目录条目（catalog 行）。
+export struct SkillEntry {
+    name: String,
+    description: String,
+}
+
+/// 发现工作区技能目录（skills/*.md；目录缺失 → 空目录）。
+export fn discover_skills() -> Vec<SkillEntry> {
+    let listing = native typescript {
+        try {
+            return await $host.fs.list("skills");
+        } catch {
+            return "";
+        }
+    };
+    let files = listing.lines().map(|l| l.trim_end()).filter(|l| l.len() > 0 && l.ends_with("/") == false);
+    let mut out: Vec<SkillEntry> = Vec::new();
+    for f in files {
+        if f.ends_with(".md") == false {
+            continue;
+        }
+        let name = f.strip_suffix(".md").unwrap_or(f.clone());
+        let body = native typescript {
+            try {
+                return await $host.fs.read(f);
+            } catch {
+                return "";
+            }
+        };
+        out.push(SkillEntry { name: name.clone(), description: frontmatter_description(body) });
+    }
+    out
+}
+
+/// 目录渲染（<available_skills> 分节体，注入系统提示词）。
+export fn render_catalog(entries: Vec<SkillEntry>) -> String {
+    if entries.len() == 0 {
+        return String::from("<available_skills>\n(none)\n</available_skills>");
+    }
+    let mut out = String::from("<available_skills>\n");
+    for e in entries {
+        out.push_str(format!("- {}: {}\n", e.name, e.description).as_str());
+    }
+    out.push_str("</available_skills>");
+    out
+}
+
+/// 按名装载技能全文（剥 frontmatter；未命中 → 报错文案）。
+export fn invoke_skill(name: String) -> ToolResult {
+    let path = format!("skills/{}.md", name);
+    let r = native typescript {
+        try {
+            return { ok: true, body: await $host.fs.read(path), error: "" };
+        } catch (e) {
+            return { ok: false, body: "", error: String(e && e.message || e) };
+        }
+    };
+    if r.ok == false {
+        return ToolResult {
+            call: format!("skill {}", name),
+            ok: false,
+            output: format!("skill \"{}\" not found in the session catalog. Load the catalog first (available skills are listed in the system prompt).", name),
+            duration_ms: 0,
+        };
+    }
+    let instructions = strip_frontmatter(r.body);
+    ToolResult {
+        call: format!("skill {}", name),
+        ok: true,
+        output: format!("Loaded skill \"{}\":\n{}", name, instructions),
+        duration_ms: 0,
+    }
+}
+
+/// frontmatter description 解析（`---` … `---` 之间找 `description:`）。
+fn frontmatter_description(body: String) -> String {
+    let lines = body.lines();
+    if lines.len() == 0 || lines[0].trim() != "---" {
+        return first_sentence(body);
+    }
+    let mut desc = String::from("");
+    let mut i: u32 = 1;
+    while (i as usize) < lines.len() {
+        let line = lines[i as usize].clone();
+        if line.trim() == "---" {
+            break;
+        }
+        if line.starts_with("description:") {
+            desc = line.strip_prefix("description:").unwrap_or(String::from("")).trim();
+        }
+        i += 1;
+    }
+    cap_desc(desc)
+}
+
+/// 无 frontmatter 时取首行作描述。
+fn first_sentence(body: String) -> String {
+    let lines = body.lines();
+    if lines.len() == 0 {
+        return String::from("");
+    }
+    cap_desc(lines[0].trim())
+}
+
+/// 描述封顶（原版 catalogDescriptionMaxLength 默认 1024 的紧凑口径）。
+fn cap_desc(desc: String) -> String {
+    if desc.len() > 200 {
+        desc.take(197).trim() + String::from("…")
+    } else {
+        desc
+    }
+}
+
+/// 剥 frontmatter（指令体从第二个 `---` 之后开始；commands 的 /<skill> 直唤共用）。
+export fn strip_frontmatter(body: String) -> String {
+    let lines = body.lines();
+    if lines.len() == 0 || lines[0].trim() != "---" {
+        return body.trim();
+    }
+    let mut out = String::from("");
+    let mut started = false;
+    let mut i: u32 = 1;
+    while (i as usize) < lines.len() {
+        let line = lines[i as usize].clone();
+        if started == false {
+            if line.trim() == "---" {
+                started = true;
+            }
+        } else {
+            out.push_str(line.as_str());
+            out.push_str("\n");
+        }
+        i += 1;
+    }
+    if started == false {
+        return body.trim();
+    }
+    out.trim()
+}

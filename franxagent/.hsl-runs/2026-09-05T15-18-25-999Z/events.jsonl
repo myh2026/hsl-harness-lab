@@ -1,0 +1,2 @@
+{"seq":0,"ts":"2026-09-05T15:18:26.018Z","name":"run_start","data":{"entry":"/tmp/boot-test3.hsl","model":"scripted","task":"","scale":"microkernel"}}
+{"seq":1,"ts":"2026-09-05T15:18:26.027Z","name":"run_end","data":{"elapsed_ms":9,"ok":true}}

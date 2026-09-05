@@ -1,0 +1,298 @@
+// ============================================================================
+// franxagent/knowledge/index.hsl — 增量索引（check_and_update 的化身）
+// ============================================================================
+// FranxAgent 原架构对应：knowledge/vector.py——
+//   get_file_state()        扫描 knowledge/ 下全部 .md（rglob）
+//   incremental_update()    对照 file_versions：新/变更 → 重索引
+//                           （删旧 source 条目 + add_document + 登记）；
+//                           消失 → 删条目；conversation 文档的备份文件
+//                           不存在 → 删条目（孤儿记忆清理）
+//   check_and_update()      库空 → full_rebuild；否则增量
+// HSL 适配：
+//   - 持久层 = knowledge/.vector-store.jsonl（sqlite vectors.db 的化身：
+//     D 行 = 文档（type/source/text），V 行 = file_versions（path/指纹））；
+//   - mtime 判据 → 内容指纹（宿主 fs 面无 stat；语义等价「变更才重索引」）；
+//   - 每次会话启动 bootstrap（= 原版进程启动时 import knowledge 的
+//     check_and_update；web 部署下一消息一进程，时序一致）。
+// ============================================================================
+
+import { KnowledgeStore, KnowledgeDoc, fingerprint } from "./store.hsl";
+
+/// 待索引文件（扫描产物）。
+#[derive(Debug, Clone)]
+export struct KnowledgeFile {
+    path: String,
+    text: String,
+}
+
+/// bootstrap：装配知识库（读 sidecar → 扫描 → 增量更新 → 落盘 sidecar）。
+/// 即原版 import knowledge 时的 check_and_update()。
+export fn bootstrap_knowledge() -> KnowledgeStore {
+    println!("[bk] enter");
+    let (docs, versions) = load_sidecar();
+    println!("[bk] sidecar loaded docs={}", docs.len());
+    let mut store = KnowledgeStore { docs, versions, indexed: 0, skipped: 0, orphans_dropped: 0 };
+    // 原版：SELECT COUNT(*) FROM vectors == 0 → full_rebuild（清空重扫）
+    if store.docs.len() == 0 {
+        store.versions.clear();
+    }
+    println!("[bk] store built");
+    let files = scan_knowledge_files();
+    println!("[bk] scanned files={}", files.len());
+    store = check_and_update(store, files);
+    println!("[bk] checked_and_updated");
+    // 观测：每次 bootstrap 的增量结果上事件总线
+    let _ = native typescript {
+        $host.events.emit("knowledge_bootstrap", { docs: store.docs.length, indexed: store.indexed, skipped: store.skipped, orphans_dropped: store.orphans_dropped });
+        return true;
+    };
+    save_sidecar(store.docs.clone(), store.versions.clone());
+    store
+}
+
+/// 会话收尾：把库与版本登记落盘（sqlite commit 的化身）。
+export fn save_store(store: KnowledgeStore) -> KnowledgeStore {
+    save_sidecar(store.docs.clone(), store.versions.clone());
+    store
+}
+
+/// check_and_update：对照 file_versions 的增量更新（详见模块头）。
+export fn check_and_update(mut store: KnowledgeStore, files: Vec<KnowledgeFile>) -> KnowledgeStore {
+    // 1) 新增 / 变更文件：重索引（删旧 source 条目 → add_document → 登记）
+    for f in files.clone() {
+        let fp = fingerprint(f.text.clone());
+        let known = store.versions.get(f.path.clone());
+        let unchanged = match known {
+            Option::Some(v) => v == fp,
+            Option::None => false,
+        };
+        if unchanged {
+            store.skipped += 1;
+            continue;
+        }
+        let source_key = format!("file:{}", f.path);
+        // 删同 source 旧条目（原版 DELETE FROM vectors WHERE source = ?）
+        let mut kept: Vec<KnowledgeDoc> = Vec::new();
+        for d in store.docs.clone() {
+            if d.source != source_key {
+                kept.push(d);
+            }
+        }
+        store.docs = kept;
+        // add_document：doc_type 按路径段推断（tools/skills/memories →
+        // tool/skill/conversation，其余 hyw——原版 Path.parts 判定）
+        store.docs.push(KnowledgeDoc {
+            doc_type: classify_path(f.path.clone()),
+            source: source_key,
+            text: f.text.clone(),
+        });
+        store.versions.insert(f.path.clone(), fp);
+        store.indexed += 1;
+    }
+    // 2) 消失文件：删条目 + 删版本登记
+    let mut removals: Vec<String> = Vec::new();
+    for path in store.versions.keys() {
+        let present = files.clone().iter().any(|f| f.path == path.clone());
+        if present == false {
+            removals.push(path);
+        }
+    }
+    for path in removals {
+        let source_key = format!("file:{}", path);
+        let mut kept: Vec<KnowledgeDoc> = Vec::new();
+        for d in store.docs.clone() {
+            if d.source != source_key {
+                kept.push(d);
+            }
+        }
+        store.docs = kept;
+        let _ = store.versions.remove(path.clone());
+    }
+    // 3) 孤儿会话记忆：conversation 型文档的备份文件不存在 → 删
+    //   （原版 §3 sync conversation memories；同时天然清理 §1 刚按文件
+    //     扫进来的 file:memories/... 双胞胎——与原版行为一致）
+    let mut conv_drops: Vec<String> = Vec::new();
+    for d in store.docs.clone() {
+        if d.doc_type == String::from("conversation") && d.source.len() > 0 {
+            let source = d.source.clone();
+            let probe = native typescript {
+                try {
+                    $host.fs.read("knowledge/" + source);
+                    return { exists: true };
+                } catch {
+                    return { exists: false };
+                }
+            };
+            if probe.exists == false {
+                conv_drops.push(d.source.clone());
+            }
+        }
+    }
+    for source in conv_drops {
+        let mut kept: Vec<KnowledgeDoc> = Vec::new();
+        for d in store.docs.clone() {
+            if d.source != source {
+                kept.push(d);
+            }
+        }
+        store.docs = kept;
+        store.orphans_dropped += 1;
+    }
+    store
+}
+
+/// 路径段 → doc_type（原版 Path.parts 判定）。
+fn classify_path(path: String) -> String {
+    if path.contains(String::from("tools/")) {
+        String::from("tool")
+    } else if path.contains(String::from("skills/")) {
+        String::from("skill")
+    } else if path.contains(String::from("memories/")) {
+        String::from("conversation")
+    } else {
+        String::from("hyw")
+    }
+}
+
+/// 扫描 knowledge/ 下全部 .md 文件（get_file_state 的化身）。
+/// 深度受宿主 fs.list 限制（两层）；演示工作区的 tools/skills/memories
+/// 目录布局恰好落在两层内。
+fn scan_knowledge_files() -> Vec<KnowledgeFile> {
+    let r = native typescript {
+        try {
+            const listing = $host.fs.list("knowledge");
+            const md = listing.split("\n").filter((s) => s.length > 0 && s.endsWith(".md"));
+            return { ok: true, files: md };
+        } catch (e) {
+            // knowledge/ 不存在 → 空扫描（原版 rglob 空结果）
+            return { ok: false, files: [] };
+        }
+    };
+    let mut out: Vec<KnowledgeFile> = Vec::new();
+    if r.ok {
+        for rel in r.files {
+            let read = read_knowledge_file(rel.clone());
+            if read.ok {
+                out.push(KnowledgeFile { path: rel, text: read.body });
+            }
+        }
+    }
+    out
+}
+
+/// 读 knowledge/<rel>（文本为空的跳过——原版 strip 后空文本 continue）。
+fn read_knowledge_file(rel: String) -> ReadOk {
+    let r = native typescript {
+        try {
+            const body = $host.fs.read("knowledge/" + rel);
+            return { ok: true, body: body };
+        } catch (e) {
+            return { ok: false, body: "" };
+        }
+    };
+    if r.ok {
+        let text = r.body.trim();
+        if text.len() > 0 {
+            ReadOk { ok: true, body: text }
+        } else {
+            ReadOk { ok: false, body: String::from("") }
+        }
+    } else {
+        ReadOk { ok: false, body: String::from("") }
+    }
+}
+
+/// 读取结果（软失败形态）。
+#[derive(Debug, Clone)]
+struct ReadOk {
+    ok: bool,
+    body: String,
+}
+
+/// sidecar 载入：(docs, versions)。
+/// D{"type":...,"source":...,"text":...} / V{"path":...,"fp":...}
+export fn load_sidecar() -> (Vec<KnowledgeDoc>, HashMap<String, String>) {
+    println!("[ls] enter");
+    let r = native typescript {
+        try {
+            const body = $host.fs.read("knowledge/.vector-store.jsonl");
+            return { ok: true, body: body };
+        } catch {
+            return { ok: false, body: "" };
+        }
+    };
+    println!("[ls] native done ok={}", if r.ok { String::from("y") } else { String::from("n") });
+    let mut docs: Vec<KnowledgeDoc> = Vec::new();
+    let mut versions: HashMap<String, String> = HashMap::new();
+    if r.ok {
+        println!("[ls] body len={}", r.body.len());
+        for line in r.body.lines() {
+            if line.len() == 0 {
+                continue;
+            }
+            let d_payload = line.strip_prefix(String::from("D"));
+            match d_payload {
+                Option::Some(json) => {
+                    println!("[ls] D line");
+                    let fields = json_fields(json);
+                    println!("[ls] fields ok");
+                    docs.push(KnowledgeDoc {
+                        doc_type: fields.get(String::from("type")).unwrap_or(String::from("generic")),
+                        source: fields.get(String::from("source")).unwrap_or(String::from("")),
+                        text: fields.get(String::from("text")).unwrap_or(String::from("")),
+                    });
+                    println!("[ls] doc pushed");
+                },
+                Option::None => {
+                    let v_payload = line.strip_prefix(String::from("V"));
+                    match v_payload {
+                        Option::Some(json) => {
+                            let fields = json_fields(json);
+                            let path = fields.get(String::from("path")).unwrap_or(String::from(""));
+                            let fp = fields.get(String::from("fp")).unwrap_or(String::from(""));
+                            if path.len() > 0 {
+                                versions.insert(path, fp);
+                            }
+                        },
+                        Option::None => {},
+                    }
+                },
+            }
+        }
+    }
+    (docs, versions)
+}
+
+/// sidecar 落盘（sqlite commit 的化身）。
+fn save_sidecar(docs: Vec<KnowledgeDoc>, versions: HashMap<String, String>) -> bool {
+    let r = native typescript {
+        try {
+            const lines = [];
+            for (const d of docs) {
+                lines.push("D" + JSON.stringify({ type: d.doc_type, source: d.source, text: d.text }));
+            }
+            for (const [path, fp] of versions) {
+                lines.push("V" + JSON.stringify({ path: path, fp: fp }));
+            }
+            $host.fs.write("knowledge/.vector-store.jsonl", lines.join("\n") + "\n");
+            return { ok: true };
+        } catch (e) {
+            return { ok: false };
+        }
+    };
+    r.ok
+}
+
+/// JSON 顶层字段 → HashMap（$host.json.fields 桥；IO 卫生同 router）。
+fn json_fields(payload: String) -> HashMap<String, String> {
+    let m: HashMap<String, String> = native typescript {
+        try {
+            return $host.json.fields(payload);
+        } catch (e) {
+            const m = new Map();
+            m.set("error", String(e && e.message || e));
+            return m;
+        }
+    };
+    m
+}

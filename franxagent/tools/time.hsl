@@ -1,0 +1,74 @@
+// ============================================================================
+// franxagent/tools/time.hsl — time 工具（当前日期时间）
+// ============================================================================
+// FranxAgent 原架构对应：knowledge/tools/time/tool.py——
+// datetime.now() → "YYYY-MM-DD Weekday HH:MM:SS"。
+// HSL 侧的职责切分（N1）：native 只做时钟效应（读本地墙钟的六个分量，
+// 等价于 IO）；格式化与星期推导（Zeller 同余）全部纯 HSL——同一格式
+// 逻辑可投射到任何后端而语义一致（N3 精神）。
+// 原版示例输出："2026-03-14 Saturday 15:30:45"。
+// ============================================================================
+
+import { ToolOutcome } from "../types/messages.hsl";
+import { FranxConfig } from "../types/state.hsl";
+
+/// time 工具：返回当前本地日期时间（含星期）。
+export fn tool_time(config: FranxConfig, call_id: String) -> ToolOutcome {
+    // 时钟效应（唯一 native 面）：本地墙钟分量
+    let r = native typescript {
+        const d = new Date();
+        return { y: d.getFullYear(), mo: d.getMonth() + 1, d: d.getDate(), h: d.getHours(), mi: d.getMinutes(), s: d.getSeconds() };
+    };
+    let out = format_stamp(r.y, r.mo, r.d, r.h, r.mi, r.s);
+    ToolOutcome {
+        call_id,
+        tool: String::from("time"),
+        ok: true,
+        output: out,
+        proposal: Option::None,
+    }
+}
+
+/// "YYYY-MM-DD Weekday HH:MM:SS"（纯 HSL 格式化）。
+fn format_stamp(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> String {
+    format!(
+        "{}-{}-{} {} {}:{}:{}",
+        y.to_string(),
+        two(mo),
+        two(d),
+        weekday_name(y, mo, d),
+        two(h),
+        two(mi),
+        two(s)
+    )
+}
+
+/// 星期名（Zeller 同余：h = 0 → Saturday）。
+/// 例：2026-01-01 → Thursday；2000-02-29 → Tuesday（与日历一致）。
+fn weekday_name(y: i64, m: i64, d: i64) -> String {
+    // Zeller 约定：一月/二月按上一年 13/14 月计
+    let mm = if m <= 2 { m + 12 } else { m };
+    let yy = if m <= 2 { y - 1 } else { y };
+    let k = yy % 100;
+    let j = yy / 100;
+    let h = (d + (13 * (mm + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+    match h {
+        0 => String::from("Saturday"),
+        1 => String::from("Sunday"),
+        2 => String::from("Monday"),
+        3 => String::from("Tuesday"),
+        4 => String::from("Wednesday"),
+        5 => String::from("Thursday"),
+        6 => String::from("Friday"),
+        _ => String::from("?"),
+    }
+}
+
+/// 两位零填充（时钟分量格式化）。
+fn two(n: i64) -> String {
+    if n < 10 {
+        format!("0{}", n)
+    } else {
+        n.to_string()
+    }
+}

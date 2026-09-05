@@ -1,0 +1,46 @@
+// ============================================================================
+// dsh/tools/workflow.hsl — workflow（步骤清单扇出编排，代表性实现）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/workflow/tool-workflow——「模型
+// 提交一段 JS 编排脚本 + 身份块，引擎跨子代理扇出执行直到脚本终值返回；
+// 前台执行：父回合阻塞到整个工作流结算，非干净结束即错误」。
+// HSL 代表性实现披露：宿主语言无 JS 引擎可嵌（HSL 侧无 eval 原语），
+// 编排面等价为「步骤清单扇出」——每步一个全新子代理（独立会话切片），
+// 顺序执行、聚合终值；前台阻塞、失败中止的契约保持。
+// ============================================================================
+
+import { DshError } from "../types/errors.hsl";
+import { Policy } from "../types/state.hsl";
+import { ToolRegistry } from "../core/registry.hsl";
+import { run_subagent } from "./subagent.hsl";
+
+/// workflow 产物。
+export struct WorkflowOutcome {
+    steps: u32,
+    results: Vec<String>,
+}
+
+/// workflow：步骤清单扇出（每步 → 全新子代理；任一步失败即整体失败）。
+export async fn run_workflow(policy: Policy, registry: ToolRegistry, steps: String) -> Result<WorkflowOutcome, DshError> {
+    let list = steps.lines().map(|l| l.trim()).filter(|l| l.len() > 0);
+    let count = list.len();
+    if count == 0 {
+        return Ok(WorkflowOutcome { steps: 0, results: Vec::new() });
+    }
+    let mut results: Vec<String> = Vec::new();
+    let mut idx: u32 = 0;
+    for step in list {
+        idx += 1;
+        let agent = format!("wf-step-{}", idx);
+        let outcome = run_subagent(policy.clone(), registry.clone(), step.clone(), agent).await?;
+        if outcome.summary.starts_with("child agent") {
+            // 子代理预算耗尽 = 非干净结束（前台契约：错误而非部分输出）
+            return Err(DshError::new(
+                String::from("workflow"),
+                format!("step {} did not finish cleanly: {}", idx, outcome.summary),
+            ));
+        }
+        results.push(outcome.summary);
+    }
+    Ok(WorkflowOutcome { steps: count, results })
+}

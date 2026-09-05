@@ -1,0 +1,2 @@
+{"seq":0,"ts":"2026-09-05T15:10:38.957Z","name":"run_start","data":{"entry":"/tmp/hsl-scratch/probe-search.hsl","model":"scripted","task":"","scale":"microkernel"}}
+{"seq":1,"ts":"2026-09-05T15:10:39.078Z","name":"run_end","data":{"elapsed_ms":121,"ok":true}}

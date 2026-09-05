@@ -2,17 +2,25 @@
 // franxagent/knowledge/store.hsl — 知识库：混合检索 + 技能沉淀 + 会话记忆
 // ============================================================================
 // FranxAgent 原架构对应：knowledge 包——向量库 + FTS5 关键词 + RRF 融合，
-// 每轮动态检索注入 system 消息；add_skill 即时入库。
-// HSL 侧：KnowledgeDoc 封闭类型分级（tool=1.0 / skill=0.8 / conversation=0.2
-// 权重，与原实现一致）；相似度用字符三元组重叠（确定性、零依赖，
-// 替代原 sentence-transformers——语义检索的符号化简化）；关键词与 RRF
-// 融合全部纯 HSL。
+// 每轮动态检索注入 system 消息；add_skill 即时入库；add_conversation
+// 把每轮问答沉淀为 conversation 型文档 + memories/ 目录 .md 备份
+//（knowledge/memory.py）。
+// HSL 侧：KnowledgeDoc 带 source（file:<path> / memories/<ts>.md）；
+// 相似度用字符三元组重叠（确定性、零依赖，替代原 sentence-transformers
+// ——语义检索的符号化简化）；关键词与 RRF 融合全部纯 HSL，权重对齐
+// 原实现（向量通道 0.7 / FTS 通道 0.3，K = 60）。
+// 持久化：knowledge/.vector-store.jsonl（vectors.db 的 HSL 化身，
+// 由 knowledge/index.hsl 读写）。
 // ============================================================================
 
-/// 知识文档（type 决定检索权重）。
+import { hash } from "std/core";
+import { ToolOutcome } from "../types/messages.hsl";
+
+/// 知识文档（type 决定检索权重；source 是向量库的来源键）。
 #[derive(Debug, Clone)]
 export struct KnowledgeDoc {
     doc_type: String,
+    source: String,
     text: String,
 }
 
@@ -28,19 +36,25 @@ impl KnowledgeDoc {
     }
 }
 
-/// 知识库（内存态；持久化经 main 的 artifacts 出口）。
+/// 知识库（内存态；持久化经 knowledge/.vector-store.jsonl 出入口）。
 #[derive(Debug, Clone)]
 export struct KnowledgeStore {
     docs: Vec<KnowledgeDoc>,
+    /// file_versions：path → 内容指纹（mtime 的化身；增量索引判据）。
+    versions: HashMap<String, String>,
+    /// 增量观测计数（check_and_update 的统计出口）。
+    indexed: u32,
+    skipped: u32,
+    orphans_dropped: u32,
 }
 
 impl KnowledgeStore {
     /// 空库。
     fn new() -> KnowledgeStore {
-        KnowledgeStore { docs: Vec::new() }
+        KnowledgeStore { docs: Vec::new(), versions: HashMap::new(), indexed: 0, skipped: 0, orphans_dropped: 0 }
     }
 
-    /// 装入一批文档（技能/工具描述）。
+    /// 装入一批文档（启动种子 / 测试装配）。
     fn load(mut self, docs: Vec<KnowledgeDoc>) -> KnowledgeStore {
         for d in docs {
             self.docs.push(d);
@@ -48,32 +62,117 @@ impl KnowledgeStore {
         self
     }
 
-    /// add_skill：即时入库（skill 级）。
-    fn add_skill(mut self, name: String, content: String) -> KnowledgeStore {
+    /// add_skill（原版 knowledge/tools/add_skill/tool.py 全语义）：
+    /// 1. 名称清洗（字母数字/_/-）；2. 写 skills/<name>.md；
+    /// 3. 移除同 source 旧条目；4. 即时入库（skill 级）；
+    /// 5. 登记 file_versions（防止下次启动重索引）。
+    fn add_skill_file(mut self, call_id: String, name: String, content: String) -> (KnowledgeStore, ToolOutcome) {
+        let safe = sanitize_skill_name(name.clone());
+        if safe.len() == 0 {
+            return (self, ToolOutcome {
+                call_id,
+                tool: String::from("add_skill"),
+                ok: false,
+                output: String::from("Error: Invalid skill name"),
+                proposal: Option::None,
+            });
+        }
+        let rel = format!("skills/{}.md", safe);
+        let source_key = format!("file:{}", rel);
+        let wr = native typescript {
+            try {
+                $host.fs.write("knowledge/" + rel, content);
+                return { ok: true, error: "" };
+            } catch (e) {
+                return { ok: false, error: String(e && e.message || e) };
+            }
+        };
+        if wr.ok == false {
+            return (self, ToolOutcome {
+                call_id,
+                tool: String::from("add_skill"),
+                ok: false,
+                output: format!("Error: write skill file failed: {}", wr.error),
+                proposal: Option::None,
+            });
+        }
+        // 移除同 source 旧条目（原版 DELETE FROM vectors WHERE source = ?）
+        self.docs = drop_source(self.docs.clone(), source_key.clone());
+        // 即时入库（skill 级，与 add_document 等价）
         self.docs.push(KnowledgeDoc {
             doc_type: String::from("skill"),
-            text: format!("# skill: {}\n{}", name, content),
+            source: source_key,
+            text: content.clone(),
         });
-        self
+        // file_versions 登记（防重启重索引）
+        self.versions.insert(rel, fingerprint(content.clone()));
+        self.indexed += 1;
+        (self, ToolOutcome {
+            call_id,
+            tool: String::from("add_skill"),
+            ok: true,
+            output: format!("Skill '{}' saved and indexed successfully.", safe),
+            proposal: Option::None,
+        })
     }
 
-    /// 会话记忆：摘要入库（conversation 级，低权重）。
-    fn remember(mut self, user_msg: String, ai_msg: String) -> KnowledgeStore {
+    /// add_conversation（原版 knowledge/memory.py 全语义）：
+    /// "User: ...\nAI: ..." 作为 conversation 型文档入库（实时生效）+
+    /// memories/<时间戳>.md 备份落盘（同秒冲突时加序号后缀，避免覆盖）。
+    fn add_conversation(mut self, user_msg: String, ai_msg: String) -> KnowledgeStore {
+        let text = format!("User: {}\nAI: {}", user_msg, ai_msg);
+        let stamp = timestamp_compact();
+        let mut rel = format!("memories/{}.md", stamp);
+        let mut n: u32 = 2;
+        loop {
+            let probe = native typescript {
+                try {
+                    $host.fs.read("knowledge/" + rel);
+                    return { exists: true };
+                } catch {
+                    return { exists: false };
+                }
+            };
+            if probe.exists == false {
+                break;
+            }
+            // 同秒冲突：追加序号（原版按秒命名在密集对话下会覆盖，此处加固）
+            rel = format!("memories/{}-{}.md", stamp, n);
+            n += 1;
+            if n > 99 {
+                break;
+            }
+        }
+        let target = rel.clone();
+        let wr = native typescript {
+            try {
+                $host.fs.write("knowledge/" + target, text);
+                $host.events.emit("conversation_saved", { file: "knowledge/" + target, chars: text.length });
+                return { ok: true, error: "" };
+            } catch (e) {
+                // 原版：备份失败仅告警，不阻断
+                return { ok: false, error: String(e && e.message || e) };
+            }
+        };
+        if wr.ok == false {
+            println!("[franxagent] ⚠️ Failed to write memory backup: {}", wr.error);
+        }
         self.docs.push(KnowledgeDoc {
             doc_type: String::from("conversation"),
-            text: format!("user: {}\nassistant: {}", user_msg, ai_msg),
+            source: rel,
+            text,
         });
         self
     }
 
     /// 混合检索：语义通道（三元组重叠×类型权重）+ 关键词通道（分词命中）
-    /// → RRF 融合（rank 1/k 常数 60，与原实现同参）。
+    /// → RRF 融合（向量权重 0.7 / FTS 权重 0.3，K = 60，与原实现同参）。
     /// 返回前 k 条文本（注入 system 消息的「Related Content」）。
     fn search(self, query: String, k: u32) -> Vec<String> {
         if self.docs.len() == 0 {
             return Vec::new();
         }
-        // 通道 1：语义（三元组重叠相似度）
+        // 通道 1：语义（三元组重叠相似度——所有文档都有排名，对应原版全量向量比对）
         let query_tris = trigrams(query.clone());
         let mut semantic: Vec<(f64, u32, String)> = Vec::new();
         for pair in self.docs.clone().enumerate() {
@@ -83,7 +182,8 @@ impl KnowledgeStore {
             let score = overlap * doc.weight();
             semantic.push((score, pair[0], doc.text.clone()));
         }
-        // 通道 2：关键词（查询词在文档中的命中数）
+        // 通道 2：关键词（查询词在文档中的命中数；0 命中不参与 FTS 排名——
+        // 对应原版 FTS MATCH 只返回命中文档）
         let mut keyword: Vec<(f64, u32, String)> = Vec::new();
         let terms = query.split_whitespace();
         for pair in self.docs.clone().enumerate() {
@@ -94,26 +194,24 @@ impl KnowledgeStore {
                     hits += 1.0;
                 }
             }
-            keyword.push((hits, pair[0], doc.text.clone()));
+            if hits > 0.0 {
+                keyword.push((hits, pair[0], doc.text.clone()));
+            }
         }
-        // RRF 融合：两通道各取排名，倒数排名融合
+        // RRF 融合：0.7/(60+rank_vec) + 0.3/(60+rank_fts)
+        // （未进入 FTS 排名的文档只有向量项，与原版 combined 字典语义一致）
         let semantic_ranked = rank_by_score(semantic);
         let keyword_ranked = rank_by_score(keyword);
         let mut fused: Vec<(f64, u32, String)> = Vec::new();
         for entry in semantic_ranked {
             let idx = entry[1];
             let r_s = entry[0];
+            let mut score = 0.7 / (60.0 + r_s);
             let r_k = find_rank(keyword_ranked.clone(), idx);
-            fused.push((1.0 / (60.0 + r_s) + 1.0 / (60.0 + r_k), idx, entry[2].clone()));
-        }
-        for entry in keyword_ranked {
-            let idx = entry[1];
-            let already = fused_contains(fused.clone(), idx);
-            if already == false {
-                let r_s = 999.0;
-                let r_k = entry[0];
-                fused.push((1.0 / (60.0 + r_s) + 1.0 / (60.0 + r_k), idx, entry[2].clone()));
+            if r_k < 999.0 {
+                score += 0.3 / (60.0 + r_k);
             }
+            fused.push((score, idx, entry[2].clone()));
         }
         let ranked = rank_by_score(fused);
         let mut out: Vec<String> = Vec::new();
@@ -128,6 +226,59 @@ impl KnowledgeStore {
     fn len(self) -> u32 {
         self.docs.len()
     }
+}
+
+/// 移除指定 source 的全部文档（原版 DELETE FROM vectors WHERE source = ?）。
+fn drop_source(docs: Vec<KnowledgeDoc>, source: String) -> Vec<KnowledgeDoc> {
+    let mut out: Vec<KnowledgeDoc> = Vec::new();
+    for d in docs {
+        if d.source != source {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// 技能名清洗（字母数字 / 下划线 / 连字符；原版 safe_name）。
+fn sanitize_skill_name(name: String) -> String {
+    let mut out = String::from("");
+    for ch in name.chars() {
+        let keep = ch.is_alphabetic() || ch.is_numeric() || ch == String::from("_") || ch == String::from("-");
+        if keep {
+            out.push_str(ch.as_str());
+        }
+    }
+    out.trim().to_string()
+}
+
+/// 当前本地时间戳（%Y%m%d%H%M%S；时钟效应唯一 native 面，格式化纯 HSL）。
+fn timestamp_compact() -> String {
+    let r = native typescript {
+        const d = new Date();
+        return { y: d.getFullYear(), mo: d.getMonth() + 1, d: d.getDate(), h: d.getHours(), mi: d.getMinutes(), s: d.getSeconds() };
+    };
+    format!("{}{}{}{}{}{}", r.y.to_string(), pad2(r.mo), pad2(r.d), pad2(r.h), pad2(r.mi), pad2(r.s))
+}
+
+/// 两位零填充。
+fn pad2(n: i64) -> String {
+    if n < 10 {
+        format!("0{}", n)
+    } else {
+        n.to_string()
+    }
+}
+
+/// 内容指纹（file_versions 的 mtime 判据化身：长度 + FNV-1a 哈希）。
+/// 宿主 fs 面没有 stat/mtime，用内容指纹判定「变更才重索引」——
+/// 语义等价且比 mtime 更稳定（touch 不触发重索引）。
+export fn fingerprint(text: String) -> String {
+    format!("{}-{}", text.len(), hash_of(text))
+}
+
+/// std/core::hash 的薄封装（保持 import 局部化）。
+fn hash_of(text: String) -> i64 {
+    hash(text)
 }
 
 /// 字符三元组（语义通道的确定性替身）。
@@ -199,14 +350,4 @@ fn find_rank(ranked: Vec<(f64, u32, String)>, idx: u32) -> f64 {
         }
     }
     999.0
-}
-
-/// 融合表是否已含 index。
-fn fused_contains(fused: Vec<(f64, u32, String)>, idx: u32) -> bool {
-    for entry in fused {
-        if entry.1 == idx {
-            return true;
-        }
-    }
-    false
 }

@@ -2,48 +2,101 @@
 // stanzaweaver/types/poem.hsl — 诗稿状态 / 模板 / 轮词汇（契约层）
 // ============================================================================
 // StanzaWeaver 原架构对应：pipeline.py 的 PipelineState（topic/template/
-// description/draft/refine_rounds/checker_pass）与 Message。
+// description/draft/refine_rounds/checker_pass）与 templates/__init__.py 的
+// PoetryTemplate（name/language/lines/syllables_per_line/syllable_constraints/
+// rule_description，list_dicts 序列化形状）。
 // HSL 侧：PoemState 一等值 + MeterTemplate 结构 + Phase 轮词汇（edge guard）。
+//
+// MeterTemplate v2（Task 6-c 五语言模板全量）：
+//   - 原版对齐字段：line_count（lines）/ syl_spec（syllables_per_line 逐行，
+//     定值或区间，空 = 不限）/ constraints（get_syllable_constraints 逐行逐位）/
+//     rhyme_groups（validate_full 的押韵要求，数据化：标签 + 行号组）/
+//     refrain_groups（叠句组：组内文本归一相等）/ rule_description / name /
+//     language（display_name 见 templates.hsl —— list_dicts 形状对齐）。
+//   - 兼容字段（现行 zh/en 校验路径保持回归）：chars_per_line / tone_pattern
+//     / rhyme_lines / syllables_per_line。
 // ============================================================================
 
-/// 格律模板（符号层的判定参数）。
-/// tone_pattern：逐字平仄模板（"平"/"仄" 串，按行给出）；
-/// rhyme_lines：须押韵的行号（0 起算）；
-/// template_kind 决定符号层的语言分支（zh/en）。
+import { SylConstraint } from "./syllable.hsl";
+
+/// 每行音节数规格（原版 SyllableCount：int 或 (min, max) 区间；min==max 为定值）。
+#[derive(Debug, Clone)]
+export struct SylSpec {
+    min: u32,
+    max: u32,
+}
+
+impl SylSpec {
+    /// 定值规格（原版 list[int] 元素）。
+    fn exact(n: u32) -> SylSpec {
+        SylSpec { min: n, max: n }
+    }
+
+    /// 区间规格（原版 (min, max) 元素）。
+    fn range(min: u32, max: u32) -> SylSpec {
+        SylSpec { min, max }
+    }
+
+    /// 实际音节数是否落在规格内（原版 _count_matches）。
+    fn accepts(self, n: u32) -> bool {
+        n >= self.min && n <= self.max
+    }
+
+    /// 人类可读（原版 format_count："5" 或 "8-10"）。
+    fn show(self) -> String {
+        if self.min == self.max {
+            self.min.to_string()
+        } else {
+            format!("{}-{}", self.min, self.max)
+        }
+    }
+}
+
+/// 格律模板（符号层的判定参数；详见模块头注释）。
 #[derive(Debug, Clone)]
 export struct MeterTemplate {
-    key: String,
-    name: String,
-    lang: String,
-    line_count: u32,
-    chars_per_line: u32,
-    tone_pattern: Vec<String>,
-    rhyme_lines: Vec<u32>,
-    syllables_per_line: u32,
+    key: String,                        // 注册键（原版 register 键的连字符形式）
+    name: String,                       // 原版 name（如 "五言绝句"）
+    language: String,                   // zh/en/fr/it/la
+    line_count: u32,                    // 原版 lines
+    chars_per_line: u32,                // [兼容] zh 恒定字数（现行路径）；0 = 非恒定
+    tone_pattern: Vec<String>,          // [兼容] zh 固定平仄谱（现行路径逐字判定）
+    rhyme_lines: Vec<u32>,              // [兼容] 单韵组（现行 zh/en 韵脚判定）
+    syllables_per_line: u32,            // [兼容] 恒定音节数（现行 en 音节判定）
+    syl_spec: Vec<SylSpec>,             // 原版 syllables_per_line（逐行；空 = 不限）
+    constraints: Vec<Vec<SylConstraint>>, // 原版 get_syllable_constraints（空 = 无）
+    rhyme_groups: Vec<(String, Vec<u32>)>, // 原版 validate_full 押韵要求（标签 + 行号组）
+    refrain_groups: Vec<Vec<u32>>,      // 叠句组（组内行文本归一相等）
+    rule_description: String,           // 原版 rule_description（注入提示词）
 }
 
 impl MeterTemplate {
-    /// 模板说明（提示词注入用）。
+    /// 模板说明（原版 describe()：行数 + 逐行音节 + 逐位约束 + 规则描述）。
     fn describe(self) -> String {
-        let mut out = format!("{}（{}）：{} 行 × {} 字", self.name, self.key, self.line_count, self.chars_per_line);
-        if self.lang == String::from("zh") {
-            out.push_str("；逐字平仄：");
-            for pattern in self.tone_pattern.clone() {
-                out.push_str(pattern.as_str());
-                out.push_str(" / ");
+        let mut out = format!("共 {} 行", self.line_count);
+        let spec = self.syl_spec.clone();
+        let constraints = self.constraints.clone();
+        for pair in spec.enumerate() {
+            let line_info = format!("\n  第{}行: {}音节", pair[0] + 1, pair[1].clone().show());
+            out.push_str(line_info.as_str());
+            if constraints.len() > pair[0] {
+                let line_c = constraints[pair[0]].clone();
+                let mut parts: Vec<String> = Vec::new();
+                for cp in line_c.enumerate() {
+                    let desc = cp[1].clone().describe();
+                    if desc != String::from("无约束") {
+                        parts.push(format!("    第{}位: {}", cp[0] + 1, desc));
+                    }
+                }
+                if parts.len() > 0 {
+                    out.push_str("\n");
+                    out.push_str(parts.join("\n").as_str());
+                }
             }
-            out.push_str("；押韵行：");
-            for line in self.rhyme_lines.clone() {
-                out.push_str(line.to_string().as_str());
-                out.push_str(" ");
-            }
-        } else {
-            out.push_str(format!("；每行 {} 音节", self.syllables_per_line).as_str());
-            out.push_str("；押韵行：");
-            for line in self.rhyme_lines.clone() {
-                out.push_str(line.to_string().as_str());
-                out.push_str(" ");
-            }
+        }
+        if self.rule_description.len() > 0 {
+            out.push_str("\n");
+            out.push_str(self.rule_description.as_str());
         }
         out
     }

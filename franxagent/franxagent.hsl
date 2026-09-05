@@ -2,25 +2,35 @@
 // franxagent/franxagent.hsl — 入口：会话编排 graph + main + 投射声明
 // ============================================================================
 // 复现 FranxAgent 的 input() 核心循环（agent.py）：
-//   1. 用户消息入持久化历史；
+//   1. 用户消息入持久化历史（孤儿清理守卫）；
 //   2. 知识混合检索 → 动态 system 注入（不入持久化历史）；
 //   3. 工具循环：模型输出 tool_calls → 路由执行（纠偏 + 安全闸门 +
 //      提案审查）→ 观察回填 → 再询问，直到纯文本回复；
-//   4. 结束：assistant 回复入历史 + 会话记忆沉淀 + 落盘。
+//      上下文超限错误 → memory() 压缩 → 重建上下文 → 重试（continue）；
+//   4. 结束：assistant 回复入历史 + add_conversation 对话入库与
+//      memories/ 备份落盘 + 知识库 sidecar 持久化；
+//   5. main 收尾：定时任务相位（scheduler tick；clock 剧本轨道驱动）
+//      → report.md 落盘。
 //
 // 拓扑（node 为物理依赖，edge 为带守卫的消息通道）：
 //   model ──ToolCalled──> router ──Observed──> model（观察回填环）
 //   router ──ProposalReady──> approver（write 提案送审）
 //   model ──Remembered──> store（会话记忆沉淀）
+//   model ──ContextCompressed──> model（上下文压缩重试环）
 // ============================================================================
 
-import { Message, ToolOutcome, Turn } from "./types/messages.hsl";
-import { FranxConfig, SessionState, TurnStats, SessionReport } from "./types/state.hsl";
+import { Message, ToolOutcome, Turn, ToolCall } from "./types/messages.hsl";
+import { FranxConfig, SessionState, TurnStats, SessionReport, KnowledgeStats, DEFAULT_CONTEXT_RETRIES } from "./types/state.hsl";
 import { ChatModel, OpenAIChatModel, ScriptedChatModel } from "./providers/chat.hsl";
 import { KnowledgeStore } from "./knowledge/store.hsl";
+import { bootstrap_knowledge, save_store } from "./knowledge/index.hsl";
 import { parse_reply, dispatch } from "./agents/router.hsl";
 import { review_proposal, settle, Approval } from "./agents/approver.hsl";
 import { clean_orphans } from "./memory/persist.hsl";
+import { memory_compress, is_context_overlimit } from "./memory/compress.hsl";
+import { broadcast, json_esc } from "./scheduler/events.hsl";
+import { SchedulerState, SchedulerSummary, run_tasks_once, register_task, request_cancel, finish_task } from "./scheduler/tick.hsl";
+import { AgentOutcome, execute_task } from "./scheduler/execute.hsl";
 import { USER_GUIDE, FRANX_CONFIG } from "./config/resources.hsl";
 
 macro_rules! bump {
@@ -31,9 +41,15 @@ macro_rules! bump {
 graph Franx(mut session: SessionState) -> Result<SessionReport, FranxError> {
     let config = session.config.clone();
     node model: Box<dyn ChatModel> = make_model(config.clone())?;
+    println!("[dbg] node model ok");
     node router: FranxConfig = config.clone();
+    println!("[dbg] node router ok");
     node approver: FranxConfig = config.clone();
-    node mut store: KnowledgeStore = seed_knowledge();
+    println!("[dbg] node approver ok");
+    // 知识库启动装配：读 sidecar → 扫描 knowledge/ → 增量索引
+    //（原版 import knowledge 时的 check_and_update）
+    node mut store: KnowledgeStore = bootstrap_knowledge();
+    println!("[dbg] node store ok");
 
     // 条件环（G3：环上每条边都带 on Guard）
     edge model -> router on Turn::ToolCalled;
@@ -41,34 +57,51 @@ graph Franx(mut session: SessionState) -> Result<SessionReport, FranxError> {
     edge router -> approver on Turn::ProposalReady;
     edge model -> store on Turn::Remembered;
 
+    println!("[dbg] nodes built");
     // 1) 历史健全化：孤儿 tool 消息清理（messages.json 的完整性守卫）
     let mut history = clean_orphans(session.history.clone());
+    println!("[dbg] orphans cleaned");
 
     // 2) 知识检索 → 动态 system 注入（不入持久化历史）
+    println!("[dbg] searching knowledge");
     let relevant = store.clone().search(session.config.clone().task.clone(), config.knowledge_k);
-    let mut context: Vec<Message> = Vec::new();
-    context.push(Message::system(USER_GUIDE));
-    if relevant.len() > 0 {
-        let mut joined = String::from("## Related Content\n\n");
-        for snippet in relevant {
-            joined.push_str(snippet.as_str());
-            joined.push_str("\n\n");
-        }
-        context.push(Message::system(joined));
-    }
-    for m in history.clone() {
-        context.push(m);
-    }
+    println!("[dbg] search done");
+    let mut context = assemble_context(relevant.clone(), history.clone());
+    println!("[dbg] context assembled");
 
     // 3) 工具循环（AgentLoop，G1）
     let mut turns: u32 = 0;
     let mut reply = String::from("");
     let mut finished: bool = false;
+    let mut retries: u32 = 0;
     loop {
         if turns >= config.max_turns {
             break;
         }
-        let raw = model.chat(context.clone()).await?;
+        println!("[dbg] turn {} calling model", turns);
+        let attempt = model.chat(context.clone()).await;
+        println!("[dbg] model returned");
+        let raw = match attempt {
+            Ok(text) => text,
+            Err(err) => {
+                // 原版 except 分支：上下文超限 → 压缩 → 重建 → continue
+                if is_context_overlimit(err.clone()) && retries < DEFAULT_CONTEXT_RETRIES {
+                    retries += 1;
+                    bump!(session.stats.compressions, 1);
+                    let before = history.len();
+                    history = memory_compress(history.clone());
+                    let after = history.len();
+                    let _ = broadcast(
+                        String::from("memory_compressed"),
+                        format!("{{\"before\": {}, \"after\": {}, \"retry\": {}}}", before, after, retries),
+                    );
+                    context = assemble_context(relevant.clone(), history.clone());
+                    continue;
+                } else {
+                    return Err(FranxError { kind: String::from("llm"), message: format!("llm {}: {}", err.code, err.message) });
+                }
+            },
+        };
         let (text, requests) = parse_reply(raw)?;
         if requests.len() == 0 {
             // 纯文本回复：会话结束
@@ -77,14 +110,39 @@ graph Franx(mut session: SessionState) -> Result<SessionReport, FranxError> {
             finished = true;
             break;
         }
-        // assistant 工具回合入历史（模型可见自己做过什么）
-        history.push(Message::assistant(format!("[tool_calls: {}]", requests.len())));
+        // assistant 工具回合入历史（模型可见自己做过什么；pair 携带
+        // 配对 call_id 集——上下文压缩的安全切割依据）
+        let mut pair_ids: Vec<String> = Vec::new();
+        for request in requests.clone() {
+            pair_ids.push(request.id.clone());
+        }
+        history.push(Message::assistant_tools(format!("[tool_calls: {}]", requests.len()), pair_ids.join(String::from(";"))));
         let mut observations: Vec<Message> = Vec::new();
         for request in requests {
             if request.corrected {
                 bump!(session.stats.corrections, 1);
             }
-            let outcome = dispatch(router.clone(), request.clone());
+            // 观测：tool_call 帧（对齐原版 SSE 的 tool_call 事件）
+            let tool_label = request.call.clone().name();
+            let _ = broadcast(
+                String::from("tool_call"),
+                format!("{{\"call_id\": \"{}\", \"tool\": \"{}\"}}", request.id.clone(), json_esc(tool_label.clone())),
+            );
+            // add_skill 执行臂需要 KnowledgeStore（路由层不持有）；
+            // 其余全部经 router 分发（S6：AgentLoop 内显式穷尽）
+            let outcome = match request.call.clone() {
+                ToolCall::AddSkill { name, content } => {
+                    let (next_store, out) = store.clone().add_skill_file(request.id.clone(), name, content);
+                    store = next_store;
+                    out
+                },
+                ToolCall::Read { path: _ } => dispatch(router.clone(), request.clone()),
+                ToolCall::Write { path: _, content: _, mode: _, start_line: _, end_line: _ } => dispatch(router.clone(), request.clone()),
+                ToolCall::Command { command: _ } => dispatch(router.clone(), request.clone()),
+                ToolCall::Search { query: _, max_results: _ } => dispatch(router.clone(), request.clone()),
+                ToolCall::Time => dispatch(router.clone(), request.clone()),
+                ToolCall::Mcp { server: _, tool: _, arguments: _ } => dispatch(router.clone(), request.clone()),
+            };
             bump!(session.stats.tool_calls, 1);
             // 提案分支：write 提案送审查闸门
             let final_outcome = match outcome.clone().proposal {
@@ -116,27 +174,68 @@ graph Franx(mut session: SessionState) -> Result<SessionReport, FranxError> {
             if final_outcome.tool == String::from("command") {
                 bump!(session.stats.commands, 1);
             }
+            // 观测：tool_result 帧
+            let _ = broadcast(
+                String::from("tool_result"),
+                format!(
+                    "{{\"call_id\": \"{}\", \"tool\": \"{}\", \"ok\": {}, \"output\": \"{}\"}}",
+                    final_outcome.call_id.clone(),
+                    final_outcome.tool.clone(),
+                    final_outcome.ok,
+                    json_esc(snippet(final_outcome.output.clone()))
+                ),
+            );
             observations.push(final_outcome.to_message());
         }
         for obs in observations {
-            context.push(obs);
+            context.push(obs.clone());
             history.push(obs);
         }
         bump!(session.stats.turns, 1);
         bump!(turns, 1);
     }
 
-    // 4) 记忆沉淀（conversation 级，低权重）+ 状态回写
+    // 4) 记忆沉淀（add_conversation：conversation 型文档入库 +
+    //    memories/<时间戳>.md 备份；原版 web 路由收尾同款）
     if finished {
         let user_msg = session.config.task.clone();
-        store = store.remember(user_msg, reply.clone());
+        store = store.add_conversation(user_msg, reply.clone());
         bump!(session.stats.memories, 1);
     }
+    // 5) 知识库持久化（sqlite commit 的 sidecar 化身）
+    store = save_store(store);
     session.history = history;
-    Ok(build_report(session, reply, turns, finished))
+    Ok(build_report(session, reply, turns, finished, store))
 }
 
-fn build_report(session: SessionState, reply: String, turns: u32, finished: bool) -> SessionReport {
+/// 上下文装配：system 指南 + 检索注入 + 持久化历史。
+fn assemble_context(relevant: Vec<String>, history: Vec<Message>) -> Vec<Message> {
+    let mut context: Vec<Message> = Vec::new();
+    context.push(Message::system(USER_GUIDE));
+    if relevant.len() > 0 {
+        let mut joined = String::from("## Related Content\n\n");
+        for snippet in relevant {
+            joined.push_str(snippet.as_str());
+            joined.push_str("\n\n");
+        }
+        context.push(Message::system(joined));
+    }
+    for m in history {
+        context.push(m);
+    }
+    context
+}
+
+/// 事件载荷截断（观测通道的输出卫生）。
+fn snippet(text: String) -> String {
+    if text.len() <= 80 {
+        text
+    } else {
+        text.chars().take(80).collect::<String>()
+    }
+}
+
+fn build_report(session: SessionState, reply: String, turns: u32, finished: bool, store: KnowledgeStore) -> SessionReport {
     let verdict = if finished { String::from("replied") } else { String::from("budget_exhausted") };
     SessionReport {
         task: session.config.task.clone(),
@@ -151,50 +250,202 @@ fn build_report(session: SessionState, reply: String, turns: u32, finished: bool
         corrections: session.stats.corrections,
         failures: session.stats.failures,
         memories: session.stats.memories,
+        compressions: session.stats.compressions,
+        knowledge: KnowledgeStats {
+            docs: store.len(),
+            indexed: store.indexed,
+            skipped: store.skipped,
+            orphans_dropped: store.orphans_dropped,
+        },
         reply,
         history_lines: session.history.len(),
         ok: finished,
     }
 }
 
-/// 模型装配（OpenAI 兼容 / 剧本）。
+/// 模型装配（OpenAI 兼容 / 剧本；剧本轨道参数化——定时任务会话用
+/// 独立轨道 task_acts，主会话用 acts）。
 fn make_model(config: FranxConfig) -> Result<Box<dyn ChatModel>, FranxError> {
-    if config.model == String::from("scripted") {
-        Ok(ScriptedChatModel::new(String::from("acts")))
+    println!("[dbg] make_model enter");
+    let scripted = config.model == String::from("scripted");
+    println!("[dbg] scripted={}", if scripted { String::from("y") } else { String::from("n") });
+    if scripted {
+        println!("[dbg] building scripted on track {}", config.model_track.clone());
+        Ok(ScriptedChatModel::new(config.model_track.clone()))
     } else {
         Ok(OpenAIChatModel::new(config.model.clone(), config.temperature))
     }
 }
 
-/// 初始知识库（技能/工具文档种子；真实系统从 knowledge/ 目录装配）。
-fn seed_knowledge() -> KnowledgeStore {
-    KnowledgeStore::new().load(vec![
-        KnowledgeDoc {
-            doc_type: String::from("tool"),
-            text: String::from("read: 读取文件全文并附行号；目录路径返回结构清单。"),
-        },
-        KnowledgeDoc {
-            doc_type: String::from("tool"),
-            text: String::from("write: 提案-审查-批准模式写入；支持 overwrite/insert/edit 三模式。"),
-        },
-        KnowledgeDoc {
-            doc_type: String::from("skill"),
-            text: String::from("# skill: safe_delete\n删除文件必须用 mv 移动到 to-delete 目录并记录清单。"),
-        },
-    ])
+// ----------------------------------------------------------------------------
+// 定时任务相位（scheduler.py 的 run_tasks 轮询化身）
+// ----------------------------------------------------------------------------
+
+/// clock 剧本轨道取下一 tick："YYYY-MM-DD HH:MM" → (date, hhmm)。
+/// 轨道缺失/耗尽 → None（相位结束）。
+fn next_clock_tick() -> Option<(String, String)> {
+    let r = native typescript {
+        try {
+            const v = await $host.fixture.next("clock");
+            return { ok: true, text: String(v) };
+        } catch {
+            return { ok: false, text: "" };
+        }
+    };
+    if r.ok == false {
+        return Option::None;
+    }
+    let parts = r.text.split(String::from(" "));
+    if parts.len() != 2 {
+        return Option::None;
+    }
+    Option::Some((parts[0].clone(), parts[1].clone()))
 }
 
+/// cancels 剧本轨道取下一裁决（"cancel" → 取消该任务；缺省 run）。
+fn next_cancel_decision() -> String {
+    let r = native typescript {
+        try {
+            const v = await $host.fixture.next("cancels");
+            return { ok: true, text: String(v) };
+        } catch {
+            return { ok: false, text: "" };
+        }
+    };
+    if r.ok {
+        r.text
+    } else {
+        String::from("run")
+    }
+}
+
+/// 读 tasks.json（"HH:MM" → content；缺失 → 空表）。
+fn load_scheduled_tasks() -> Vec<(String, String)> {
+    let r = native typescript {
+        try {
+            const body = $host.fs.read("tasks.json");
+            return { ok: true, body: body };
+        } catch {
+            return { ok: false, body: "" };
+        }
+    };
+    let mut tasks: Vec<(String, String)> = Vec::new();
+    if r.ok {
+        let fields: HashMap<String, String> = native typescript {
+            try {
+                return $host.json.fields(r.body);
+            } catch {
+                return new Map();
+            }
+        };
+        for time_str in fields.keys() {
+            let content = fields.get(time_str.clone()).unwrap_or(String::from(""));
+            tasks.push((time_str, content));
+        }
+    }
+    tasks
+}
+
+/// 定时任务会话：task_acts 剧本轨道驱动（tasks_agent.input 的化身）。
+fn run_task_session(config: FranxConfig, content: String) -> Result<SessionReport, FranxError> {
+    let mut task_config = config.clone();
+    task_config.model_track = String::from("task_acts");
+    let mut opening: Vec<Message> = Vec::new();
+    opening.push(Message::user(format!("task: {}", content)));
+    let session = SessionState { config: task_config, history: opening, stats: TurnStats::zero() };
+    Franx::run(session)
+}
+
+/// 调度相位：逐 clock tick 轮询 → 触发任务 → 逐帧多播事件。
+/// 取消裁决来自 cancels 轨道（/cancel_task 路由的化身）；
+/// 任务的代理输出以 task_acts 会话真跑（execute_task 的 chunk 流）。
+fn run_scheduler_phase(config: FranxConfig) -> SchedulerSummary {
+    let tasks = load_scheduled_tasks();
+    let mut state = SchedulerState::new();
+    let mut summary = SchedulerSummary::zero();
+    let mut k_indexed: u32 = 0;
+    let mut k_skipped: u32 = 0;
+    let mut k_orphans: u32 = 0;
+    loop {
+        let tick = next_clock_tick();
+        match tick {
+            Option::None => break,
+            Option::Some(pair) => {
+                let date = pair.0;
+                let hhmm = pair.1;
+                if hhmm.len() != 5 {
+                    // 非法 tick 帧：跳过（不推进相位）
+                    continue;
+                }
+                bump!(summary.ticks, 1);
+                let stepped = run_tasks_once(tasks.clone(), hhmm.clone(), date.clone(), state);
+                state = stepped.0;
+                for task in stepped.1 {
+                    // active_tasks 登记（线程 spawn 前的注册语义）
+                    state = register_task(state, task.id.clone());
+                    bump!(summary.triggered, 1);
+                    let decision = next_cancel_decision();
+                    let events = if decision == String::from("cancel") {
+                        // /cancel_task 命中：开始前取消（cancel_event 预置）
+                        let cancelled = request_cancel(state, task.id.clone());
+                        state = cancelled.0;
+                        bump!(summary.cancelled, 1);
+                        execute_task(task.clone(), AgentOutcome::Ok { chunks: Vec::new() }, 0)
+                    } else {
+                        match run_task_session(config.clone(), task.content.clone()) {
+                            Ok(rep) => {
+                                bump!(summary.completed, 1);
+                                k_indexed += rep.knowledge.indexed;
+                                k_skipped += rep.knowledge.skipped;
+                                k_orphans += rep.knowledge.orphans_dropped;
+                                summary.knowledge.docs = rep.knowledge.docs;
+                                execute_task(task.clone(), AgentOutcome::Ok { chunks: rep.reply.clone().lines() }, -1)
+                            },
+                            Err(e) => {
+                                bump!(summary.errored, 1);
+                                execute_task(task.clone(), AgentOutcome::Failed { error: e.message.clone() }, -1)
+                            },
+                        }
+                    };
+                    for ev in events {
+                        let _ = broadcast(ev.kind.clone(), ev.data.clone());
+                    }
+                    // finally：active_tasks 摘除
+                    state = finish_task(state, task.id.clone());
+                }
+            },
+        }
+    }
+    summary.dedup_skipped = state.dedup_skipped;
+    summary.active_clear = state.active.len() == 0;
+    summary.knowledge.indexed = k_indexed;
+    summary.knowledge.skipped = k_skipped;
+    summary.knowledge.orphans_dropped = k_orphans;
+    summary
+}
+
+// ----------------------------------------------------------------------------
+// 出口：report.md
+// ----------------------------------------------------------------------------
+
 export fn main() -> Result<(), FranxError> {
+    println!("[dbg] main enter");
     let config = FranxConfig::from_config()?;
+    println!("[dbg] config ok");
     let mut opening: Vec<Message> = Vec::new();
     opening.push(Message::user(format!("task: {}", config.task)));
     let session = SessionState { config: config.clone(), history: opening, stats: TurnStats::zero() };
+    println!("[dbg] session built, running graph");
     let report = Franx::run(session)?;
-    write_artifacts(report)
+    println!("[dbg] graph done");
+    // 定时任务相位（clock 轨道缺失时零触发空转）
+    let scheduler = run_scheduler_phase(config.clone());
+    println!("[dbg] scheduler done");
+    write_artifacts(report, scheduler)
 }
 
-fn write_artifacts(report: SessionReport) -> Result<(), FranxError> {
-    let report_md = render_report(report.clone());
+fn write_artifacts(report: SessionReport, scheduler: SchedulerSummary) -> Result<(), FranxError> {
+    let report_md = render_report(report.clone(), scheduler.clone());
     native typescript {
         $host.artifacts.write("report.md", report_md);
         return true;
@@ -203,7 +454,7 @@ fn write_artifacts(report: SessionReport) -> Result<(), FranxError> {
     Ok(())
 }
 
-fn render_report(report: SessionReport) -> String {
+fn render_report(report: SessionReport, scheduler: SchedulerSummary) -> String {
     let mut out = String::from("# FranxAgent Session Report\n\n");
     out.push_str("## 任务\n\n");
     out.push_str(report.task.as_str());
@@ -218,6 +469,26 @@ fn render_report(report: SessionReport) -> String {
     out.push_str(format!("- protocol corrections: {}\n", report.corrections).as_str());
     out.push_str(format!("- failures: {}\n", report.failures).as_str());
     out.push_str(format!("- memories: {}\n", report.memories).as_str());
+    out.push_str(format!("- context compressions: {}\n", report.compressions).as_str());
+    out.push_str("\n## 知识库（增量索引）\n\n");
+    out.push_str(format!("- docs: {}\n", report.knowledge.docs).as_str());
+    out.push_str(format!("- indexed (new or changed): {}\n", report.knowledge.indexed).as_str());
+    out.push_str(format!("- skipped (unchanged): {}\n", report.knowledge.skipped).as_str());
+    out.push_str(format!("- orphan conversation docs dropped: {}\n", report.knowledge.orphans_dropped).as_str());
+    if scheduler.triggered > 0 {
+        out.push_str(format!(
+            "- scheduled sessions: indexed {} / skipped {} / orphans {} (docs {})\n",
+            scheduler.knowledge.indexed, scheduler.knowledge.skipped, scheduler.knowledge.orphans_dropped, scheduler.knowledge.docs
+        ).as_str());
+    }
+    out.push_str("\n## 定时任务调度（tick 相位）\n\n");
+    out.push_str(format!("- clock ticks: {}\n", scheduler.ticks).as_str());
+    out.push_str(format!(
+        "- triggered: {} (completed {}, cancelled {}, errored {})\n",
+        scheduler.triggered, scheduler.completed, scheduler.cancelled, scheduler.errored
+    ).as_str());
+    out.push_str(format!("- dedup skipped (same-minute re-poll): {}\n", scheduler.dedup_skipped).as_str());
+    out.push_str(format!("- active_tasks cleared: {}\n", if scheduler.active_clear { String::from("true") } else { String::from("false") }).as_str());
     out
 }
 

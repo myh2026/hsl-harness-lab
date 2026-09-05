@@ -1,0 +1,87 @@
+// ============================================================================
+// dsh/tools/ralph.hsl — ralph（固定前台工作流：全新子代理接力）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/workflow/tool-ralph——「把一个
+// 不可变目标交给一串全新子代理：每个都不带会话种子启动、只携带上一份
+// 有界报告；worker 报告完成或具体受阻即返回，否则到回合上限；完成与
+// 受阻都是 worker 自报而非独立认证」。HSL 侧：ralph worker = 单回合
+// 全新子代理（fixture 轨道 ralph / 真实 LLM），回复以 COMPLETE:/BLOCKED:
+// 前缀判定；上一份报告截到有界容量（400 字符）后随行。
+// ============================================================================
+
+import { Message } from "../types/messages.hsl";
+import { DshError } from "../types/errors.hsl";
+import { Policy } from "../types/state.hsl";
+import { ModelProvider, ScriptedModel, DeepSeekModel } from "../providers/model.hsl";
+
+/// 接力报告容量（原版 bounded report 的紧凑口径）。
+const REPORT_CAP: u32 = 400;
+
+/// ralph 产物。
+export struct RalphOutcome {
+    rounds: u32,
+    outcome: String,   // completed / blocked / round-limit
+    report: String,
+}
+
+/// ralph 回合提示词（worker 角色：全新会话，无父转录种子）。
+fn worker_prompt(objective: String, previous: String) -> String {
+    let prev = if previous.len() > 0 {
+        format!("\n\nPrevious worker's bounded report:\n{}", previous)
+    } else {
+        String::from("")
+    };
+    format!(
+        "You are a Ralph worker: a fresh agent with no conversation history, handed one immutable objective.\nObjective: {}{}\n\nReply with EXACTLY ONE line, either:\nCOMPLETE: <final report>\nBLOCKED: <concrete blocker>\nor a plain progress report line (the next fresh worker will only see it, truncated to {} chars).",
+        objective,
+        prev,
+        REPORT_CAP
+    )
+}
+
+/// ralph 主循环（固定前台：调用方回合阻塞直到结算）。
+export async fn run_ralph(policy: Policy, objective: String, max_rounds: u32) -> Result<RalphOutcome, DshError> {
+    let cap = if max_rounds > 0 { max_rounds } else { 3 };
+    let mut previous = String::from("");
+    let mut round: u32 = 0;
+    while round < cap {
+        round += 1;
+        let model = make_worker_model(policy.clone());
+        let mut slice: Vec<Message> = Vec::new();
+        slice.push(Message::system(String::from("You are a Ralph worker agent. One line per turn, no tools, no JSON.")));
+        slice.push(Message::user(worker_prompt(objective.clone(), previous.clone())));
+        let reply = model.act(slice).await?;
+        let line = reply.trim();
+        if line.starts_with("COMPLETE:") {
+            let report = line.strip_prefix("COMPLETE:").unwrap_or(String::from("")).trim();
+            return Ok(RalphOutcome { rounds: round, outcome: String::from("completed"), report });
+        }
+        if line.starts_with("BLOCKED:") {
+            let report = line.strip_prefix("BLOCKED:").unwrap_or(String::from("")).trim();
+            return Ok(RalphOutcome { rounds: round, outcome: String::from("blocked"), report });
+        }
+        previous = bounded(line);
+    }
+    Ok(RalphOutcome { rounds: round, outcome: String::from("round-limit"), report: previous })
+}
+
+/// worker 模型装配（scripted：fixture 轨道 ralph；真实：LLM 网关）。
+fn make_worker_model(policy: Policy) -> Box<dyn ModelProvider> {
+    if policy.model == String::from("deepseek") {
+        DeepSeekModel::new(String::from("glm-4.5"), policy.temperature)
+    } else {
+        ScriptedModel::new(String::from("fixture"), String::from("ralph"))
+    }
+}
+
+/// 有界报告（截断 + 通告）。
+fn bounded(report: String) -> String {
+    if report.len() <= REPORT_CAP {
+        report
+    } else {
+        let head = report.take(REPORT_CAP);
+        let mut out = head.trim_end();
+        out.push_str(" …[truncated]");
+        out
+    }
+}

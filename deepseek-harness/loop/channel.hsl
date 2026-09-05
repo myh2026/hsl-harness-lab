@@ -1,0 +1,41 @@
+// ============================================================================
+// dsh/loop/channel.hsl — 用户输入通道（commands 框架的输入侧）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/interaction/commands + 会话空闲
+// 轮询——「用户在交互 UI 输入 /command [input] 直接对代理执行，不创建
+// 模型消息」。HSL 剧本模式：用户输入来自 fixture 轨道「user」（含斜杠
+// 命令与普通消息），loop 顶轮询；真实模式无 fixture → 恒空（披露）。
+// ============================================================================
+
+import { split_once } from "std/text";
+
+/// 轮询下一条用户输入（无 / 耗尽 / 未配置 fixture → 空串）。
+export fn poll_user() -> String {
+    let r = native typescript {
+        try {
+            return await $host.fixture.next("user");
+        } catch {
+            return "";
+        }
+    };
+    r
+}
+
+/// 是否为斜杠命令（commands 分支入口；模型消息之外的命令分支）。
+export fn is_command(input: String) -> bool {
+    input.starts_with("/")
+}
+
+/// 拆出命令名与参数（"/compact now" → ("compact", "now")）。
+export fn split_command(input: String) -> (String, String) {
+    let trimmed = input.trim();
+    let body = match trimmed.strip_prefix("/") {
+        Option::Some(rest) => rest,
+        Option::None => trimmed.clone(),
+    };
+    let parts = split_once(body, String::from(" "));
+    match parts {
+        Option::Some(pair) => (pair[0].clone(), pair[1].clone().trim()),
+        Option::None => (body, String::from("")),
+    }
+}

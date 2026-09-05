@@ -1,0 +1,53 @@
+// ============================================================================
+// dsh/tools/questions.hsl — ask_user（user-questions 的人机问答协议）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/interaction/user-questions——
+// 「模型侧工具/权限插件需要暂停工作等人类决策：ask_user_question 挂起
+// 当前工具调用直到用户作答」。HSL 侧：问题必填非空（空问题集 =
+// EMPTY_QUESTIONS 错误，对齐原版错误分类）；作答经 fixture 轨道
+// 「answers」驱动（真实模式无人应答 → 明确的超时披露而非伪造）。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+import { Policy } from "../types/state.hsl";
+
+/// ask_user：挂起并等待用户作答（scripted：answers 轨道；real：披露）。
+export fn ask_user(policy: Policy, questions: String) -> ToolResult {
+    if questions.trim().len() == 0 {
+        return ToolResult {
+            call: String::from("ask_user"),
+            ok: false,
+            output: String::from("ask_user_question requires at least one question (EMPTY_QUESTIONS)"),
+            duration_ms: 0,
+        };
+    }
+    if policy.model != String::from("scripted") {
+        return ToolResult {
+            call: String::from("ask_user"),
+            ok: false,
+            output: String::from("No human answerer is attached in this mode (user-questions needs an interactive UI channel; disclosed). Include the unresolved question in your final result instead."),
+            duration_ms: 0,
+        };
+    }
+    let answer = native typescript {
+        try {
+            return await $host.fixture.next("answers");
+        } catch {
+            return "";
+        }
+    };
+    if answer.len() == 0 {
+        return ToolResult {
+            call: String::from("ask_user"),
+            ok: false,
+            output: String::from("ask_user_question was aborted before the user answered"),
+            duration_ms: 0,
+        };
+    }
+    ToolResult {
+        call: String::from("ask_user"),
+        ok: true,
+        output: format!("User answered: {}", answer),
+        duration_ms: 0,
+    }
+}

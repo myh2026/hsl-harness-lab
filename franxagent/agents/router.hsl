@@ -4,7 +4,9 @@
 // FranxAgent 原架构对应：agent.py 的工具调用处理层——
 // 1) 模型只能调用名为 `tools` 的唯一函数（tool_name + arguments 内层）；
 // 2) 模型直接以内建工具名调用（如 "read"）时自动纠偏为 tools 包装；
-// 3) arguments 是 JSON 字符串 → HashMap<String,String> 进入 HSL（N2）。
+// 3) 带 "/" 的名字是 MCP 外部工具（server/tool 形态），不纠偏、原样
+//    转发（loader.tools 的 "/" 分支）；
+// 4) arguments 是 JSON 字符串 → HashMap<String,String> 进入 HSL（N2）。
 // ============================================================================
 
 import { ToolCall, ToolOutcome } from "../types/messages.hsl";
@@ -13,11 +15,16 @@ import { FranxConfig } from "../types/state.hsl";
 import { tool_read, tool_write_propose } from "../tools/fs.hsl";
 import { tool_command } from "../tools/command.hsl";
 import { tool_search } from "../tools/search.hsl";
+import { tool_time } from "../tools/time.hsl";
+import { tool_mcp } from "../tools/mcp.hsl";
 
 /// 模型原始输出 → (正文文本, 工具请求列表)。
 /// 协议：输出是 JSON，或含 "tool_calls" 数组，或纯文本回复。
 /// 纠偏：function.name != "tools" 且非 MCP 路径（无 "/"）时，
 /// 把 name 视为 tool_name、arguments 原样内移（corrections 计数 +1）。
+/// MCP：name 含 "/"（如 "notes-mcp/append_note"）→ 不纠偏，按
+/// server/tool 拆分转发（arguments 原样透传，MCP 工具参数面是
+/// 任意 JSON，保持字符串形态）。
 export fn parse_reply(raw: String) -> Result<(String, Vec<ToolRequestNorm>), FranxError> {
     let parsed = native typescript {
         const out = { text: "", calls: [], corrected: false };
@@ -31,6 +38,7 @@ export fn parse_reply(raw: String) -> Result<(String, Vec<ToolRequestNorm>), Fra
                     let corrected = false;
                     if (name !== "tools" && !name.includes("/")) {
                         // 纠偏：直接调用内建工具名 → 包装为 tools 协议
+                        // （带 "/" 的 MCP 名不纠偏——原版 func_name 判定同款）
                         try {
                             const inner = JSON.parse(argsStr);
                             argsStr = JSON.stringify({ tool_name: name, arguments: inner });
@@ -67,7 +75,6 @@ export fn parse_reply(raw: String) -> Result<(String, Vec<ToolRequestNorm>), Fra
                 return m;
             }
         };
-        let tool_name = fields.get("tool_name").unwrap_or(String::from(""));
         let inner: HashMap<String, String> = native typescript {
             try {
                 const args = JSON.parse(c.arguments);
@@ -83,7 +90,13 @@ export fn parse_reply(raw: String) -> Result<(String, Vec<ToolRequestNorm>), Fra
                 return m;
             }
         };
-        let call = build_call(tool_name.clone(), inner.clone())?;
+        // tools 包装形态 vs MCP 直呼形态（纠偏后非 tools 的只剩带 "/" 的名字）
+        let call = if c.name == String::from("tools") {
+            let tool_name = fields.get("tool_name").unwrap_or(String::from(""));
+            build_call(tool_name.clone(), inner.clone())?
+        } else {
+            build_mcp_call(c.name.clone(), c.arguments.clone())?
+        };
         requests.push(ToolRequestNorm {
             id: c.id,
             call,
@@ -120,13 +133,27 @@ fn build_call(tool_name: String, inner: HashMap<String, String>) -> Result<ToolC
             query: require(inner, "query")?,
             max_results: inner.get("max_results").unwrap_or(String::from("5")).parse::<u32>()?,
         })
+    } else if tool_name == String::from("time") {
+        Ok(ToolCall::Time)
     } else if tool_name == String::from("add_skill") {
         Ok(ToolCall::AddSkill {
             name: require(inner, "name")?,
             content: require(inner, "content")?,
         })
     } else {
-        Err(FranxError::new(String::from("parse"), format!("未知工具 \"{}\"（只能经 tools 协议调用 read/write/command/search/add_skill）", tool_name)))
+        Err(FranxError::new(String::from("parse"), format!("未知工具 \"{}\"（只能经 tools 协议调用 read/write/command/search/time/add_skill，或 server/tool 形态的 MCP 工具）", tool_name)))
+    }
+}
+
+/// "server/tool" → Mcp 转发调用（arguments 原样透传）。
+fn build_mcp_call(full_name: String, raw_arguments: String) -> Result<ToolCall, FranxError> {
+    let parts = full_name.split(String::from("/"));
+    if parts.len() < 2 {
+        Err(FranxError::new(String::from("parse"), format!("MCP 工具名 \"{}\" 缺少 server 前缀（应为 server/tool 形态）", full_name)))
+    } else {
+        let server = parts[0].clone();
+        let tool = parts.skip(1).join(String::from("/"));
+        Ok(ToolCall::Mcp { server, tool, arguments: raw_arguments })
     }
 }
 
@@ -147,6 +174,7 @@ export fn dispatch(config: FranxConfig, request: ToolRequestNorm) -> ToolOutcome
         },
         ToolCall::Command { command } => tool_command(config, call_id, command),
         ToolCall::Search { query, max_results } => tool_search(config, call_id, query, max_results),
+        ToolCall::Time => tool_time(config, call_id),
         // add_skill 的执行臂在主循环（需要 KnowledgeStore 状态，路由层不持有）
         ToolCall::AddSkill { name, content } => ToolOutcome {
             call_id,
@@ -155,5 +183,6 @@ export fn dispatch(config: FranxConfig, request: ToolRequestNorm) -> ToolOutcome
             output: format!("skill {} queued ({} chars)", name, content.len()),
             proposal: Option::None,
         },
+        ToolCall::Mcp { server, tool, arguments } => tool_mcp(config, call_id, server, tool, arguments),
     }
 }

@@ -11,10 +11,13 @@ import { Policy } from "../types/state.hsl";
 import { cap_chars } from "./workspace.hsl";
 
 /// bash 工具：执行命令并归一输出（stdout/stderr 合并 + 封顶）。
+/// 超时预算 = timeout-policy 下传宿主的协作截止线
+/// （min(policy.tool_timeout_ms, 60000)；宿主真超时杀进程）。
 #[capability(process_spawn)]
 export fn run_bash(policy: Policy, command: String) -> Result<ToolResult, String> {
+    let budget = policy.tool_timeout_ms.min(60_000);
     let r = native typescript {
-        const out = await $host.shell.run(command, { timeoutMs: 60000 });
+        const out = await $host.shell.run(command, { timeoutMs: budget });
         return { ok: out.ok, code: out.code, stdout: out.stdout, stderr: out.stderr };
     };
     let mut combined = String::from("");

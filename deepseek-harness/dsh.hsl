@@ -1,11 +1,19 @@
 // ============================================================================
 // dsh/dsh.hsl — 入口：主编排 graph + main + 投射声明
 // ============================================================================
-// 复现 deepseek-harness 的 core spine（session / system-prompt / tools /
-// agent / agent-loop / everything-is-a-plugin）：
-//   model ──on Step::ToolRequested──> registry ──on Step::Observed──> model
+// 复现 deepseek-harness 的全能力面（dsh-base bundle）：
+//   core spine：everything-is-a-plugin 装配 / append-only 会话日志 /
+//               有序分节系统提示词 / 守卫工具注册表 / agent-loop
+//   回路级：门禁管线（plan-mode 写门禁 → user-approval → checkpoint →
+//           timeout 包裹分发）、compaction（pruner + summary）、
+//           commands（斜杠命令分支）、todo 投影注入、skill 目录、
+//           goal round driver、repeat-tool-reminder、jobs 完成通知、
+//           token-meter 计量、feedback 工件、user-questions 协议。
+// 拓扑：
+//   model ──on Step::ToolRequested──> registry（门禁管线 + 守卫执行）
+//   registry ──on Step::Observed──> model（观察回填）
 //   model ──on Step::ReviewRequested──> reviewer ──(Revise)──> model
-//   每轮事实 append 进 session log（模型可见事实全量落日志）
+//   model ──on Step::TurnLogged──> log（每轮事实 append）
 //
 // 文法覆盖：GraphDef（mut 参数 + 返回类型）/ node 声明带初始化与 ? /
 //           条件边环（G3 环上全部带 guard）/ AgentLoop（G1）+
@@ -13,8 +21,8 @@
 //           project + rules 规则组（BNF v1.5）+ scale
 // ============================================================================
 
-import { Message, ToolResult, Action, Verdict, Step } from "./types/messages.hsl";
-import { Policy, RunState, RunStats, RunReport } from "./types/state.hsl";
+import { Message, Action, Verdict, Step } from "./types/messages.hsl";
+import { Policy, RunState, RunReport } from "./types/state.hsl";
 import { DshError } from "./types/errors.hsl";
 import { SessionEvent } from "./types/events.hsl";
 import { Harness, PluginHost, make_reviewer } from "./core/plugin.hsl";
@@ -23,12 +31,26 @@ import { DeepSeekModel, ModelProvider } from "./providers/model.hsl";
 import { parse_action } from "./agents/executor.hsl";
 import { review } from "./agents/reviewer.hsl";
 import { DSH_CONFIG, EVENTS_SCHEMA } from "./config/resources.hsl";
+import { run_tool } from "./core/gates.hsl";
+import { poll_user, is_command } from "./loop/channel.hsl";
+import { run_command } from "./loop/commands.hsl";
+import { relieve } from "./loop/compaction.hsl";
+import { presentation_notice, approved_notice, rejected_notice } from "./loop/planmode.hsl";
+import { request, Decision } from "./loop/approval.hsl";
+import { track, reminder_due, reminder_text, reset } from "./loop/repeat.hsl";
+import { estimate, transcript_tokens } from "./loop/tokens.hsl";
+import { render_log } from "./loop/feedback.hsl";
+import { render_todos } from "./tools/todo.hsl";
+import { discover_skills, render_catalog } from "./tools/skill.hsl";
+import { goal_round_due, advance_round } from "./tools/goal.hsl";
+import { deliver_notices } from "./tools/jobs.hsl";
 
 macro_rules! bump {
     ($field:expr, $by:expr) => { $field += $by; };
 }
 
-/// 主编排 graph：插件装配 → agent loop → 审查闸门 → 报告。
+/// 主编排 graph：插件装配 → 系统提示词注入 → agent loop（门禁管线 +
+/// 回路级能力）→ 审查闸门 → goal 续行判定 → 报告与事件出口。
 ///
 /// 拓扑（node 为物理依赖，edge 为带守卫的消息通道）：
 ///   model ──ToolRequested──> registry（守卫执行管线）
@@ -46,6 +68,21 @@ graph Dsh(mut state: RunState) -> Result<RunReport, DshError> {
     let mut turns: u32 = 0;
     let mut accepted: bool = false;
 
+    // ---- 系统提示词注入（system-prompt 包全量装配：分节 + 技能目录） ----
+    let mut sys_body = harness.prompt.clone().assemble();
+    let skills = discover_skills();
+    if skills.len() > 0 {
+        sys_body.push_str("\n\n");
+        sys_body.push_str(render_catalog(skills.clone()).as_str());
+        log = log.append(SessionEvent::SkillCatalogPublished { count: skills.len() });
+    }
+    let mut opening: Vec<Message> = Vec::new();
+    opening.push(Message::system(sys_body));
+    for m in transcript.clone() {
+        opening.push(m);
+    }
+    transcript = opening;
+
     // 条件环（G3：环上每条边都带 on Guard，由词法打破死锁）
     edge model -> registry on Step::ToolRequested;
     edge registry -> model on Step::Observed;
@@ -58,10 +95,62 @@ graph Dsh(mut state: RunState) -> Result<RunReport, DshError> {
             log = log.append(SessionEvent::BudgetExhausted { phase: String::from("turns") });
             break;
         }
+
+        // ---- 用户输入通道（commands 框架输入侧；命令不耗模型回合） ----
+        let input = poll_user();
+        if input.len() > 0 {
+            if is_command(input.clone()) {
+                let outcome = run_command(state, transcript, input).await;
+                state = outcome.state;
+                transcript = outcome.transcript;
+                for e in outcome.events.clone() {
+                    log = log.append(e);
+                }
+                println!("[dsh] command: {}", outcome.notice);
+                continue;
+            } else {
+                // 普通用户消息：入转录 + repeat 计数清零（原版语义）
+                transcript.push(Message::user(input.clone()));
+                state = reset(state);
+            }
+        }
+
+        // ---- 后台任务完成通知（in-session 注入，一次通知而非每任务一回合） ----
+        let delivery = deliver_notices(state);
+        state = delivery.state;
+        for m in delivery.messages.clone() {
+            transcript.push(m);
+        }
+        for e in delivery.events.clone() {
+            log = log.append(e);
+        }
+
+        // ---- compaction 压力缓解（pruner 先行不调模型；剪枝解压则跳过摘要） ----
+        let relief = relieve(state.policy.clone(), transcript.clone()).await;
+        transcript = relief.transcript;
+        for e in relief.events.clone() {
+            log = log.append(e);
+        }
+        if relief.pruned {
+            bump!(state.stats.pruned_results, 1);
+        }
+        if relief.compacted {
+            bump!(state.stats.compactions, 1);
+        }
+
+        // ---- todo 投影注入（todo_dirty → 上下文快照，tool-todo 语义） ----
+        if state.todo_dirty {
+            transcript.push(Message::user(format!("[todos]\n{}", render_todos(state.todos.clone()))));
+            state.todo_dirty = false;
+        }
+
         log = log.append(SessionEvent::TurnOpened { turn: turns });
+        let fed = transcript_tokens(transcript.clone());
         let raw = model.act(transcript.clone()).await?;
         // 模型自己的回合必须入转录（否则模型看不到自己已做过什么 → 重复动作）
         transcript.push(Message::assistant(raw.clone()));
+        bump!(state.stats.tokens_in, fed);
+        bump!(state.stats.tokens_out, estimate(raw.clone()));
         log = log.append(SessionEvent::ModelReplied { turn: turns, chars: raw.len() });
         // 协议纠错回路：解析失败把错误反馈给模型重试（预算内）
         let action = match parse_action(raw) {
@@ -84,25 +173,34 @@ graph Dsh(mut state: RunState) -> Result<RunReport, DshError> {
                     }
                     bump!(state.stats.bash_calls, 1);
                 }
-                let outcome = registry.registry.clone().guarded_run(call.clone(), turns);
-                let result: ToolResult = match outcome {
-                    Ok(r) => r,
-                    Err(g) => {
-                        // 守卫拒绝：作为事实落日志 + 反馈模型（不终止 harness）
-                        log = log.append(SessionEvent::ToolGuarded { turn: turns, tool: g.tool.clone(), reason: g.reason.clone() });
-                        bump!(state.stats.guarded, 1);
-                        ToolResult {
-                            call: format!("guard {}", g.tool),
-                            ok: false,
-                            output: format!("guard denied: {}", g.reason),
-                            duration_ms: 0,
-                        }
-                    },
-                };
+                // 门禁管线：plan-mode 写门禁 → user-approval → checkpoint
+                // → timeout 包裹的守卫分发（gates.hsl 四道门串联）
+                let outcome = run_tool(state, harness.registry.clone(), call.clone(), turns).await;
+                state = outcome.state;
+                let result = outcome.result;
+                if outcome.guarded {
+                    // 管线拒绝 ≠ 工具失败：事实落日志 + 模型可见反馈（不终止 harness）
+                    log = log.append(SessionEvent::ToolGuarded { turn: turns, tool: outcome.tool.clone(), reason: outcome.reason.clone() });
+                    bump!(state.stats.guarded, 1);
+                } else {
+                    for e in outcome.events.clone() {
+                        log = log.append(e);
+                    }
+                }
                 transcript.push(result.clone().observation());
                 log = log.append(SessionEvent::ToolDispatched { turn: turns, tool: call.name(), ok: result.ok });
                 if result.ok == false {
                     bump!(state.stats.failures, 1);
+                }
+                // repeat-tool-reminder：同参重复调用 → 建议性提醒（不阻断）
+                state = track(state, call.clone());
+                match reminder_due(state.clone()) {
+                    Option::Some((tool, count)) => {
+                        log = log.append(SessionEvent::RepeatReminded { tool, count });
+                        bump!(state.stats.reminders, 1);
+                        transcript.push(Message::user(reminder_text(tool, count)));
+                    },
+                    Option::None => {},
                 }
                 bump!(state.stats.tool_calls, 1);
                 bump!(state.stats.turns, 1);
@@ -110,6 +208,36 @@ graph Dsh(mut state: RunState) -> Result<RunReport, DshError> {
                 log = log.append(SessionEvent::TurnClosed { turn: turns });
             },
             Action::Done { summary } => {
+                // 计划模式：done = 呈交计划 → 审批（不进 review 闸门）
+                if state.plan_mode {
+                    log = log.append(SessionEvent::PlanPresented { chars: summary.len() });
+                    bump!(state.stats.approvals, 1);
+                    let (decision, event) = request(
+                        String::from("plan"),
+                        String::from("plan presented for approval (plan-mode gate)"),
+                        state.policy.clone(),
+                    ).await;
+                    log = log.append(event);
+                    match decision {
+                        Decision::AllowedOnce => {
+                            state.plan_mode = false;
+                            log = log.append(SessionEvent::PlanModeChanged { active: false });
+                            transcript.push(Message::user(format!("{}\n{}", presentation_notice(summary), approved_notice())));
+                        },
+                        Decision::Rejected => {
+                            transcript.push(Message::user(format!("{}\n{}", presentation_notice(summary), rejected_notice())));
+                        },
+                        Decision::Cancelled => {
+                            transcript.push(Message::user(format!("{}\n{}", presentation_notice(summary), rejected_notice())));
+                        },
+                        Decision::Unavailable => {
+                            transcript.push(Message::user(format!("{}\n{}", presentation_notice(summary), rejected_notice())));
+                        },
+                    }
+                    bump!(state.stats.turns, 1);
+                    bump!(turns, 1);
+                    continue;
+                }
                 println!("[dsh] model declared done: {}", summary);
                 state.transcript = transcript.clone();
                 let v = review(state.clone(), reviewer.clone()).await?;
@@ -126,8 +254,22 @@ graph Dsh(mut state: RunState) -> Result<RunReport, DshError> {
                 });
                 match v {
                     Verdict::Accept => {
-                        accepted = true;
-                        break;
+                        // goal round driver：活跃 goal 有剩余回合容量 → 自动开下一回合
+                        match goal_round_due(state.clone()) {
+                            Option::Some(round_prompt) => {
+                                let (state_next, round_event) = advance_round(state);
+                                state = state_next;
+                                log = log.append(round_event);
+                                transcript.push(Message::user(round_prompt));
+                                bump!(state.stats.turns, 1);
+                                bump!(turns, 1);
+                                continue;
+                            },
+                            Option::None => {
+                                accepted = true;
+                                break;
+                            },
+                        }
                     },
                     Verdict::Revise { note } => {
                         println!("[dsh] reviewer 要求返工: {}", note);
@@ -143,6 +285,22 @@ graph Dsh(mut state: RunState) -> Result<RunReport, DshError> {
     state.transcript = transcript.clone();
     log = log.append(SessionEvent::RunEnd { verdict: if accepted { String::from("accepted") } else { String::from("budget_exhausted") }, turns });
     let events_logged = log.len();
+    // 会话事件全量投递到事件总线（G6 microkernel 观测；events.jsonl 出口）
+    let pairs: Vec<(String, String)> = log.clone().replay_pairs();
+    native typescript {
+        for (const pair of pairs) {
+            $host.events.emit(pair[0], pair[1]);
+        }
+        return true;
+    };
+    // feedback 工件（command-feedback：评语不进模型历史，运行结束落盘）
+    let feedback = render_log(state.clone());
+    if feedback.len() > 0 {
+        native typescript {
+            $host.artifacts.write("feedback.log", feedback);
+            return true;
+        };
+    }
     Ok(build_report(state, transcript, turns, accepted, events_logged))
 }
 
@@ -160,15 +318,25 @@ fn build_report(state: RunState, transcript: Vec<Message>, turns: u32, accepted:
         events_logged,
         ok: accepted,
         transcript,
+        tokens_in: state.stats.tokens_in,
+        tokens_out: state.stats.tokens_out,
+        approvals: state.stats.approvals,
+        checkpoints: state.stats.checkpoints,
+        compactions: state.stats.compactions,
+        pruned_results: state.stats.pruned_results,
+        jobs: state.stats.jobs,
+        subagents: state.stats.subagents,
+        reminders: state.stats.reminders,
+        timeouts: state.stats.timeouts,
     }
 }
 
 export fn main() -> Result<(), DshError> {
     let policy = Policy::from_config()?;
+    // opening 只含用户行；系统提示词由 graph 内的分节装配 + 技能目录构成
     let mut opening: Vec<Message> = Vec::new();
-    opening.push(Message::system(policy.task.clone()));
     opening.push(Message::user(format!("workspace: {}\ntask: {}", policy.workspace, policy.task)));
-    let state = RunState { policy: policy.clone(), transcript: opening, stats: RunStats::zero() };
+    let state = RunState::opening(policy.clone(), opening);
     let report = Dsh::run(state)?;
     write_artifacts(report, policy)
 }
@@ -201,6 +369,19 @@ fn render_report(report: RunReport, policy: Policy) -> String {
     out.push_str(format!("- bash_calls: {}\n", report.bash_calls).as_str());
     out.push_str(format!("- failures: {}\n", report.failures).as_str());
     out.push_str(format!("- guarded: {}\n", report.guarded).as_str());
+    out.push_str("\n## Token 计量（chars/4 启发式口径）\n\n");
+    out.push_str(format!("- tokens_in: {}\n", report.tokens_in).as_str());
+    out.push_str(format!("- tokens_out: {}\n", report.tokens_out).as_str());
+    out.push_str("\n## 回路级能力计数\n\n");
+    out.push_str(format!("- approvals: {}\n", report.approvals).as_str());
+    out.push_str(format!("- checkpoints: {}\n", report.checkpoints).as_str());
+    out.push_str(format!("- compactions: {}\n", report.compactions).as_str());
+    out.push_str(format!("- pruned_results: {}\n", report.pruned_results).as_str());
+    out.push_str(format!("- jobs: {}\n", report.jobs).as_str());
+    out.push_str(format!("- subagents: {}\n", report.subagents).as_str());
+    out.push_str(format!("- reminders: {}\n", report.reminders).as_str());
+    out.push_str(format!("- timeouts: {}\n", report.timeouts).as_str());
+    out.push_str("\n## 观测\n\n");
     out.push_str(format!("- events_logged: {}\n", report.events_logged).as_str());
     out.push_str(format!("- transcript_lines: {}\n", report.transcript_lines).as_str());
     out

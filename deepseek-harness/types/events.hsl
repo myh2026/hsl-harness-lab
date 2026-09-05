@@ -7,6 +7,10 @@
 // ============================================================================
 
 /// 会话事件（不可变事实；log 只 append，不修改历史）。
+/// 全量还原词汇：core spine 事件 + dsh-base 回路级能力事件
+/// （todo / skill / goal / subagent / jobs / web / approval /
+/// checkpoint / pruner / compaction / plan-mode / feedback /
+/// user-questions / timeout / repeat-reminder / commands）。
 #[derive(Debug, Clone)]
 export enum SessionEvent {
     RunStart { task: String, model: String },
@@ -19,12 +23,37 @@ export enum SessionEvent {
     ReviewVerdict { accepted: bool, note: String },
     BudgetExhausted { phase: String },
     RunEnd { verdict: String, turns: u32 },
+    // ---- 回路级能力事件 ----
+    TodoUpdated { pending: u32, in_progress: u32, completed: u32 },
+    SkillCatalogPublished { count: u32 },
+    SkillLoaded { name: String },
+    GoalCreated { id: String, objective: String },
+    GoalUpdated { id: String, action: String, phase: String },
+    GoalRoundStarted { round: u32, cap: u32 },
+    SubagentSpawned { agent: String },
+    SubagentReplied { agent: String, chars: u32 },
+    JobSpawned { id: u32, command: String },
+    JobNoticeDelivered { id: u32, status: String },
+    WebSearched { query: String, sources: u32 },
+    WebFetched { url: String, status: u32 },
+    ApprovalResolved { tool: String, decision: String, reason: String },
+    CheckpointTaken { path: String, bytes: u32 },
+    CheckpointRestored { seq: u32, path: String },
+    ToolResultsPruned { count: u32, chars_before: u32, chars_after: u32 },
+    Compacted { items: u32, chars_before: u32, chars_after: u32, by: String },
+    PlanModeChanged { active: bool },
+    PlanPresented { chars: u32 },
+    FeedbackRecorded { chars: u32 },
+    UserQuestionAnswered { chars: u32 },
+    ToolTimedOut { tool: String, budget_ms: u32 },
+    RepeatReminded { tool: String, count: u32 },
+    CommandRun { command: String },
 }
 
 impl SessionEvent {
     /// 事件名（events.jsonl 的 name 字段，机器可读出口）。
     fn name(self) -> String {
-        match self {
+        match self.clone() {
             SessionEvent::RunStart { task: _, model: _ } => String::from("run_start"),
             SessionEvent::TurnOpened { turn: _ } => String::from("turn_opened"),
             SessionEvent::PromptAssembled { sections: _, chars: _ } => String::from("prompt_assembled"),
@@ -35,12 +64,36 @@ impl SessionEvent {
             SessionEvent::ReviewVerdict { accepted: _, note: _ } => String::from("review_verdict"),
             SessionEvent::BudgetExhausted { phase: _ } => String::from("budget_exhausted"),
             SessionEvent::RunEnd { verdict: _, turns: _ } => String::from("run_end"),
+            SessionEvent::TodoUpdated { pending: _, in_progress: _, completed: _ } => String::from("todo_updated"),
+            SessionEvent::SkillCatalogPublished { count: _ } => String::from("skill_catalog_published"),
+            SessionEvent::SkillLoaded { name: _ } => String::from("skill_loaded"),
+            SessionEvent::GoalCreated { id: _, objective: _ } => String::from("goal_created"),
+            SessionEvent::GoalUpdated { id: _, action: _, phase: _ } => String::from("goal_updated"),
+            SessionEvent::GoalRoundStarted { round: _, cap: _ } => String::from("goal_round_started"),
+            SessionEvent::SubagentSpawned { agent: _ } => String::from("subagent_spawned"),
+            SessionEvent::SubagentReplied { agent: _, chars: _ } => String::from("subagent_replied"),
+            SessionEvent::JobSpawned { id: _, command: _ } => String::from("job_spawned"),
+            SessionEvent::JobNoticeDelivered { id: _, status: _ } => String::from("job_notice_delivered"),
+            SessionEvent::WebSearched { query: _, sources: _ } => String::from("web_searched"),
+            SessionEvent::WebFetched { url: _, status: _ } => String::from("web_fetched"),
+            SessionEvent::ApprovalResolved { tool: _, decision: _, reason: _ } => String::from("approval_resolved"),
+            SessionEvent::CheckpointTaken { path: _, bytes: _ } => String::from("checkpoint_taken"),
+            SessionEvent::CheckpointRestored { seq: _, path: _ } => String::from("checkpoint_restored"),
+            SessionEvent::ToolResultsPruned { count: _, chars_before: _, chars_after: _ } => String::from("tool_results_pruned"),
+            SessionEvent::Compacted { items: _, chars_before: _, chars_after: _, by: _ } => String::from("compacted"),
+            SessionEvent::PlanModeChanged { active: _ } => String::from("plan_mode_changed"),
+            SessionEvent::PlanPresented { chars: _ } => String::from("plan_presented"),
+            SessionEvent::FeedbackRecorded { chars: _ } => String::from("feedback_recorded"),
+            SessionEvent::UserQuestionAnswered { chars: _ } => String::from("user_question_answered"),
+            SessionEvent::ToolTimedOut { tool: _, budget_ms: _ } => String::from("tool_timed_out"),
+            SessionEvent::RepeatReminded { tool: _, count: _ } => String::from("repeat_reminded"),
+            SessionEvent::CommandRun { command: _ } => String::from("command_run"),
         }
     }
 
     /// 单行渲染（人读出口；jsonl 由 write_artifacts 的 native 块序列化）。
     fn render(self) -> String {
-        match self {
+        match self.clone() {
             SessionEvent::RunStart { task, model } => format!("run_start task={} model={}", task, model),
             SessionEvent::TurnOpened { turn } => format!("turn_opened #{}", turn),
             SessionEvent::PromptAssembled { sections, chars } => format!("prompt_assembled sections={} chars={}", sections, chars),
@@ -57,6 +110,36 @@ impl SessionEvent {
             },
             SessionEvent::BudgetExhausted { phase } => format!("budget_exhausted ({})", phase),
             SessionEvent::RunEnd { verdict, turns } => format!("run_end {} turns={}", verdict, turns),
+            SessionEvent::TodoUpdated { pending, in_progress, completed } => {
+                format!("todo_updated pending={} in_progress={} completed={}", pending, in_progress, completed)
+            },
+            SessionEvent::SkillCatalogPublished { count } => format!("skill_catalog_published count={}", count),
+            SessionEvent::SkillLoaded { name } => format!("skill_loaded {}", name),
+            SessionEvent::GoalCreated { id, objective } => format!("goal_created {} objective={}", id, objective),
+            SessionEvent::GoalUpdated { id, action, phase } => format!("goal_updated {} {} -> {}", id, action, phase),
+            SessionEvent::GoalRoundStarted { round, cap } => format!("goal_round_started {}/{}", round, cap),
+            SessionEvent::SubagentSpawned { agent } => format!("subagent_spawned {}", agent),
+            SessionEvent::SubagentReplied { agent, chars } => format!("subagent_replied {} chars={}", agent, chars),
+            SessionEvent::JobSpawned { id, command } => format!("job_spawned {} {}", id, command),
+            SessionEvent::JobNoticeDelivered { id, status } => format!("job_notice_delivered {} [{}]", id, status),
+            SessionEvent::WebSearched { query, sources } => format!("web_searched \"{}\" sources={}", query, sources),
+            SessionEvent::WebFetched { url, status } => format!("web_fetched {} [{}]", url, status),
+            SessionEvent::ApprovalResolved { tool, decision, reason } => format!("approval_resolved {} {} ({})", tool, decision, reason),
+            SessionEvent::CheckpointTaken { path, bytes } => format!("checkpoint_taken {} ({} bytes)", path, bytes),
+            SessionEvent::CheckpointRestored { seq, path } => format!("checkpoint_restored #{} {}", seq, path),
+            SessionEvent::ToolResultsPruned { count, chars_before, chars_after } => {
+                format!("tool_results_pruned {} ({} -> {} chars)", count, chars_before, chars_after)
+            },
+            SessionEvent::Compacted { items, chars_before, chars_after, by } => {
+                format!("compacted {} items ({} -> {} chars, by {})", items, chars_before, chars_after, by)
+            },
+            SessionEvent::PlanModeChanged { active } => format!("plan_mode_changed {}", if active { "on" } else { "off" }),
+            SessionEvent::PlanPresented { chars } => format!("plan_presented chars={}", chars),
+            SessionEvent::FeedbackRecorded { chars } => format!("feedback_recorded chars={}", chars),
+            SessionEvent::UserQuestionAnswered { chars } => format!("user_question_answered chars={}", chars),
+            SessionEvent::ToolTimedOut { tool, budget_ms } => format!("tool_timed_out {} ({} ms)", tool, budget_ms),
+            SessionEvent::RepeatReminded { tool, count } => format!("repeat_reminded {} ({} repeats)", tool, count),
+            SessionEvent::CommandRun { command } => format!("command_run {}", command),
         }
     }
 }

@@ -1,0 +1,40 @@
+{
+ "acts": [
+  "{\"action\": \"tool\", \"tool\": \"glob\", \"pattern\": \"*.ts\"}",
+  "{\"action\": \"tool\", \"tool\": \"grep\", \"pattern\": \"median\", \"include\": \"*.ts\"}",
+  "{\"action\": \"tool\", \"tool\": \"str_replace_editor\", \"command\": \"create\", \"path\": \"tools-log.md\", \"file_text\": \"# tool log\\nTODO exercise new tools\\nend\"}",
+  "{\"action\": \"tool\", \"tool\": \"str_replace_editor\", \"command\": \"str_replace\", \"path\": \"tools-log.md\", \"old_str\": \"TODO exercise new tools\", \"new_str\": \"DONE exercised new tools\"}",
+  "{\"action\": \"tool\", \"tool\": \"str_replace_editor\", \"command\": \"view\", \"path\": \"tools-log.md\"}",
+  "{\"action\": \"tool\", \"tool\": \"todo_write\", \"todos\": \"[{\\\"content\\\": \\\"survey files\\\", \\\"status\\\": \\\"completed\\\"}, {\\\"content\\\": \\\"edit log\\\", \\\"status\\\": \\\"in_progress\\\"}, {\\\"content\\\": \\\"wrap up\\\", \\\"status\\\": \\\"pending\\\"}]\"}",
+  "{\"action\": \"tool\", \"tool\": \"skill\", \"name\": \"review-checklist\"}",
+  "{\"action\": \"tool\", \"tool\": \"web_search\", \"query\": \"deepseek harness github\"}",
+  "{\"action\": \"tool\", \"tool\": \"web_fetch\", \"url\": \"https://example.com/harness\"}",
+  "{\"action\": \"tool\", \"tool\": \"ask_user\", \"questions\": \"workspace 备份完成了吗？\"}",
+  "{\"action\": \"tool\", \"tool\": \"subagent\", \"task\": \"列出工作区文件并报告数量\"}",
+  "{\"action\": \"tool\", \"tool\": \"job_spawn\", \"command\": \"bun --version\"}",
+  "{\"action\": \"tool\", \"tool\": \"job_list\"}",
+  "{\"action\": \"tool\", \"tool\": \"job_output\", \"job_id\": \"1\", \"wait\": true}",
+  "{\"action\": \"tool\", \"tool\": \"job_kill\", \"job_id\": \"1\"}",
+  "{\"action\": \"tool\", \"tool\": \"read_image\", \"path\": \"logo.png\"}",
+  "{\"action\": \"tool\", \"tool\": \"read_file\", \"path\": \"tools-log.md\"}",
+  "{\"action\": \"done\", \"summary\": \"exercised glob/grep/str_replace_editor/todo/skill/web/ask_user/subagent/jobs/read_image\"}"
+ ],
+ "reviews": [
+  "{\"verdict\": \"accept\"}"
+ ],
+ "tracks": {
+  "web_search": [
+   "{\"results\": [{\"title\": \"deepseek-harness\", \"url\": \"https://github.com/deepseek-ai/deepseek-harness\", \"snippet\": \"everything-is-a-plugin harness\"}], \"query\": \"deepseek harness github\"}"
+  ],
+  "web_fetch": [
+   "{\"status\": 200, \"content\": \"# deepseek-harness\\n\\neverything-is-a-plugin production harness.\"}"
+  ],
+  "answers": [
+   "yes, backup done"
+  ],
+  "subagent": [
+   "{\"action\": \"tool\", \"tool\": \"list_files\"}",
+   "{\"action\": \"done\", \"summary\": \"工作区共 4 个文件：stats.ts, stats.test.ts, tools-log.md, skills/review-checklist.md\"}"
+  ]
+ }
+}

@@ -1,0 +1,289 @@
+// ============================================================================
+// dsh/tools/editor.hsl — str_replace_editor（OpenAI 风格命令式编辑器）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/fs/tool-str-replace-editor——
+// 「view 编号全文 / 浅层目录列举；create 拒绝覆盖已存在；str_replace 唯一
+// 字面替换（错误文案沿用 old_str 词汇）；insert 在 0 起算边界插入」。
+// 报错/成功文案逐字对齐原版；view 目录列举省略隐藏/依赖/缓存项。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+import { Policy } from "../types/state.hsl";
+import { cap_chars } from "./workspace.hsl";
+
+/// str_replace_editor 工具：单 schema 四命令（view/create/str_replace/insert）。
+/// 命令未用字段以 "" / 0 到达（executor 已把 null 归一为空，等价原版
+/// 「null placeholder 视为省略」语义）。
+export fn run_editor(policy: Policy, command: String, path: String, file_text: String, old_str: String, new_str: String, insert_line: i64, view_start: i64, view_end: i64) -> Result<ToolResult, String> {
+    let r = native typescript {
+        try {
+            return { ok: true, body: await $host.fs.read(path), error: "" };
+        } catch (e) {
+            return { ok: false, body: "", error: String(e && e.message || e) };
+        }
+    };
+    let exists = r.ok;
+    let body = r.body;
+    match command.as_str() {
+        "view" => view_path(policy, path, exists, body, view_start, view_end),
+        "create" => {
+            if exists {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor create {}", path),
+                    ok: false,
+                    output: format!("File already exists at: {}. Cannot overwrite files using command `create`.", path),
+                    duration_ms: 0,
+                });
+            }
+            if file_text.len() == 0 {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor create {}", path),
+                    ok: false,
+                    output: String::from("Parameter `file_text` is required for command: create"),
+                    duration_ms: 0,
+                });
+            }
+            write_all(path, file_text)?;
+            Ok(ToolResult {
+                call: format!("str_replace_editor create {}", path),
+                ok: true,
+                output: format!("File created successfully at: {}.", path),
+                duration_ms: 0,
+            })
+        },
+        "str_replace" => {
+            if old_str.len() == 0 {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor str_replace {}", path),
+                    ok: false,
+                    output: String::from("Parameter `old_str` is required for command: str_replace"),
+                    duration_ms: 0,
+                });
+            }
+            if new_str.len() == 0 {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor str_replace {}", path),
+                    ok: false,
+                    output: String::from("Parameter `new_str` must be omitted or contain a string for command: str_replace"),
+                    duration_ms: 0,
+                });
+            }
+            if exists == false {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor str_replace {}", path),
+                    ok: false,
+                    output: format!("The file {} does not exist. Read it first before editing.", path),
+                    duration_ms: 0,
+                });
+            }
+            let count = occurrence_count(body, old_str.clone());
+            if count == 0 {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor str_replace {}", path),
+                    ok: false,
+                    output: format!("No replacement was performed, old_str `{}` did not appear verbatim in {}.", old_str, path),
+                    duration_ms: 0,
+                });
+            }
+            if count > 1 {
+                let lines = occurrence_lines(body, old_str.clone());
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor str_replace {}", path),
+                    ok: false,
+                    output: format!("No replacement was performed. Multiple occurrences of old_str `{}` in lines [{}]. Please ensure it is unique.", old_str, lines.join(", ")),
+                    duration_ms: 0,
+                });
+            }
+            let replaced = body.replace(old_str.as_str(), new_str.as_str());
+            write_all(path, replaced)?;
+            Ok(ToolResult {
+                call: format!("str_replace_editor str_replace {}", path),
+                ok: true,
+                output: format!("The file {} has been edited successfully.", path),
+                duration_ms: 0,
+            })
+        },
+        "insert" => {
+            if new_str.len() == 0 {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor insert {}", path),
+                    ok: false,
+                    output: String::from("Parameter `new_str` is required for command: insert"),
+                    duration_ms: 0,
+                });
+            }
+            if exists == false {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor insert {}", path),
+                    ok: false,
+                    output: format!("The file {} does not exist. Read it first before editing.", path),
+                    duration_ms: 0,
+                });
+            }
+            let lines = body.lines();
+            let total = lines.len();
+            if insert_line < 0 || insert_line > total as i64 {
+                return Ok(ToolResult {
+                    call: format!("str_replace_editor insert {}", path),
+                    ok: false,
+                    output: format!("Invalid `insert_line` parameter: {}. It should be within the range of lines of the file: [0, {}]", insert_line, total),
+                    duration_ms: 0,
+                });
+            }
+            let mut out = String::from("");
+            let mut idx: i64 = 0;
+            for line in lines {
+                out.push_str(line.as_str());
+                out.push_str("\n");
+                if idx == insert_line {
+                    out.push_str(new_str.as_str());
+                    out.push_str("\n");
+                }
+                idx += 1;
+            }
+            if insert_line == total as i64 {
+                out.push_str(new_str.as_str());
+                out.push_str("\n");
+            }
+            write_all(path, out)?;
+            Ok(ToolResult {
+                call: format!("str_replace_editor insert {}", path),
+                ok: true,
+                output: format!("The file {} has been edited successfully.", path),
+                duration_ms: 0,
+            })
+        },
+        _ => Ok(ToolResult {
+            call: format!("str_replace_editor {}", command),
+            ok: false,
+            output: String::from("The `command` parameter must be one of: `view`, `create`, `str_replace`, `insert`"),
+            duration_ms: 0,
+        }),
+    }
+}
+
+/// view：文件 → 1 起算编号全文（tab 保留）；view_range 支持负上界（-1 = 到尾）。
+fn view_path(policy: Policy, path: String, exists: bool, body: String, view_start: i64, view_end: i64) -> Result<ToolResult, String> {
+    if exists == false {
+        // 目录探测（view 是唯一可用于目录的命令）
+        let listing = native typescript {
+            try {
+                return { ok: true, body: await $host.fs.list(path), error: "" };
+            } catch (e) {
+                return { ok: false, body: "", error: String(e && e.message || e) };
+            }
+        };
+        if listing.ok {
+            let entries = listing.body.lines().map(|l| l.trim_end()).filter(|l| l.len() > 0);
+            let visible = entries.filter(|e| {
+                let first = e.clone();
+                let parts = first.split("/");
+                let name = match parts.last() {
+                    Option::Some(n) => n.clone(),
+                    Option::None => String::from(""),
+                };
+                name.starts_with(".") == false
+                    && name != String::from("node_modules")
+                    && name != String::from("__pycache__")
+                    && name != String::from(".git")
+            });
+            let mut out = String::from("");
+            for entry in visible {
+                out.push_str(entry.as_str());
+                out.push_str("\n");
+            }
+            return Ok(ToolResult {
+                call: format!("str_replace_editor view {}", path),
+                ok: true,
+                output: cap_chars(out, policy.max_output_chars),
+                duration_ms: 0,
+            });
+        }
+        return Ok(ToolResult {
+            call: format!("str_replace_editor view {}", path),
+            ok: false,
+            output: format!("The path {} does not exist.", path),
+            duration_ms: 0,
+        });
+    }
+    let lines = body.lines();
+    let total = lines.len() as i64;
+    let start = if view_start > 0 { view_start } else { 1 };
+    let end = if view_end == 0 || view_end < 0 { total } else { view_end };
+    if start < 1 || start > total {
+        return Ok(ToolResult {
+            call: format!("str_replace_editor view {}", path),
+            ok: false,
+            output: format!("Invalid `view_range`: [{}, {}]. Its first element `{}` should be within the range of lines of the file: [1, {}]", view_start, view_end, view_start, total),
+            duration_ms: 0,
+        });
+    }
+    if end < start {
+        return Ok(ToolResult {
+            call: format!("str_replace_editor view {}", path),
+            ok: false,
+            output: format!("Invalid `view_range`: [{}, {}]. Its second element `{}` should be larger or equal than its first `{}`", view_start, view_end, view_end, view_start),
+            duration_ms: 0,
+        });
+    }
+    let mut out = String::from("");
+    for pair in lines.enumerate() {
+        let no = pair[0] as i64 + 1;
+        if no >= start && no <= end {
+            out.push_str(format!("{}\t{}\n", no, pair[1].clone()).as_str());
+        }
+    }
+    Ok(ToolResult {
+        call: format!("str_replace_editor view {}", path),
+        ok: true,
+        output: cap_chars(out, policy.max_output_chars),
+        duration_ms: 0,
+    })
+}
+
+/// 写全量（create / str_replace / insert 共用效应出口）。
+fn write_all(path: String, content: String) -> Result<(), String> {
+    let r = native typescript {
+        try {
+            const bytes = $host.fs.write(path, content);
+            return { ok: true, error: "", bytes };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e), bytes: 0 };
+        }
+    };
+    if r.ok {
+        Ok(())
+    } else {
+        Err(r.error)
+    }
+}
+
+/// 出现次数（str_replace 唯一性判定）。
+fn occurrence_count(body: String, needle: String) -> u32 {
+    if needle.len() == 0 {
+        return 0;
+    }
+    let parts = body.split(needle.as_str());
+    (parts.len() - 1) as u32
+}
+
+/// 出现行号（多重命中报错文案用；累计文本计数增量即命中完成行）。
+fn occurrence_lines(body: String, needle: String) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: u32 = 0;
+    let mut line_no: u32 = 0;
+    let mut so_far = String::from("");
+    for line in body.lines() {
+        line_no += 1;
+        so_far.push_str(line.as_str());
+        so_far.push_str("\n");
+        let now = occurrence_count(so_far.clone(), needle.clone());
+        let mut i = seen;
+        while i < now {
+            out.push(line_no.to_string());
+            i += 1;
+        }
+        seen = now;
+    }
+    out
+}

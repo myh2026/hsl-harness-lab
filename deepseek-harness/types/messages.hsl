@@ -5,6 +5,13 @@
 // HSL 侧：封闭枚举承载词汇表（S6：新增变体 = 编译期处决，直面分支）。
 // ============================================================================
 
+/// 待办项（todo_write 工具词汇；dsh-tool-todo 的 item schema 投影）。
+#[derive(Debug, Clone)]
+export struct TodoItem {
+    content: String,
+    status: String,
+}
+
 #[derive(Debug, Clone)]
 export struct Message {
     role: String,
@@ -30,26 +37,116 @@ impl Message {
 }
 
 /// 工具词汇：模型可调用的全部动作（封闭枚举——新增工具必须显式扩这里）。
-/// 对应 deepseek-harness tools 包注册表的可调用面。
+/// 对应 deepseek-harness dsh-base bundle 的模型可见工具面（tool-fs /
+/// tool-fs-search / tool-str-replace-editor / tool-todo / tool-skill /
+/// tool-goal / tool-web / tool-subagent / tool-jobs / tool-ralph /
+/// tool-workflow / user-questions 全注册）。
 #[derive(Debug, Clone)]
 export enum ToolCall {
+    // ---- tool-fs（含受限 read_image） ----
     ReadFile { path: String },
     WriteFile { path: String, content: String },
     EditFile { path: String, old_text: String, new_text: String },
     Bash { command: String },
     ListFiles,
+    ReadImage { path: String },
+    // ---- tool-fs-search（glob / grep） ----
+    Glob { pattern: String, path: String },
+    Grep { pattern: String, path: String, include: String },
+    // ---- tool-str-replace-editor（OpenAI 风格命令式编辑器） ----
+    StrReplaceEditor { command: String, path: String, file_text: String, old_str: String, new_str: String, insert_line: i64, view_start: i64, view_end: i64 },
+    // ---- tool-todo ----
+    TodoWrite { todos: Vec<TodoItem> },
+    // ---- tool-skill ----
+    SkillInvoke { name: String },
+    // ---- tool-goal（get/create/update 三名共用一个变体，op 定名） ----
+    GoalTool { op: String, objective: String, goal_id: String, revision: u32, action: String, max_rounds: u32, blocked_reason: String },
+    // ---- tool-web（web_search / web_fetch，provider 声明层） ----
+    WebSearch { query: String },
+    WebFetch { url: String },
+    // ---- subagent + tool-jobs（job_spawn/job_output/job_list/job_kill） ----
+    Subagent { task: String },
+    Jobs { op: String, job_id: String, arg: String, wait: bool, timeout_ms: u32, reason: String },
+    // ---- tool-ralph / tool-workflow（代表性实现） ----
+    Ralph { objective: String, max_rounds: u32 },
+    Workflow { steps: String },
+    // ---- user-questions（ask_user 协议） ----
+    AskUser { questions: String },
 }
 
 impl ToolCall {
-    /// 工具名（schema 注入 / 守卫审计共用）。
+    /// 工具名（schema 注入 / 守卫审计共用）。goal / jobs 两族按 op 分名，
+    /// 与原版 get_goal / create_goal / update_goal / job_output / job_list /
+    /// job_kill 的模型可见名一一对齐（job_spawn 为 HSL 侧补入口，见 README 披露）。
     fn name(self) -> String {
-        match self {
+        match self.clone() {
             ToolCall::ReadFile { path: _ } => String::from("read_file"),
             ToolCall::WriteFile { path: _, content: _ } => String::from("write_file"),
             ToolCall::EditFile { path: _, old_text: _, new_text: _ } => String::from("edit_file"),
             ToolCall::Bash { command: _ } => String::from("bash"),
             ToolCall::ListFiles => String::from("list_files"),
+            ToolCall::ReadImage { path: _ } => String::from("read_image"),
+            ToolCall::Glob { pattern: _, path: _ } => String::from("glob"),
+            ToolCall::Grep { pattern: _, path: _, include: _ } => String::from("grep"),
+            ToolCall::StrReplaceEditor { command: _, path: _, file_text: _, old_str: _, new_str: _, insert_line: _, view_start: _, view_end: _ } => String::from("str_replace_editor"),
+            ToolCall::TodoWrite { todos: _ } => String::from("todo_write"),
+            ToolCall::SkillInvoke { name: _ } => String::from("skill"),
+            ToolCall::GoalTool { op, objective: _, goal_id: _, revision: _, action: _, max_rounds: _, blocked_reason: _ } => goal_tool_name(op),
+            ToolCall::WebSearch { query: _ } => String::from("web_search"),
+            ToolCall::WebFetch { url: _ } => String::from("web_fetch"),
+            ToolCall::Subagent { task: _ } => String::from("subagent"),
+            ToolCall::Jobs { op, job_id: _, arg: _, wait: _, timeout_ms: _, reason: _ } => job_tool_name(op),
+            ToolCall::Ralph { objective: _, max_rounds: _ } => String::from("ralph"),
+            ToolCall::Workflow { steps: _ } => String::from("workflow"),
+            ToolCall::AskUser { questions: _ } => String::from("ask_user"),
         }
+    }
+
+    /// 是否为“写入类”动作（plan-mode 门禁与 checkpoint 快照的判定面）。
+    /// 对应原版 fs/write-intent 语义：create / str_replace / insert / write / edit。
+    fn is_mutation(self) -> bool {
+        match self.clone() {
+            ToolCall::WriteFile { path: _, content: _ } => true,
+            ToolCall::EditFile { path: _, old_text: _, new_text: _ } => true,
+            ToolCall::StrReplaceEditor { command, path: _, file_text: _, old_str: _, new_str: _, insert_line: _, view_start: _, view_end: _ } => {
+                command == String::from("create") || command == String::from("str_replace") || command == String::from("insert")
+            }
+            _ => false,
+        }
+    }
+
+    /// 变异目标路径（checkpoint 快照目标；非变异返回 ""）。
+    fn mutation_path(self) -> String {
+        match self.clone() {
+            ToolCall::WriteFile { path, content: _ } => path,
+            ToolCall::EditFile { path, old_text: _, new_text: _ } => path,
+            ToolCall::StrReplaceEditor { command: _, path, file_text: _, old_str: _, new_str: _, insert_line: _, view_start: _, view_end: _ } => path,
+            _ => String::from(""),
+        }
+    }
+}
+
+/// goal 工具族名（op → 模型可见工具名）。
+fn goal_tool_name(op: String) -> String {
+    if op == String::from("create") {
+        String::from("create_goal")
+    } else if op == String::from("update") {
+        String::from("update_goal")
+    } else {
+        String::from("get_goal")
+    }
+}
+
+/// jobs 工具族名（op → 模型可见工具名；spawn 为 HSL 侧补入口）。
+fn job_tool_name(op: String) -> String {
+    if op == String::from("spawn") {
+        String::from("job_spawn")
+    } else if op == String::from("output") {
+        String::from("job_output")
+    } else if op == String::from("kill") {
+        String::from("job_kill")
+    } else {
+        String::from("job_list")
     }
 }
 

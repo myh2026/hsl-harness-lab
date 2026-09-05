@@ -1,0 +1,136 @@
+// ============================================================================
+// dsh/loop/approval.hsl — user-approval（危险动作一次性审批门）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/interaction/user-approval——
+// 「敏感工具动作暂停等待一次性 allow/reject：ask（默认，走回答者瀑布）
+// 或 never（确定性拒绝）；缺答/非属主/抛错一律 fail closed 到
+// unavailable；每次请求计入会话审计日志」。HSL 侧：危险判定（bash 危险
+// 词 + 受保护路径写入）→ 审批请求（scripted：fixture 轨道 approvals；
+// 真实模式无回答者 → fail closed）→ 决策四值 + 审计事件
+// ApprovalResolved。grant 只对当次动作生效（一次性语义）。
+// ============================================================================
+
+import { ToolCall } from "../types/messages.hsl";
+import { Policy } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+
+/// 审批决策（对齐原版四值：allowed-once / rejected / cancelled / unavailable）。
+export enum Decision {
+    AllowedOnce,
+    Rejected,
+    Cancelled,
+    Unavailable,
+}
+
+/// 危险词表（bash/jobs 命令判定；原版由 permission-presets/审批消费者定义）。
+
+/// 危险动作判定：返回 Some(reason) 表示需要审批。
+/// 面一：bash / job_spawn 命令含危险词；面二：写入受保护路径。
+export fn danger_judge(call: ToolCall, policy: Policy) -> Option<String> {
+    match call.clone() {
+        ToolCall::Bash { command } => {
+            let hit = danger_token(command.clone());
+            match hit {
+                Option::Some(tok) => Option::Some(format!("bash command contains danger token \"{}\"", tok)),
+                Option::None => Option::None,
+            }
+        },
+        ToolCall::Jobs { op, arg, job_id: _, wait: _, timeout_ms: _, reason: _ } => {
+            if op == String::from("spawn") {
+                let hit = danger_token(arg.clone());
+                match hit {
+                    Option::Some(tok) => Option::Some(format!("job command contains danger token \"{}\"", tok)),
+                    Option::None => Option::None,
+                }
+            } else {
+                Option::None
+            }
+        },
+        ToolCall::WriteFile { path, content: _ } => protected_reason(path, policy),
+        ToolCall::EditFile { path, old_text: _, new_text: _ } => protected_reason(path, policy),
+        ToolCall::StrReplaceEditor { command: _, path, file_text: _, old_str: _, new_str: _, insert_line: _, view_start: _, view_end: _ } => {
+            if call.clone().is_mutation() {
+                protected_reason(path, policy)
+            } else {
+                Option::None
+            }
+        },
+        _ => Option::None,
+    }
+}
+
+/// 请求审批（ask 模式 → 回答者；never 模式 → 确定性拒绝）。
+/// 返回 (决策, 事件)：事件进审计日志（无论放行与否）。
+export async fn request(tool: String, reason: String, policy: Policy) -> (Decision, SessionEvent) {
+    if policy.approval_mode == String::from("never") {
+        return (Decision::Rejected, SessionEvent::ApprovalResolved { tool, decision: String::from("rejected"), reason: String::from("policy never: deterministically rejected before any answerer ran") });
+    }
+    let answer = native typescript {
+        try {
+            return await $host.fixture.next("approvals");
+        } catch {
+            return "";
+        }
+    };
+    let decision = map_answer(answer);
+    let tag = match decision {
+        Decision::AllowedOnce => String::from("allowed-once"),
+        Decision::Rejected => String::from("rejected"),
+        Decision::Cancelled => String::from("cancelled"),
+        Decision::Unavailable => String::from("unavailable"),
+    };
+    let detail = if answer.len() == 0 {
+        String::from("no answerer available (fail closed)")
+    } else {
+        reason
+    };
+    (decision, SessionEvent::ApprovalResolved { tool, decision: tag, reason: detail })
+}
+
+/// 回答映射（allow/approve → AllowedOnce；reject → Rejected；
+/// cancel → Cancelled；空/未知 → Unavailable（fail closed））。
+fn map_answer(answer: String) -> Decision {
+    let a = answer.trim();
+    if a == String::from("allow") || a == String::from("approve") || a == String::from("allowed-once") {
+        Decision::AllowedOnce
+    } else if a == String::from("reject") {
+        Decision::Rejected
+    } else if a == String::from("cancel") {
+        Decision::Cancelled
+    } else {
+        Decision::Unavailable
+    }
+}
+
+/// 危险词命中（rm 破坏性删除 / 提权 / 强推 / 远程脚本注入 / 设备级写入）。
+fn danger_token(command: String) -> Option<String> {
+    let tokens = vec![
+        String::from("rm "),
+        String::from("sudo "),
+        String::from("git push --force"),
+        String::from("curl "),
+        String::from("wget "),
+        String::from("mkfs"),
+        String::from("dd if"),
+        String::from("chmod -R"),
+        String::from("chown -R"),
+        String::from("| sh"),
+        String::from("| bash"),
+    ];
+    for t in tokens {
+        if command.contains(t.as_str()) {
+            return Option::Some(t);
+        }
+    }
+    Option::None
+}
+
+/// 受保护路径写入判定。
+fn protected_reason(path: String, policy: Policy) -> Option<String> {
+    for p in policy.protect {
+        if path == p || path.starts_with(format!("{}/", p).as_str()) {
+            return Option::Some(format!("path \"{}\" is protected by policy ({}); mutation requires approval", path, p));
+        }
+    }
+    Option::None
+}

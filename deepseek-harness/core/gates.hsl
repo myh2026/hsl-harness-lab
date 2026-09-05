@@ -1,0 +1,107 @@
+// ============================================================================
+// dsh/core/gates.hsl — 门禁管线（回路级策略对工具执行流的包裹）
+// ============================================================================
+// deepseek-harness 原架构对应：guard 包 + interaction 包的管线级组合
+// ——「工具执行流上叠加策略：plan-mode 写门禁、user-approval 一次性
+// 审批、session-checkpoint 变更前快照、tool-call-timeout 预算」。HSL 侧
+// 串联四道门 + 注册表守卫分发，统一运载 GateOutcome：
+//   plan gate → approval gate → checkpoint → timeout 包裹的 guarded_dispatch
+// 门禁拒绝 ≠ 工具失败（guarded=true，调用方落 ToolGuarded 事件 + 反馈
+// 模型，不终止 harness——与白名单守卫同语义）。
+// ============================================================================
+
+import { ToolCall, ToolResult } from "../types/messages.hsl";
+import { RunState, GateOutcome } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+import { ToolRegistry } from "./registry.hsl";
+import { gate as plan_gate } from "../loop/planmode.hsl";
+import { danger_judge, request, Decision } from "../loop/approval.hsl";
+import { snapshot } from "../loop/checkpoint.hsl";
+import { check as timeout_check } from "../loop/timeout.hsl";
+import { now_ms } from "std/time";
+
+/// 门禁管线主入口：一道工具调用经过全部回路级策略后结算。
+export async fn run_tool(mut state: RunState, registry: ToolRegistry, call: ToolCall, turn: u32) -> GateOutcome {
+    let name = call.clone().name();
+    let mut events: Vec<SessionEvent> = Vec::new();
+
+    // ---- 门一：plan-mode 写门禁（计划模式下变异类动作一律拒绝） ----
+    match plan_gate(call.clone(), state.plan_mode) {
+        Option::Some(reason) => {
+            return deny(state, name, reason, "plan-mode gate");
+        },
+        Option::None => {},
+    }
+
+    // ---- 门二：user-approval（危险动作一次性审批；fail closed） ----
+    match danger_judge(call.clone(), state.policy.clone()) {
+        Option::Some(reason) => {
+            state.stats.approvals += 1;
+            let (decision, event) = request(name.clone(), reason.clone(), state.policy.clone()).await;
+            events.push(event);
+            let allowed = match decision {
+                Decision::AllowedOnce => true,
+                _ => false,
+            };
+            if allowed == false {
+                return deny(state, name, format!("approval rejected: {}", reason), "user-approval gate");
+            }
+        },
+        Option::None => {},
+    }
+
+    // ---- 门三：checkpoint（变异前快照，可回滚） ----
+    let (state_after, cp_events) = snapshot(state, call.clone());
+    state = state_after;
+    if cp_events.len() > 0 {
+        state.stats.checkpoints += 1;
+    }
+    for e in cp_events {
+        events.push(e);
+    }
+
+    // ---- 门四：timeout 包裹的守卫分发 ----
+    let budget = state.policy.tool_timeout_ms;
+    let t0 = now_ms();
+    let outcome = registry.clone().guarded_dispatch(state.clone(), call.clone(), turn).await;
+    let elapsed = now_ms() - t0;
+    match outcome {
+        Ok(dispatched) => {
+            state = dispatched.state;
+            let mut result = dispatched.result;
+            for e in dispatched.events {
+                events.push(e);
+            }
+            match timeout_check(name.clone(), budget, elapsed) {
+                Option::Some((timed_out, ev)) => {
+                    state.stats.timeouts += 1;
+                    events.push(ev);
+                    result = timed_out;
+                },
+                Option::None => {},
+            }
+            GateOutcome { state, result, events, guarded: false, tool: name, reason: String::from("") }
+        },
+        Err(g) => {
+            // 白名单守卫拒绝（与 plan/approval 同语义：反馈模型，不终止）
+            deny(state, g.tool, g.reason, "whitelist guard")
+        },
+    }
+}
+
+/// 统一拒绝出口（管线任何一道的守卫语义：事实落日志 + 模型可见反馈）。
+fn deny(state: RunState, tool: String, reason: String, stage: String) -> GateOutcome {
+    GateOutcome {
+        state,
+        result: ToolResult {
+            call: format!("guard {}", tool),
+            ok: false,
+            output: format!("guard denied ({}): {}", stage, reason),
+            duration_ms: 0,
+        },
+        events: Vec::new(),
+        guarded: true,
+        tool,
+        reason,
+    }
+}

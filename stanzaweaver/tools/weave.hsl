@@ -2,20 +2,47 @@
 // stanzaweaver/tools/weave.hsl — 四工具：search_words / refine_line /
 //                                rewrite / submit（tools-as-interface）
 // ============================================================================
-// StanzaWeaver 原架构对应：tools/__init__.py 的 WRITER_TOOLS。核心设计：
-// 「AI 不能输出自由文本冒充完成；只能调用四个结构化工具」。
-// HSL 侧：封闭枚举 WeaveCall + WeaveOutcome；每次改动即触发符号层
-// 全量校验（validate_full），违规拒绝修改并回传具体错误。
+// StanzaWeaver 原架构对应：src/tools/__init__.py 的 WRITER_TOOLS +
+// src/tools/search_words.py（词库约束查询）+ src/tools/refine_line.py。
+// 核心设计：「AI 不能输出自由文本冒充完成；只能调用四个结构化工具」。
+//
+// Task 6-c search_words 接线（对齐原版）：
+//   - 参数面 = 原版 SEARCH_WORDS_TOOL：query / syllable_count / onset /
+//     nucleus / coda / tone / stress / length / limit（limit 夹取 [1,50]）；
+//   - 优先查词库（WordVault，语言取模板 language；约束语义 = language 必滤
+//     + syllable_count 等值 + 逐位约束 EXISTS + 插入序 + 重排），observation
+//     对齐原版 {"words": [{text, language, meaning, syllables,
+//     matched_syllable}, ...]} JSON；
+//   - 词库无果（含词库未导入）→ 回退既有 lexicon 三元组排序（现行为保持）；
+//     两路皆空 → "(no candidates)"；
+//   - 每次工具执行经 $host.events.emit 发 "tool" 事件（G6 观测等价物——
+//     原版 on_step 回调推送前端）。
+// HSL 侧：封闭枚举 WeaveCall + WeaveOutcome；改动即触发符号层校验，
+// 违规拒绝修改并回传具体错误。
 // ============================================================================
 
 import { PoemState } from "../types/poem.hsl";
 import { Lexicon } from "../prosody/lexicon.hsl";
 import { validate_full, validate_line } from "../prosody/validator.hsl";
+import { WordVault } from "../knowledge/vocab.hsl";
+import { import_all } from "../knowledge/importer.hsl";
+import { SylConstraint } from "../types/syllable.hsl";
 
-/// 织造工具词汇（封闭枚举，S6）。
+/// 织造工具词汇（封闭枚举，S6；search_words 参数面对齐原版工具 schema）。
 #[derive(Debug, Clone)]
 export enum WeaveCall {
-    SearchWords { query: String, tone: String, rhyme: String, limit: u32 },
+    SearchWords {
+        query: String,
+        tone: String,
+        rhyme: String,
+        limit: u32,
+        syllable_count: Option<u32>,
+        onset: String,
+        nucleus: String,
+        coda: String,
+        stress: String,
+        length: String,
+    },
     RefineLine { line: u32, new_text: String },
     Rewrite { instruction: String },
     Submit { title: String },
@@ -24,7 +51,7 @@ export enum WeaveCall {
 impl WeaveCall {
     fn name(self) -> String {
         match self {
-            WeaveCall::SearchWords { query: _, tone: _, rhyme: _, limit: _ } => String::from("search_words"),
+            WeaveCall::SearchWords { query: _, tone: _, rhyme: _, limit: _, syllable_count: _, onset: _, nucleus: _, coda: _, stress: _, length: _ } => String::from("search_words"),
             WeaveCall::RefineLine { line: _, new_text: _ } => String::from("refine_line"),
             WeaveCall::Rewrite { instruction: _ } => String::from("rewrite"),
             WeaveCall::Submit { title: _ } => String::from("submit"),
@@ -51,45 +78,37 @@ impl WeaveOutcome {
     }
 }
 
-/// 工具执行器：携带诗稿状态的织造工具箱（Step 3 ReAct 循环的执行臂）。
+/// 工具执行器：携带诗稿状态与词库的织造工具箱（Step 3 ReAct 循环的执行臂）。
 #[derive(Debug, Clone)]
 export struct WeaveKit {
     lexicon: Lexicon,
+    vault: WordVault,
 }
 
 impl WeaveKit {
-    fn new(lexicon: Lexicon) -> WeaveKit {
-        WeaveKit { lexicon }
+    /// 显式构造（词库由调用方装配）。
+    fn new(lexicon: Lexicon, vault: WordVault) -> WeaveKit {
+        WeaveKit { lexicon, vault }
+    }
+
+    /// 装配 + 自动导入（镜像 app.py _auto_import：原版在应用启动后台线程
+    /// 导入词库；HSL 侧在 weaver 节点初始化时同步完成，import_all 幂等）。
+    fn open() -> WeaveKit {
+        let vault = import_all(WordVault::open());
+        let nzh = vault.clone().word_count(String::from("zh"));
+        let nfr = vault.clone().word_count(String::from("fr"));
+        native typescript {
+            $host.events.emit("vocab_import", { zh: nzh, fr: nfr, store: "vocabulary.tsv" });
+            return true;
+        };
+        WeaveKit { lexicon: Lexicon::new(), vault }
     }
 
     /// 执行一次工具调用（改动即全量校验——符号层铁律）。
     fn execute(self, state: PoemState, call: WeaveCall) -> WeaveOutcome {
         match call {
-            WeaveCall::SearchWords { query, tone, rhyme, limit } => {
-                let results = self.lexicon.clone().search(query.clone(), tone, rhyme, limit);
-                if results.len() == 0 {
-                    WeaveOutcome {
-                        tool: String::from("search_words"),
-                        ok: true,
-                        output: String::from("(no candidates)"),
-                        draft: state.draft.clone(),
-                        submitted: false,
-                        title: String::from(""),
-                    }
-                } else {
-                    let mut out = String::from("");
-                    for pair in results.enumerate() {
-                        out.push_str(format!("{}. {}\n", pair[0] + 1, pair[1]).as_str());
-                    }
-                    WeaveOutcome {
-                        tool: String::from("search_words"),
-                        ok: true,
-                        output: out,
-                        draft: state.draft.clone(),
-                        submitted: false,
-                        title: String::from(""),
-                    }
-                }
+            WeaveCall::SearchWords { query, tone, rhyme, limit, syllable_count, onset, nucleus, coda, stress, length } => {
+                run_search(self, state, query, tone, rhyme, limit, syllable_count, onset, nucleus, coda, stress, length)
             },
             WeaveCall::RefineLine { line, new_text } => {
                 refine_line(self, state, line, new_text)
@@ -97,6 +116,7 @@ impl WeaveKit {
             WeaveCall::Rewrite { instruction: _ } => {
                 // 整体重写：writer 上下文已含 instruction；这里只回显确认，
                 // 新稿由 writer 的下一轮 tool 调用（refine_line）或对话产出。
+                emit_tool_event(String::from("rewrite"), true, String::from("{}"));
                 WeaveOutcome {
                     tool: String::from("rewrite"),
                     ok: true,
@@ -110,6 +130,7 @@ impl WeaveKit {
                 // 提交：先全量格律校验，通过才受理（否则拒绝并回传错误）
                 let report = validate_full(state.template.clone(), self.lexicon.clone(), state.draft.clone());
                 if report.valid {
+                    emit_tool_event(String::from("submit"), true, format!("{{\"lines\": {}}}", state.draft.len()));
                     WeaveOutcome {
                         tool: String::from("submit"),
                         ok: true,
@@ -124,6 +145,7 @@ impl WeaveKit {
                         out.push_str(format!("- {}\n", v).as_str());
                     }
                     out.push_str("请继续炼句（refine_line）后再次 submit。");
+                    emit_tool_event(String::from("submit"), false, format!("{{\"violations\": {}}}", report.violations.len()));
                     WeaveOutcome {
                         tool: String::from("submit"),
                         ok: false,
@@ -138,10 +160,83 @@ impl WeaveKit {
     }
 }
 
-/// refine_line：整句替换 + 立即单行校验（该句音节数 + 逐位平仄；
+/// search_words：词库优先（约束查询）→ lexicon 回退 → (no candidates)。
+fn run_search(kit: WeaveKit, state: PoemState, query: String, tone: String, rhyme: String, limit: u32, syllable_count: Option<u32>, onset: String, nucleus: String, coda: String, stress: String, length: String) -> WeaveOutcome {
+    let language = state.template.clone().language;
+    // limit 夹取 [1, 50]（原版 execute_search_words）
+    let cap = if limit > 50 {
+        50
+    } else {
+        if limit < 1 {
+            1
+        } else {
+            limit
+        }
+    };
+    let constraint = SylConstraint {
+        onset: onset.clone(),
+        nucleus: nucleus.clone(),
+        coda: coda.clone(),
+        tone: tone.clone(),
+        stress: stress.clone(),
+        length: length.clone(),
+    };
+    // 1) 词库优先（WordVault：约束语义 + 重排，见 knowledge/vocab.hsl）
+    let results = kit.vault.clone().search(language.clone(), query.clone(), syllable_count, constraint, cap);
+    if results.len() > 0 {
+        let mut json = String::from("{\"words\": [");
+        let mut first: bool = true;
+        for hit in results.clone() {
+            if first == false {
+                json.push_str(", ");
+            }
+            first = false;
+            json.push_str(hit.word.clone().to_json(hit.matched.clone()).as_str());
+        }
+        json.push_str("]}");
+        emit_tool_event(String::from("search_words"), true, format!("{{\"source\": \"vocab\", \"words\": {}}}", results.len()));
+        return WeaveOutcome {
+            tool: String::from("search_words"),
+            ok: true,
+            output: json,
+            draft: state.draft.clone(),
+            submitted: false,
+            title: String::from(""),
+        };
+    }
+    // 2) 词库无果（含未导入）→ 回退内置 lexicon 三元组排序（现有行为）
+    let hits = kit.lexicon.clone().search(query.clone(), tone, rhyme, cap);
+    if hits.len() > 0 {
+        let mut out = String::new();
+        for pair in hits.enumerate() {
+            out.push_str(format!("{}. {}\n", pair[0] + 1, pair[1]).as_str());
+        }
+        emit_tool_event(String::from("search_words"), true, format!("{{\"source\": \"lexicon-fallback\", \"words\": {}}}", hits.len()));
+        return WeaveOutcome {
+            tool: String::from("search_words"),
+            ok: true,
+            output: out,
+            draft: state.draft.clone(),
+            submitted: false,
+            title: String::from(""),
+        };
+    }
+    emit_tool_event(String::from("search_words"), true, String::from("{\"source\": \"none\", \"words\": 0}"));
+    WeaveOutcome {
+        tool: String::from("search_words"),
+        ok: true,
+        output: String::from("(no candidates)"),
+        draft: state.draft.clone(),
+        submitted: false,
+        title: String::from(""),
+    }
+}
+
+/// refine_line：整句替换 + 立即单行校验（该句音节数 + 逐位约束；
 /// 不通过则拒绝修改——与原实现语义一致；全量校验在 submit 时执行）。
 fn refine_line(kit: WeaveKit, state: PoemState, line: u32, new_text: String) -> WeaveOutcome {
     if line >= state.draft.len() {
+        emit_tool_event(String::from("refine_line"), false, format!("{{\"line\": {}}}", line));
         return WeaveOutcome {
             tool: String::from("refine_line"),
             ok: false,
@@ -156,32 +251,43 @@ fn refine_line(kit: WeaveKit, state: PoemState, line: u32, new_text: String) -> 
         let mut new_draft = state.draft.clone();
         new_draft.remove(line);
         new_draft.insert(line, new_text.clone());
-        WeaveOutcome {
+        emit_tool_event(String::from("refine_line"), true, format!("{{\"line\": {}}}", line));
+        return WeaveOutcome {
             tool: String::from("refine_line"),
             ok: true,
             output: format!("line {} → \"{}\" (line meter valid)", line, new_text),
             draft: new_draft,
             submitted: false,
             title: String::from(""),
-        }
+        };
     } else {
         let mut out = String::from("refused — line meter violations:\n");
         for v in report.violations {
             out.push_str(format!("- {}\n", v).as_str());
         }
         out.push_str("修改未生效；请调整后重试。");
-        WeaveOutcome {
+        emit_tool_event(String::from("refine_line"), false, format!("{{\"line\": {}, \"violations\": {}}}", line, report.violations.len()));
+        return WeaveOutcome {
             tool: String::from("refine_line"),
             ok: false,
             output: out,
             draft: state.draft.clone(),
             submitted: false,
             title: String::from(""),
-        }
+        };
     }
 }
 
-/// 模型输出 → WeaveCall（严格 JSON 协议；N2 类型纪律）。
+/// 工具事件（G6 观测：原版 on_step 回调 → 前端工具状态栏；此处入事件总线）。
+fn emit_tool_event(tool: String, ok: bool, data_json: String) {
+    native typescript {
+        $host.events.emit("tool", { tool: tool, ok: ok, data: JSON.parse(data_json) });
+        return true;
+    };
+}
+
+/// 模型输出 → WeaveCall（严格 JSON 协议；N2 类型纪律；
+/// search_words 新参数缺省：syllable_count → None，音位约束 → ""）。
 export fn parse_weave_call(raw: String) -> Result<WeaveCall, String> {
     let fields: HashMap<String, String> = native typescript {
         try {
@@ -203,6 +309,12 @@ export fn parse_weave_call(raw: String) -> Result<WeaveCall, String> {
             tone: fields.get("tone").unwrap_or(String::from("")),
             rhyme: fields.get("rhyme").unwrap_or(String::from("")),
             limit: fields.get("limit").unwrap_or(String::from("20")).parse::<u32>()?,
+            syllable_count: fields.get("syllable_count").unwrap_or(String::from("")).parse::<u32>().ok(),
+            onset: fields.get("onset").unwrap_or(String::from("")),
+            nucleus: fields.get("nucleus").unwrap_or(String::from("")),
+            coda: fields.get("coda").unwrap_or(String::from("")),
+            stress: fields.get("stress").unwrap_or(String::from("")),
+            length: fields.get("length").unwrap_or(String::from("")),
         })
     } else if tool == String::from("refine_line") {
         Ok(WeaveCall::RefineLine {

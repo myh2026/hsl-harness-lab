@@ -6,14 +6,56 @@
 // → parse::<T>()（零隐式转换，S1；N2 类型纪律）。
 // ============================================================================
 
-import { Message } from "./messages.hsl";
+import { Message, TodoItem, ToolResult } from "./messages.hsl";
+import { SessionEvent } from "./events.hsl";
 import { DshError } from "./errors.hsl";
 
 export const DEFAULT_MAX_TURNS: u32 = 24;
 export const DEFAULT_MAX_BASH: u32 = 0x0C; // 12 —— 十六进制字面量（BNF §1.5）
 export const DEFAULT_MAX_OUTPUT: u32 = 4_000; // 下划线分隔字面量
 
-/// 运行策略（由 CLI --flags 装配，经 $host.config 读取）。
+/// 目标（dsh-goal 服务状态；goal-round-driver 的驱动对象）。
+#[derive(Debug, Clone)]
+export struct Goal {
+    id: String,
+    revision: u32,
+    objective: String,
+    max_rounds: u32,
+    phase: String,      // active / paused / completed / blocked
+    rounds: u32,
+    blocked_reason: String,
+}
+
+/// 会话检查点（session-checkpoint-policy：变异前快照，可回滚）。
+#[derive(Debug, Clone)]
+export struct Checkpoint {
+    seq: u32,
+    path: String,
+    content: String,
+}
+
+/// 后台任务表项（dsh-jobs-local 的内存化身）。
+#[derive(Debug, Clone)]
+export struct Job {
+    id: u32,
+    kind: String,       // bash / subagent
+    label: String,
+    status: String,     // running / exited / killed
+    ok: bool,
+    output: String,
+    notice_delivered: bool,
+}
+
+/// 重复调用追踪（repeat-tool-reminder 的计数器）。新用户消息归零。
+#[derive(Debug, Clone)]
+export struct RepeatTracker {
+    signature: String,
+    count: u32,
+}
+
+/// 运行策略（由 CLI --flags 装配，经 $host.config 读取；回路级策略项
+/// ——压缩阈值 / 工具超时 / 审批模式 / 保护路径 / todo 并行——经环境变量
+/// 装配，缺省值保证 dsh-base 默认组合行为不变）。
 #[derive(Debug, Clone)]
 export struct Policy {
     model: String,
@@ -24,6 +66,11 @@ export struct Policy {
     workspace: String,
     task: String,
     allow: Vec<String>,
+    compact_threshold_chars: u32,
+    tool_timeout_ms: u32,
+    todo_allow_parallel: bool,
+    approval_mode: String,
+    protect: Vec<String>,
 }
 
 impl Policy {
@@ -41,6 +88,11 @@ impl Policy {
             m.set("workspace", String(c.workspace));
             m.set("task", String(c.task));
             m.set("allow", c.allow.join(","));
+            m.set("compact_threshold_chars", $host.env.get("DSH_COMPACT_THRESHOLD") || "");
+            m.set("tool_timeout_ms", $host.env.get("DSH_TOOL_TIMEOUT_MS") || "");
+            m.set("todo_allow_parallel", $host.env.get("DSH_TODO_PARALLEL") || "");
+            m.set("approval_mode", $host.env.get("DSH_APPROVAL") || "");
+            m.set("protect", $host.env.get("DSH_PROTECT") || "");
             return m;
         };
         let model = cfg.get("model").unwrap_or(String::from("scripted"));
@@ -52,6 +104,15 @@ impl Policy {
         let task = cfg.get("task").unwrap_or(String::from(""));
         let allow_raw = cfg.get("allow").unwrap_or(String::from("bun"));
         let allow = allow_raw.split(',').map(|s| s.trim().to_string());
+        let compact_threshold_chars = env_u32(cfg.get("compact_threshold_chars"), 20_000);
+        let tool_timeout_ms = env_u32(cfg.get("tool_timeout_ms"), 120_000);
+        let todo_allow_parallel = match cfg.get("todo_allow_parallel") {
+            Option::Some(v) => v == String::from("true"),
+            Option::None => false,
+        };
+        let approval_mode = cfg.get("approval_mode").unwrap_or(String::from("ask"));
+        let protect_raw = cfg.get("protect").unwrap_or(String::from("stats.test.ts"));
+        let protect = protect_raw.split(',').map(|s| s.trim().to_string());
         Ok(Policy {
             model,
             temperature,
@@ -61,11 +122,25 @@ impl Policy {
             workspace,
             task,
             allow,
+            compact_threshold_chars,
+            tool_timeout_ms,
+            todo_allow_parallel,
+            approval_mode,
+            protect,
         })
     }
 }
 
-/// 运行预算与统计（agent-loop 的 turn 计数器）。
+/// 环境变量数值读取（缺省回落）。
+fn env_u32(raw: Option<String>, fallback: u32) -> u32 {
+    match raw {
+        Option::Some(v) => v.parse::<u32>().unwrap_or(fallback),
+        Option::None => fallback,
+    }
+}
+
+/// 运行预算与统计（agent-loop 的 turn 计数器 + token-meter 累计 +
+/// 回路级能力计数：审批 / 检查点 / 压缩 / 剪枝 / 任务 / 子代理 / 提醒 / 超时）。
 #[derive(Debug, Clone)]
 export struct RunStats {
     turns: u32,
@@ -73,23 +148,99 @@ export struct RunStats {
     bash_calls: u32,
     failures: u32,
     guarded: u32,
+    tokens_in: u64,
+    tokens_out: u64,
+    approvals: u32,
+    checkpoints: u32,
+    compactions: u32,
+    pruned_results: u32,
+    jobs: u32,
+    subagents: u32,
+    reminders: u32,
+    timeouts: u32,
 }
 
 impl RunStats {
     fn zero() -> RunStats {
-        RunStats { turns: 0, tool_calls: 0, bash_calls: 0, failures: 0, guarded: 0 }
+        RunStats {
+            turns: 0,
+            tool_calls: 0,
+            bash_calls: 0,
+            failures: 0,
+            guarded: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            approvals: 0,
+            checkpoints: 0,
+            compactions: 0,
+            pruned_results: 0,
+            jobs: 0,
+            subagents: 0,
+            reminders: 0,
+            timeouts: 0,
+        }
     }
 }
 
-/// 运行状态（graph 主参数）。
+/// 运行状态（graph 主参数；回路级能力状态随行：todo 投影 / goal /
+/// plan-mode / 检查点 / 任务表 / 重复追踪 / 反馈）。全部字段值语义，
+/// 克隆无共享可变（S7 不可变优先精神的运行时镜像）。
 #[derive(Debug, Clone)]
 export struct RunState {
     policy: Policy,
     transcript: Vec<Message>,
     stats: RunStats,
+    todos: Vec<TodoItem>,
+    todo_dirty: bool,
+    goal: Option<Goal>,
+    plan_mode: bool,
+    checkpoints: Vec<Checkpoint>,
+    jobs: Vec<Job>,
+    repeat: RepeatTracker,
+    feedback_remarks: Vec<String>,
 }
 
-/// 运行报告（harness 出口产物）。
+impl RunState {
+    /// 初始状态（main 装配入口）。
+    fn opening(policy: Policy, transcript: Vec<Message>) -> RunState {
+        RunState {
+            policy: policy.clone(),
+            transcript,
+            stats: RunStats::zero(),
+            todos: Vec::new(),
+            todo_dirty: false,
+            goal: Option::None,
+            plan_mode: false,
+            checkpoints: Vec::new(),
+            jobs: Vec::new(),
+            repeat: RepeatTracker { signature: String::from(""), count: 0 },
+            feedback_remarks: Vec::new(),
+        }
+    }
+}
+
+/// 工具分发产物（注册表 → 门禁管线的统一运载；goal/todo/jobs 等
+/// 有状态工具随行携带更新后的 RunState）。
+#[derive(Debug, Clone)]
+export struct DispatchOutcome {
+    state: RunState,
+    result: ToolResult,
+    events: Vec<SessionEvent>,
+}
+
+/// 门禁管线产物（plan-mode / approval / checkpoint / timeout 裁决 +
+/// 分发结果的统一运载；guarded=true 表示管线拒绝，result 即拒绝文案）。
+#[derive(Debug, Clone)]
+export struct GateOutcome {
+    state: RunState,
+    result: ToolResult,
+    events: Vec<SessionEvent>,
+    guarded: bool,
+    tool: String,
+    reason: String,
+}
+
+/// 运行报告（harness 出口产物；新增 token 计量与回路级能力计数）。
 #[derive(Debug, Clone)]
 export struct RunReport {
     task: String,
@@ -103,4 +254,14 @@ export struct RunReport {
     events_logged: u32,
     ok: bool,
     transcript: Vec<Message>,
+    tokens_in: u64,
+    tokens_out: u64,
+    approvals: u32,
+    checkpoints: u32,
+    compactions: u32,
+    pruned_results: u32,
+    jobs: u32,
+    subagents: u32,
+    reminders: u32,
+    timeouts: u32,
 }

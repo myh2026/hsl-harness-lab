@@ -1,0 +1,69 @@
+// ============================================================================
+// dsh/tools/image.hsl — read_image（tool-fs 的图片读取受限面，诚实披露）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/fs/tool-fs 的图片读取——图片作为
+// 附件进入多模态上下文。HSL 宿主运行时没有图像解码能力（$host.fs 只提供
+// utf-8 文本读；无多模态消息通道），故本工具如实实现为「元信息 + 披露」：
+// 校验路径存在 / 是否图像扩展名，返回受限说明而非伪造图像内容。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+
+/// read_image：图像读取受限（宿主无解码能力 → meta + 披露）。
+export fn read_image(path: String) -> ToolResult {
+    let r = native typescript {
+        try {
+            const body = await $host.fs.read(path);
+            return { ok: true, exists: true, chars: body.length, error: "" };
+        } catch (e) {
+            return { ok: false, exists: false, chars: 0, error: String(e && e.message || e) };
+        }
+    };
+    if r.exists == false {
+        return ToolResult {
+            call: format!("read_image {}", path),
+            ok: false,
+            output: format!("The path {} does not exist or is not readable.", path),
+            duration_ms: 0,
+        };
+    }
+    let ext = image_ext(path.clone());
+    if ext == "" {
+        return ToolResult {
+            call: format!("read_image {}", path),
+            ok: false,
+            output: format!("{} is not an image file (supported: png/jpg/jpeg/gif/webp/svg).", path),
+            duration_ms: 0,
+        };
+    }
+    ToolResult {
+        call: format!("read_image {}", path),
+        ok: true,
+        output: format!(
+            "Image present: {} ({} bytes raw, format .{}).\nread_image is unavailable in this host runtime: no image decoding and no multimodal message channel exist (disclosed). Use the file's textual companion or re-describe the task instead.",
+            path,
+            r.chars,
+            ext
+        ),
+        duration_ms: 0,
+    }
+}
+
+/// 图像扩展名判定（非图像 → ""）。
+fn image_ext(path: String) -> String {
+    let lower = path.to_lowercase();
+    let exts = vec![
+        String::from(".png"),
+        String::from(".jpg"),
+        String::from(".jpeg"),
+        String::from(".gif"),
+        String::from(".webp"),
+        String::from(".svg"),
+    ];
+    for e in exts {
+        if lower.ends_with(e.as_str()) {
+            return e;
+        }
+    }
+    String::from("")
+}

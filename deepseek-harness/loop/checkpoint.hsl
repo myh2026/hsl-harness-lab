@@ -1,0 +1,73 @@
+// ============================================================================
+// dsh/loop/checkpoint.hsl — session-checkpoint-policy（变异前快照，可回滚）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/session/session-checkpoint-policy
+// ——「零配置插件，在关键时刻让会话可持久：模型请求到达适配器之前、
+// 顶层工具产生外部副作用之前、每个 step 边界」。HSL 侧：变异工具执行
+// 前对目标文件做快照入 RunState.checkpoints（seq 递增）；/restore 命令
+// 回滚最后一个快照（变更前内容写回）。新文件的 create 不快照（无删除
+// 原语可回滚，create 自身拒绝覆盖）。bash 副作用由白名单+审批门覆盖
+// （无整工作区快照原语，README 披露）。
+// ============================================================================
+
+import { ToolCall } from "../types/messages.hsl";
+import { RunState, Checkpoint } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+
+/// 变异前快照（门禁管线在 dispatch 前调用；返回更新后的 state + 事件）。
+export fn snapshot(mut state: RunState, call: ToolCall) -> (RunState, Vec<SessionEvent>) {
+    if call.clone().is_mutation() == false {
+        return (state, Vec::new());
+    }
+    let path = call.clone().mutation_path();
+    if path.len() == 0 {
+        return (state, Vec::new());
+    }
+    let r = native typescript {
+        try {
+            return { ok: true, body: await $host.fs.read(path) };
+        } catch {
+            return { ok: false, body: "" };
+        }
+    };
+    if r.ok == false {
+        // 目标尚不存在（create 新文件）：无删除原语可回滚，不快照
+        return (state, Vec::new());
+    }
+    let seq = (state.clone().checkpoints.len() + 1) as u32;
+    let cp = Checkpoint { seq, path: path.clone(), content: r.body };
+    state.checkpoints.push(cp);
+    (state, vec![SessionEvent::CheckpointTaken { path, bytes: r.body.len() }])
+}
+
+/// 回滚最后一个快照（/restore 命令入口；返回 state + 事件 + 通告文案）。
+export fn restore_last(state: RunState) -> (RunState, Vec<SessionEvent>, String) {
+    let last = state.clone().checkpoints.last();
+    let cp = match last {
+        Option::Some(c) => c,
+        Option::None => {
+            return (state, Vec::new(), String::from("No checkpoint to restore (mutations take snapshots before they run)."));
+        },
+    };
+    let path = cp.path.clone();
+    let content = cp.content.clone();
+    let seq = cp.seq;
+    let w = native typescript {
+        try {
+            $host.fs.write(path, content);
+            return { ok: true, error: "" };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e) };
+        }
+    };
+    if w.ok == false {
+        return (state, Vec::new(), format!("Checkpoint restore failed: {}", w.error));
+    }
+    // 工具链 bug#3 规避：块语句后不以 `(` 开头收尾，经 let 中转
+    let restored = (
+        state,
+        vec![SessionEvent::CheckpointRestored { seq, path: path.clone() }],
+        format!("Restored checkpoint #{} — {} written back to its pre-mutation content.", seq, path),
+    );
+    restored
+}

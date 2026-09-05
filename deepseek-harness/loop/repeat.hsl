@@ -1,0 +1,81 @@
+// ============================================================================
+// dsh/loop/repeat.hsl — repeat-tool-reminder（同参重复调用提醒）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/guard/repeat-tool-reminder——
+// 「模型可能困在用同样参数反复调同一工具上；在选定的重复计数（3/5/8）
+// 投递提醒：分析上次结果、换路或结束；提醒是建议从不阻断；新用户
+// 消息清零计数；每个代理独立追踪」。HSL 侧：调用签名（工具名 + 参数
+// 指纹）计数，命中 3/5/8 → 注入提醒用户消息（不阻断，观察文案）。
+// ============================================================================
+
+import { ToolCall } from "../types/messages.hsl";
+import { RunState, RepeatTracker } from "../types/state.hsl";
+
+/// 追踪一次工具调用：签名一致 → 计数 +1；变化 → 重置为 1。
+export fn track(mut state: RunState, call: ToolCall) -> RunState {
+    let sig = signature(call);
+    if state.repeat.signature == sig {
+        state.repeat.count += 1;
+    } else {
+        state.repeat = RepeatTracker { signature: sig, count: 1 };
+    }
+    state
+}
+
+/// 提醒是否到期（命中 3/5/8 阈值；返回 (工具名, 计数)）。
+export fn reminder_due(state: RunState) -> Option<(String, u32)> {
+    let count = state.repeat.count;
+    if count == 3 || count == 5 || count == 8 {
+        let name = state.repeat.signature.split("|").first().unwrap_or(String::from("tool"));
+        return Option::Some((name, count));
+    }
+    Option::None
+}
+
+/// 提醒文案（建议性，不阻断）。
+export fn reminder_text(tool: String, count: u32) -> String {
+    format!(
+        "reminder: you have called {} with the same arguments {} times now. Analyze the last result and either try a different approach or finish the task.",
+        tool, count
+    )
+}
+
+/// 新用户消息 → 计数清零（原版语义：一条新用户消息重置计数）。
+export fn reset(mut state: RunState) -> RunState {
+    state.repeat = RepeatTracker { signature: String::from(""), count: 0 };
+    state
+}
+
+/// 调用签名：工具名 + 参数拼接指纹（同工具同参数 → 同签名）。
+fn signature(call: ToolCall) -> String {
+    format!("{}|{}", call.clone().name(), arg_fingerprint(call))
+}
+
+/// 参数指纹（字符串参数拼接；非字符串参数以标志位并入）。
+fn arg_fingerprint(call: ToolCall) -> String {
+    match call.clone() {
+        ToolCall::ReadFile { path } => path,
+        ToolCall::WriteFile { path, content } => format!("{}|{}|{}", path, content.len(), content.take(64)),
+        ToolCall::EditFile { path, old_text, new_text } => format!("{}|{}|{}", path, old_text, new_text),
+        ToolCall::Bash { command } => command,
+        ToolCall::ListFiles => String::from("-"),
+        ToolCall::ReadImage { path } => path,
+        ToolCall::Glob { pattern, path } => format!("{}|{}", pattern, path),
+        ToolCall::Grep { pattern, path, include } => format!("{}|{}|{}", pattern, path, include),
+        ToolCall::StrReplaceEditor { command, path, file_text, old_str, new_str, insert_line, view_start, view_end } => {
+            format!("{}|{}|{}|{}|{}|{}|{}|{}", command, path, file_text.len(), old_str, new_str, insert_line, view_start, view_end)
+        },
+        ToolCall::TodoWrite { todos } => format!("{} items", todos.len()),
+        ToolCall::SkillInvoke { name } => name,
+        ToolCall::GoalTool { op, objective, goal_id, revision, action, max_rounds, blocked_reason } => {
+            format!("{}|{}|{}|{}|{}|{}|{}", op, objective, goal_id, revision, action, max_rounds, blocked_reason)
+        },
+        ToolCall::WebSearch { query } => query,
+        ToolCall::WebFetch { url } => url,
+        ToolCall::Subagent { task } => task,
+        ToolCall::Jobs { op, job_id, arg, wait, timeout_ms, reason } => format!("{}|{}|{}|{}|{}|{}", op, job_id, arg, wait, timeout_ms, reason),
+        ToolCall::Ralph { objective, max_rounds } => format!("{}|{}", objective, max_rounds),
+        ToolCall::Workflow { steps } => steps,
+        ToolCall::AskUser { questions } => questions,
+    }
+}

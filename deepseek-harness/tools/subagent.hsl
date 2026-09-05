@@ -1,0 +1,92 @@
+// ============================================================================
+// dsh/tools/subagent.hsl — subagent（进程内子代理 = agent-loop 嵌套调用）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/subagent + subagent-spawn-in-process
+// + tool-subagent——「一次委托 = 一个子代理带着独立会话切片运行；父代理
+// 只见最终报告；one-shot 策略默认等待子代理完成」。HSL 侧：run_subagent
+// 复用 agent-loop 的嵌套调用（独立 transcript 切片 + 子模型（fixture
+// 轨道 subagent / 真实 LLM）+ 同一注册表白名单守卫），子代理输出不进
+// 父转录，只回终报（对齐「failed runs surface as errored tool results」）。
+// ============================================================================
+
+import { Message, ToolResult, Action } from "../types/messages.hsl";
+import { DshError } from "../types/errors.hsl";
+import { Policy } from "../types/state.hsl";
+import { ModelProvider, ScriptedModel, DeepSeekModel } from "../providers/model.hsl";
+import { parse_action } from "../agents/executor.hsl";
+import { ToolRegistry } from "../core/registry.hsl";
+
+/// 子代理回合上限（子会话自身预算，与父 turn 预算独立）。
+const CHILD_MAX_TURNS: u32 = 4;
+
+/// 子代理产物（父可见面：终报 + 子会话统计）。
+export struct SubagentOutcome {
+    agent: String,
+    summary: String,
+    turns: u32,
+    tool_calls: u32,
+}
+
+/// 子代理角色提示词（与主提示词同源不同实例——独立会话切片）。
+fn child_prompt() -> String {
+    String::from(
+        "You are a DSH child agent. Complete the delegated task in the shared workspace by calling tools.\nFollow the same JSON protocol as the parent: EXACTLY ONE JSON object per turn,\nwith \"action\" = \"tool\" (plus tool/parameters) or \"done\" (plus \"summary\").\nYour final \"summary\" is the only thing the parent sees: make it complete and self-contained.",
+    )
+}
+
+/// 进程内子代理：独立会话切片 + 嵌套 agent-loop + 白名单守卫。
+/// agent_id 用于父日志的 SubagentSpawned/Replied 归因。
+export async fn run_subagent(policy: Policy, registry: ToolRegistry, task: String, agent: String) -> Result<SubagentOutcome, DshError> {
+    let model = make_child_model(policy.clone());
+    let mut transcript: Vec<Message> = Vec::new();
+    transcript.push(Message::system(child_prompt()));
+    transcript.push(Message::user(task.clone()));
+    let mut turns: u32 = 0;
+    let mut tool_calls: u32 = 0;
+    let mut summary = String::from("");
+    while turns < CHILD_MAX_TURNS {
+        let raw = model.act(transcript.clone()).await?;
+        transcript.push(Message::assistant(raw.clone()));
+        turns += 1;
+        let action = match parse_action(raw) {
+            Ok(a) => a,
+            Err(e) => {
+                transcript.push(Message::user(format!("协议违规：{}。请输出恰好一个 JSON 对象。", e.message)));
+                continue;
+            },
+        };
+        match action {
+            Action::Tool { call } => {
+                let outcome = registry.clone().guarded_run(call.clone(), turns);
+                let result: ToolResult = match outcome {
+                    Ok(r) => r,
+                    Err(g) => ToolResult {
+                        call: format!("guard {}", g.tool),
+                        ok: false,
+                        output: format!("guard denied: {}", g.reason),
+                        duration_ms: 0,
+                    },
+                };
+                transcript.push(result.clone().observation());
+                tool_calls += 1;
+            },
+            Action::Done { summary: s } => {
+                summary = s;
+                break;
+            },
+        }
+    }
+    if summary.len() == 0 {
+        summary = format!("child agent {} exhausted its turn budget ({} turns) without done", agent, turns);
+    }
+    Ok(SubagentOutcome { agent, summary, turns, tool_calls })
+}
+
+/// 子模型装配（scripted：fixture 轨道 subagent；真实：LLM 网关）。
+fn make_child_model(policy: Policy) -> Box<dyn ModelProvider> {
+    if policy.model == String::from("deepseek") {
+        DeepSeekModel::new(String::from("glm-4.5"), policy.temperature)
+    } else {
+        ScriptedModel::new(String::from("fixture"), String::from("subagent"))
+    }
+}

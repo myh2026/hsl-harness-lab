@@ -1,0 +1,36 @@
+// ============================================================================
+// franxagent/scheduler/events.hsl — EventBroadcaster（事件多播桥）
+// ============================================================================
+// FranxAgent 原架构对应：scheduler.py 的 EventBroadcaster——
+// broadcast(event_type, data) 把 SSE 帧（"event: <type>\ndata: <json>"）
+// 多播给全部订阅者（/events 路由）。
+// HSL 侧：$host.events 总线是等价的观测通道（G6 microkernel 尺度下
+// 边事件与自定义事件同落 events.jsonl）；订阅者管理（subscribe/
+// unsubscribe）属 web 适配层。数据 JSON 在 HSL 侧拼装（json_esc 转义），
+// native 只做发射效应。
+// ============================================================================
+
+/// 多播一帧事件（EventBroadcaster.broadcast 的化身）。
+export fn broadcast(event_type: String, data_json: String) -> bool {
+    let r = native typescript {
+        try {
+            $host.events.emit(event_type, JSON.parse(data_json));
+            return { ok: true };
+        } catch {
+            // 数据不是合法 JSON → 退化为字符串载荷（不丢事件）
+            $host.events.emit(event_type, data_json);
+            return { ok: true };
+        }
+    };
+    r.ok
+}
+
+/// JSON 字符串字面量转义（HSL 侧拼 JSON 的卫生层）。
+export fn json_esc(text: String) -> String {
+    let mut out = text.clone();
+    out = out.replace(String::from("\\"), String::from("\\\\"));
+    out = out.replace(String::from("\""), String::from("\\\""));
+    out = out.replace(String::from("\n"), String::from("\\n"));
+    out = out.replace(String::from("\t"), String::from("\\t"));
+    out
+}

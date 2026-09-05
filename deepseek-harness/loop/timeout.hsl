@@ -1,0 +1,39 @@
+// ============================================================================
+// dsh/loop/timeout.hsl — tool-call-timeout-policy（每工具协作超时预算）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/guard/timeout-policy——「为声明
+// 了限额的工具武装协作截止线：先请工具停止，结算后映射为清晰的
+// `Error: tool call timed out after <ms>ms`；插件从不硬停下游工作；
+// 限额来自各工具自身配置，插件零配置」。HSL 侧：预算来自
+// DSH_TOOL_TIMEOUT_MS（缺省 120000 = 不构成实际约束）；bash 类工具把
+// 预算下传宿主（真超时杀进程）；其余工具以后置 elapsed 判定（结算晚
+// 于预算 → 映射超时错误文案，与原版「cooperative」语义一致）。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+import { SessionEvent } from "../types/events.hsl";
+
+/// 超时判定：elapsed 超预算 → Some(超时错误结果 + 事件)。
+export fn check(tool: String, budget_ms: u32, elapsed_ms: u64) -> Option<(ToolResult, SessionEvent)> {
+    if budget_ms == 0 {
+        return Option::None;
+    }
+    if elapsed_ms <= budget_ms as u64 {
+        return Option::None;
+    }
+    let text = timeout_text(budget_ms);
+    Option::Some((
+        ToolResult {
+            call: tool.clone(),
+            ok: false,
+            output: text,
+            duration_ms: elapsed_ms,
+        },
+        SessionEvent::ToolTimedOut { tool, budget_ms },
+    ))
+}
+
+/// 超时错误文案（对齐原版 `Error: tool call timed out after <ms>ms`）。
+fn timeout_text(budget_ms: u32) -> String {
+    format!("Error: tool call timed out after {}ms", budget_ms)
+}

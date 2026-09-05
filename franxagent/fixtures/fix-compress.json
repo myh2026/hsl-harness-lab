@@ -1,0 +1,22 @@
+{
+ "tracks": {
+  "acts": [
+   "{\"content\": \"\", \"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"tools\", \"arguments\": \"{\\\"tool_name\\\": \\\"read\\\", \\\"arguments\\\": {\\\"path\\\": \\\"notes.txt\\\"}}\"}}]}",
+   "{\"content\": \"\", \"tool_calls\": [{\"id\": \"call_2\", \"type\": \"function\", \"function\": {\"name\": \"tools\", \"arguments\": \"{\\\"tool_name\\\": \\\"read\\\", \\\"arguments\\\": {\\\"path\\\": \\\"tasks.json\\\"}}\"}}]}",
+   "{\"content\": \"\", \"tool_calls\": [{\"id\": \"call_3\", \"type\": \"function\", \"function\": {\"name\": \"tools\", \"arguments\": \"{\\\"tool_name\\\": \\\"read\\\", \\\"arguments\\\": {\\\"path\\\": \\\"notes.txt\\\"}}\"}}]}",
+   "{\"content\": \"\", \"tool_calls\": [{\"id\": \"call_4\", \"type\": \"function\", \"function\": {\"name\": \"tools\", \"arguments\": \"{\\\"tool_name\\\": \\\"write\\\", \\\"arguments\\\": {\\\"path\\\": \\\"notes.txt\\\", \\\"content\\\": \\\"meeting notes 2026-09-05\\\\nTODO: fix variance denominator (n-1) [DONE]\\\\nTODO: implement median\\\", \\\"mode\\\": \\\"overwrite\\\"}}\"}}]}",
+   "上下文超限已触发压缩并恢复：notes.txt 已更新（第 2 行标记 DONE）。"
+  ],
+  "approvals": [
+   "approve"
+  ]
+ },
+ "faults": [
+  {
+   "target": "fixture.next:acts",
+   "nth": 4,
+   "kind": "error",
+   "message": "Error code: 400 - This model's maximum context length is 4096 tokens. However, your messages resulted in 8231 tokens. Please reduce the length of the messages."
+  }
+ ]
+}

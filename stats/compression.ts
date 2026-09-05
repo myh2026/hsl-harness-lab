@@ -91,9 +91,13 @@ function project(
   }
 }
 
+// dsh 原版侧 = HSL 复现所覆盖的 dsh-base 能力包（core spine + 全工具面 +
+// 回路级能力；平台基建层 storage/credentials/telemetry/外部协议不计，见
+// 复现 README「能力矩阵」的 ⚪ 披露清单）
 const dsh = project(
   'dsh', 'deepseek-harness',
   [
+    // core spine
     `${REPOS}/deepseek-harness/packages/core`,
     `${REPOS}/deepseek-harness/packages/guard`,
     `${REPOS}/deepseek-harness/packages/llm/llm`,
@@ -101,6 +105,24 @@ const dsh = project(
     `${REPOS}/deepseek-harness/packages/session/session-log-deepseek`,
     `${REPOS}/deepseek-harness/packages/session/session-persistence`,
     `${REPOS}/deepseek-harness/packages/session/session-persistence-jsonl`,
+    `${REPOS}/deepseek-harness/packages/session/session-checkpoint-policy`,
+    // 全工具面
+    `${REPOS}/deepseek-harness/packages/fs`,
+    `${REPOS}/deepseek-harness/packages/shell`,
+    `${REPOS}/deepseek-harness/packages/web/tool-web`,
+    `${REPOS}/deepseek-harness/packages/web/web-fetch-http`,
+    `${REPOS}/deepseek-harness/packages/web/web-search-deepseek`,
+    `${REPOS}/deepseek-harness/packages/todo`,
+    `${REPOS}/deepseek-harness/packages/skill`,
+    `${REPOS}/deepseek-harness/packages/goal`,
+    `${REPOS}/deepseek-harness/packages/subagent`,
+    `${REPOS}/deepseek-harness/packages/jobs`,
+    `${REPOS}/deepseek-harness/packages/workflow`,
+    // 回路级能力
+    `${REPOS}/deepseek-harness/packages/compaction`,
+    `${REPOS}/deepseek-harness/packages/plan`,
+    `${REPOS}/deepseek-harness/packages/interaction`,
+    `${REPOS}/deepseek-harness/packages/feedback`,
   ],
   `${PROJ}/deepseek-harness`,
   [],

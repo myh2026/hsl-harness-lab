@@ -1,0 +1,184 @@
+// ============================================================================
+// stanzaweaver/types/syllable.hsl — 音节（格律分析最小单元）+ 逐位约束
+// ============================================================================
+// StanzaWeaver 原架构对应：src/models/syllable.py 的 Syllable
+// （onset/nucleus/coda + attributes{tone, stress, length}）。
+// HSL 侧：attributes 三键展平为本体字段（tone/stress/length —— 空 = 未知/不限），
+// 约束原语 SylConstraint 与原版 constraint dict（onset/nucleus/coda +
+// attributes 子字典）逐字段同构，match_constraint 语义一致（空字段 = 不限）。
+// ============================================================================
+
+/// 一个音节：声母 / 韵腹 / 韵尾 + 音系属性（平仄 | 重音 | 长短）。
+#[derive(Debug, Clone)]
+export struct Syllable {
+    onset: String,    // 声母/辅音首（如 "zh"、"str"）
+    nucleus: String,  // 韵腹/元音核（如 "a"、"iao"、"IY"）
+    coda: String,      // 韵尾/尾辅音（如 "ng"、"T"）
+    tone: String,      // "" | "平" | "仄"（zh）
+    stress: String,    // "" | "heavy" | "light"（en/it）
+    length: String,    // "" | "long" | "short"（la）
+}
+
+impl Syllable {
+    /// 音节完整拼写（onset + nucleus + coda）—— 原版 Syllable.text 属性。
+    fn text(self) -> String {
+        format!("{}{}{}", self.onset, self.nucleus, self.coda)
+    }
+
+    /// 是否满足一条逐位约束（原版 match_constraint：空字段不限；
+    /// HSL 侧对未知属性 ""/"?" 一律放行 —— 与符号层「查无此字不误报」一致）。
+    fn matches(self, c: SylConstraint) -> bool {
+        if c.onset.len() > 0 && self.onset != c.onset {
+            return false;
+        }
+        if c.nucleus.len() > 0 && self.nucleus != c.nucleus {
+            return false;
+        }
+        if c.coda.len() > 0 && self.coda != c.coda {
+            return false;
+        }
+        if c.tone.len() > 0 && self.tone != c.tone && self.tone != String::from("?") {
+            return false;
+        }
+        if c.stress.len() > 0 && self.stress != c.stress && self.stress.len() > 0 {
+            return false;
+        }
+        if c.length.len() > 0 && self.length != c.length && self.length.len() > 0 {
+            return false;
+        }
+        true
+    }
+
+    /// 音节的人类可读描述（原版 _describe_syllable："声母=zh,tone=平"）。
+    fn describe(self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.onset.len() > 0 {
+            parts.push(format!("声母={}", self.onset));
+        }
+        if self.nucleus.len() > 0 {
+            parts.push(format!("韵母={}", self.nucleus));
+        }
+        if self.coda.len() > 0 {
+            parts.push(format!("韵尾={}", self.coda));
+        }
+        if self.tone.len() > 0 {
+            parts.push(format!("tone={}", self.tone));
+        }
+        if self.stress.len() > 0 {
+            parts.push(format!("stress={}", self.stress));
+        }
+        if self.length.len() > 0 {
+            parts.push(format!("length={}", self.length));
+        }
+        if parts.len() == 0 {
+            String::from("空")
+        } else {
+            parts.join(",")
+        }
+    }
+
+    /// 序列化为存储字段串 "onset|nucleus|coda|tone|stress|length"。
+    fn to_store_field(self) -> String {
+        format!("{}|{}|{}|{}|{}|{}", self.onset, self.nucleus, self.coda, self.tone, self.stress, self.length)
+    }
+
+    /// 从存储字段串还原（to_store_field 的逆；字段不足时补空）。
+    fn from_store_field(field: String) -> Syllable {
+        let cols = field.split("|");
+        Syllable {
+            onset: cols.get(0).unwrap_or(String::from("")),
+            nucleus: cols.get(1).unwrap_or(String::from("")),
+            coda: cols.get(2).unwrap_or(String::from("")),
+            tone: cols.get(3).unwrap_or(String::from("")),
+            stress: cols.get(4).unwrap_or(String::from("")),
+            length: cols.get(5).unwrap_or(String::from("")),
+        }
+    }
+}
+
+/// 逐位音节约束（原版 ConstraintDict：onset/nucleus/coda + attributes 三键；
+/// 空字段 = 不限）。词库 search_words 的逐位约束与模板 constraints 共用此原语。
+#[derive(Debug, Clone)]
+export struct SylConstraint {
+    onset: String,
+    nucleus: String,
+    coda: String,
+    tone: String,     // "平" | "仄" | ""
+    stress: String,   // "heavy" | "light" | ""
+    length: String,   // "long" | "short" | ""
+}
+
+impl SylConstraint {
+    /// 不限（原版 _make_syl() 空约束 / 词牌谱 "中" 位）。
+    fn free() -> SylConstraint {
+        SylConstraint {
+            onset: String::from(""),
+            nucleus: String::from(""),
+            coda: String::from(""),
+            tone: String::from(""),
+            stress: String::from(""),
+            length: String::from(""),
+        }
+    }
+
+    /// 仅声调约束（原版 zh._tone(t)）。
+    fn tone_only(t: String) -> SylConstraint {
+        let mut c = SylConstraint::free();
+        c.tone = t;
+        c
+    }
+
+    /// 仅重音约束（原版 en._l/_h）。
+    fn stress_only(s: String) -> SylConstraint {
+        let mut c = SylConstraint::free();
+        c.stress = s;
+        c
+    }
+
+    /// 仅长短约束（原版 la._L/_S）。
+    fn length_only(l: String) -> SylConstraint {
+        let mut c = SylConstraint::free();
+        c.length = l;
+        c
+    }
+
+    /// 是否携带任一约束（全空 = 不限位）。
+    fn is_any_set(self) -> bool {
+        self.onset.len() > 0 || self.nucleus.len() > 0 || self.coda.len() > 0
+            || self.tone.len() > 0 || self.stress.len() > 0 || self.length.len() > 0
+    }
+
+    /// 约束的人类可读描述（原版 _describe_constraint）。
+    fn describe(self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.onset.len() > 0 {
+            parts.push(format!("声母={}", self.onset));
+        }
+        if self.nucleus.len() > 0 {
+            parts.push(format!("韵母={}", self.nucleus));
+        }
+        if self.coda.len() > 0 {
+            parts.push(format!("韵尾={}", self.coda));
+        }
+        if self.tone.len() > 0 {
+            parts.push(format!("tone={}", self.tone));
+        }
+        if self.stress.len() > 0 {
+            parts.push(format!("stress={}", self.stress));
+        }
+        if self.length.len() > 0 {
+            parts.push(format!("length={}", self.length));
+        }
+        if parts.len() == 0 {
+            String::from("无约束")
+        } else {
+            parts.join(",")
+        }
+    }
+
+    /// JSON 渲染（原版 constraint dict 形状：onset/nucleus/coda + attributes 三键）。
+    fn to_json(self) -> String {
+        format!("{{\"onset\": \"{}\", \"nucleus\": \"{}\", \"coda\": \"{}\", \"attributes\": {{\"tone\": \"{}\", \"stress\": \"{}\", \"length\": \"{}\"}}}}",
+            self.onset, self.nucleus, self.coda, self.tone, self.stress, self.length)
+    }
+}

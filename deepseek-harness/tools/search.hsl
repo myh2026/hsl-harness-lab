@@ -1,0 +1,380 @@
+// ============================================================================
+// dsh/tools/search.hsl — glob / grep（tool-fs-search 的模型可见发现工具）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/fs/tool-fs-search——「model-facing
+// filesystem discovery tools，glob 按模式发现文件、grep 按行搜内容，结果
+// 有界」。原版背靠打包的 ripgrep；HSL 侧以纯字符串工程重写匹配层：
+//   glob：段级两指针通配（`*`/`?`/`**`）+ 无 `/` 模式匹配任意深度 basename
+//   grep：微型回溯正则子集（`. * + ? ^ $` + 字面 + `\\` 转义）
+// 偏差披露：宿主 fs 无 mtime API → glob 结果按字典序（非修改时间序）；
+// 宿主 list 递归深度 ≤2 层；grep 正则不支持字符类/分组/交替。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+import { Policy } from "../types/state.hsl";
+import { cap_chars } from "./workspace.hsl";
+
+/// glob 工具：按模式发现文件（含隐藏文件；无 `/` 的模式匹配任意深度
+/// basename，故 `*` 匹配整棵树）。结果封顶 + 截断通告（spill 不可用提示）。
+export fn run_glob(policy: Policy, pattern: String, path: String) -> Result<ToolResult, String> {
+    if pattern.len() == 0 {
+        return Err(String::from("pattern must be a non-empty string"));
+    }
+    if path.len() == 0 {
+        return Err(String::from("path must be a non-empty string when given"));
+    }
+    let listing = native typescript {
+        try {
+            return await $host.fs.list(".");
+        } catch (e) {
+            return "ERROR: " + String(e && e.message || e);
+        }
+    };
+    if listing.starts_with("ERROR: ") {
+        return Err(listing);
+    }
+    let files = listing.lines().map(|l| l.trim_end()).filter(|l| l.len() > 0 && l.ends_with("/") == false);
+    let base = path.trim();
+    let matched = files.filter(|f| {
+        let subject = if base == "." || base.len() == 0 {
+            f.clone()
+        } else {
+            match f.clone().strip_prefix(format!("{}/", base).as_str()) {
+                Option::Some(rest) => rest,
+                Option::None => String::from("\x00no"),
+            }
+        };
+        glob_match(pattern.clone(), subject)
+    });
+    let total = matched.len();
+    if total == 0 {
+        return Ok(ToolResult {
+            call: format!("glob {}", pattern),
+            ok: true,
+            output: String::from("No files found"),
+            duration_ms: 0,
+        });
+    }
+    let page = matched.take(policy_max_glob(policy));
+    let mut out = page.join("\n");
+    if total > page.len() {
+        out.push_str("\n\n(The complete result could not be saved; narrow pattern or path to see more.)");
+    } else {
+        out.push_str(format!("\n\n(Showing {} of {} paths.)", page.len(), total).as_str());
+    }
+    Ok(ToolResult {
+        call: format!("glob {} {}", pattern, path),
+        ok: true,
+        output: cap_chars(out, policy.max_output_chars),
+        duration_ms: 0,
+    })
+}
+
+/// grep 工具：正则搜文件内容，按文件分组返回 `Line N: <preview>`。
+/// `include` 是一个正向 glob 过滤（拒绝 `!` 前缀与逗号清单，花括号内逗号合法）。
+export fn run_grep(policy: Policy, pattern: String, path: String, include: String) -> Result<ToolResult, String> {
+    if pattern.len() == 0 {
+        return Err(String::from("pattern must be a non-empty string"));
+    }
+    if include.len() > 0 {
+        validate_include(include.clone())?;
+    }
+    let listing = native typescript {
+        try {
+            return await $host.fs.list(".");
+        } catch (e) {
+            return "ERROR: " + String(e && e.message || e);
+        }
+    };
+    if listing.starts_with("ERROR: ") {
+        return Err(listing);
+    }
+    let files = listing.lines().map(|l| l.trim_end()).filter(|l| l.len() > 0 && l.ends_with("/") == false);
+    let base = path.trim();
+    let candidates = files.filter(|f| {
+        if base == "." || base.len() == 0 {
+            true
+        } else {
+            f.starts_with(format!("{}/", base).as_str()) || f.clone() == base
+        }
+    });
+    let mut body = String::from("");
+    let mut seen: u32 = 0;
+    let mut kept: u32 = 0;
+    for file in candidates {
+        if include.len() > 0 && glob_match(include.clone(), file.clone()) == false {
+            continue;
+        }
+        let content = native typescript {
+            try {
+                return await $host.fs.read(file);
+            } catch {
+                return "";
+            }
+        };
+        if content.len() == 0 {
+            continue; // 二进制 / 不可读文件：跳过（ripgrep 默认行为）
+        }
+        let lines = content.lines();
+        let mut section = String::from("");
+        for pair in lines.enumerate() {
+            let line = pair[1].clone();
+            if regex_search(pattern.clone(), line.clone()) {
+                seen += 1;
+                if kept < policy_max_grep(policy) {
+                    kept += 1;
+                    if section.len() == 0 {
+                        section.push_str(file.as_str());
+                        section.push_str("\n");
+                    }
+                    section.push_str(format!("Line {}: {}\n", pair[0] + 1, preview_line(line, policy)).as_str());
+                }
+            }
+        }
+        if section.len() > 0 {
+            body.push_str(section.trim_end().as_str());
+            body.push_str("\n\n");
+        }
+    }
+    let mut out = if seen == 0 {
+        String::from("No matches found")
+    } else if seen > kept {
+        format!("Found {} of {} matches\n\n{}", kept, seen, body.trim_end())
+    } else {
+        format!("Found {} {}\n\n{}", seen, if seen == 1 { "match" } else { "matches" }, body.trim_end())
+    };
+    if seen > kept {
+        out.push_str("\n\n(The complete result could not be saved; narrow pattern, path, or include to see more.)");
+    }
+    Ok(ToolResult {
+        call: format!("grep \"{}\" {}", pattern, path),
+        ok: true,
+        output: cap_chars(out, policy.max_output_chars),
+        duration_ms: 0,
+    })
+}
+
+/// include 校验（原版 validateInclude 逐语义移植）：非空、非 `!` 否定、
+/// 顶层逗号清单拒绝（花括号组内逗号合法——`*.{ts,tsx}` 是交替不是清单）。
+fn validate_include(include: String) -> Result<(), String> {
+    if include.trim().len() == 0 {
+        return Err(String::from("include must be a non-empty glob when given"));
+    }
+    if include.starts_with("!") {
+        return Err(String::from("include must be a positive glob filter; negated patterns (\"!…\") are not supported"));
+    }
+    let chars = include.chars();
+    let mut depth: u32 = 0;
+    for c in chars {
+        if c == "{" {
+            depth += 1;
+        } else if c == "}" {
+            if depth > 0 { depth -= 1; }
+        } else if c == "," && depth == 0 {
+            return Err(String::from("include must be one glob, not a comma-separated list (use {a,b} alternation instead)"));
+        }
+    }
+    Ok(())
+}
+
+/// 匹配行预览封顶（原版 grepMaxLineBytes 的字符口径近似）。
+fn preview_line(line: String, policy: Policy) -> String {
+    cap_chars(line.trim_end(), policy.max_output_chars.min(2_000))
+}
+
+// ----------------------------------------------------------------------------
+// glob 匹配层（纯 HSL 字符串工程）
+// ----------------------------------------------------------------------------
+
+/// 单段通配匹配（`*` 任意段内字符、`?` 单字符、其余字面；两指针 + 回溯）。
+fn seg_match(seg: String, text: String) -> bool {
+    let s = seg.chars();
+    let t = text.chars();
+    let mut si: u32 = 0;
+    let mut ti: u32 = 0;
+    let mut star: u32 = 999_999;
+    let mut star_t: u32 = 0;
+    while ti < t.len() {
+        let sc = s[si as usize];
+        let tc = t[ti as usize];
+        if si < s.len() && (sc == "?" || sc == tc) {
+            si += 1;
+            ti += 1;
+        } else if si < s.len() && sc == "*" {
+            star = si;
+            star_t = ti;
+            si += 1;
+        } else if star != 999_999 {
+            star_t += 1;
+            ti = star_t;
+            si = star + 1;
+        } else {
+            return false;
+        }
+    }
+    let mut k = si;
+    while k < s.len() {
+        if s[k as usize] != "*" { return false; }
+        k += 1;
+    }
+    true
+}
+
+/// 段序列匹配（`**` 跨任意深度；递归回溯）。
+fn match_segs(segs: Vec<String>, parts: Vec<String>) -> bool {
+    if segs.is_empty() {
+        return parts.is_empty();
+    }
+    let head = segs[0].clone();
+    if head == "**" {
+        let rest = segs.skip(1);
+        if match_segs(rest.clone(), parts.clone()) {
+            return true;
+        }
+        if parts.is_empty() {
+            return false;
+        }
+        return match_segs(segs.clone(), parts.skip(1));
+    }
+    if parts.is_empty() {
+        return false;
+    }
+    if seg_match(head, parts[0].clone()) == false {
+        return false;
+    }
+    match_segs(segs.skip(1), parts.skip(1))
+}
+
+/// glob 语义入口：无 `/` 的模式匹配任意深度 basename（`*` 匹配整棵树），
+/// 含 `/` 的模式按相对路径段匹配。
+fn glob_match(pattern: String, path: String) -> bool {
+    if path.starts_with("\x00") {
+        return false; // base 目录外的前哨标记
+    }
+    if pattern.contains("/") == false {
+        let parts = path.split("/");
+        let last = match parts.last() {
+            Option::Some(l) => l.clone(),
+            Option::None => String::from(""),
+        };
+        return seg_match(pattern, last);
+    }
+    match_segs(pattern.split("/"), path.split("/"))
+}
+
+// ----------------------------------------------------------------------------
+// grep 微型正则子集（`. * + ? ^ $` + 字面 + `\\` 转义；回溯匹配）
+// ----------------------------------------------------------------------------
+
+/// 正则 token（量词分离编译）。
+struct Tok {
+    ch: String,
+    quant: String,
+}
+
+/// 模式编译：转义消解 + 量词分离。
+fn compile_pattern(p: String) -> Vec<Tok> {
+    let chars = p.chars();
+    let mut toks: Vec<Tok> = Vec::new();
+    let mut i: u32 = 0;
+    while i < chars.len() {
+        let mut c = chars[i as usize];
+        i += 1;
+        if c == "\\" && i < chars.len() {
+            c = chars[i as usize];
+            i += 1;
+        }
+        let mut q = String::from("");
+        if i < chars.len() {
+            let nx = chars[i as usize];
+            if nx == "*" || nx == "+" || nx == "?" {
+                q = nx.to_string();
+                i += 1;
+            }
+        }
+        toks.push(Tok { ch: c.to_string(), quant: q });
+    }
+    toks
+}
+
+/// token 序列回溯匹配。
+fn match_toks(toks: Vec<Tok>, pi: u32, t: Vec<String>, ti: u32, dollared: bool) -> bool {
+    if pi >= toks.len() {
+        if dollared {
+            return ti == t.len();
+        }
+        return true;
+    }
+    let tok = toks[pi as usize].clone();
+    if tok.quant == "*" || tok.quant == "+" {
+        let min: i64 = if tok.quant == "+" { 1 } else { 0 };
+        let mut k: i64 = ti as i64;
+        while k < t.len() as i64 && (tok.ch == "." || tok.ch == t[k as usize]) {
+            k += 1;
+        }
+        while k >= (ti as i64) + min {
+            if match_toks(toks.clone(), pi + 1, t.clone(), k as u32, dollared) {
+                return true;
+            }
+            k -= 1;
+        }
+        return false;
+    }
+    if tok.quant == "?" {
+        if match_toks(toks.clone(), pi + 1, t.clone(), ti, dollared) {
+            return true;
+        }
+        if ti < t.len() && (tok.ch == "." || tok.ch == t[ti as usize]) {
+            return match_toks(toks.clone(), pi + 1, t.clone(), ti + 1, dollared);
+        }
+        return false;
+    }
+    if ti < t.len() && (tok.ch == "." || tok.ch == t[ti as usize]) {
+        return match_toks(toks.clone(), pi + 1, t.clone(), ti + 1, dollared);
+    }
+    false
+}
+
+/// 行内搜索（ripgrep 语义：非锚定搜索，`^`/`$` 锚定行首/行尾）。
+fn regex_search(pattern: String, line: String) -> bool {
+    let mut pat = pattern.clone();
+    let mut anchored = false;
+    let mut dollared = false;
+    if pat.starts_with("^") {
+        anchored = true;
+        pat = match pat.strip_prefix("^") {
+            Option::Some(rest) => rest,
+            Option::None => pat,
+        };
+    }
+    if pat.ends_with("$") {
+        dollared = true;
+        pat = match pat.strip_suffix("$") {
+            Option::Some(rest) => rest,
+            Option::None => pat,
+        };
+    }
+    let toks = compile_pattern(pat);
+    let t = line.chars().map(|c| c.to_string()).collect::<Vec<String>>();
+    let mut start: u32 = 0;
+    while start <= t.len() {
+        if match_toks(toks.clone(), 0, t.clone(), start, dollared) {
+            return true;
+        }
+        if anchored {
+            return false;
+        }
+        start += 1;
+    }
+    false
+}
+
+/// glob 内联结果上限（原版 globMaxResults=100）。
+fn policy_max_glob(policy: Policy) -> u32 {
+    policy.max_output_chars.min(100)
+}
+
+/// grep 内联匹配上限（原版 grepMaxMatches=250）。
+fn policy_max_grep(policy: Policy) -> u32 {
+    policy.max_output_chars.min(250)
+}

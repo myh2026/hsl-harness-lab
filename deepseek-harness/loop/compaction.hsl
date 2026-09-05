@@ -1,0 +1,229 @@
+// ============================================================================
+// dsh/loop/compaction.hsl — compaction（pruner 剪枝 + summary 压缩）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/compaction——「长会话把较老历史
+// 凝结为一条摘要消息、保留近期对话、会话照常继续（condensed 内容留在
+// 会话日志，重放即复现）」+ compaction-tool-result-pruner——「压缩将触发
+// 时先把超预算工具结果剪为有界头 + 中段剪除标记 + 有界尾；剪枝不调
+// 模型，可能独自解除压力（压缩可整体跳过）；低于压力的会话绝不动」
+// + command-compact——「/compact 按需压缩：不耗模型回合；完成即报
+// 凝结条数与估算节省 token」。HSL 侧：压力 = 转录字符阈值
+// （DSH_COMPACT_THRESHOLD）；pruner 先行、剪枝解压则跳过摘要；
+// 摘要 = 一次额外模型请求（scripted：compact 轨道；真实：LLM），
+// 保留 system + 最近 KEEP_RECENT 条，其余换为一条 [compacted] 摘要。
+// ============================================================================
+
+import { Message } from "../types/messages.hsl";
+import { Policy } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+import { ModelProvider, ScriptedModel, DeepSeekModel } from "../providers/model.hsl";
+
+/// 单条工具结果剪枝阈值（超过即头/中/尾剪除）。
+const MAX_TOOL_RESULT_CHARS: u32 = 1_200;
+/// 剪枝保留头/尾容量。
+const PRUNE_HEAD: u32 = 500;
+const PRUNE_TAIL: u32 = 300;
+/// 摘要压缩保留的近期消息条数（system 之外）。
+const KEEP_RECENT: u32 = 2;
+
+/// 压缩产物（transcript 新值 + 事件 + 通告 + 统计增量）。
+export struct CompactOutcome {
+    transcript: Vec<Message>,
+    events: Vec<SessionEvent>,
+    notice: String,
+    pruned: bool,
+    compacted: bool,
+    items: u32,
+    chars_before: u32,
+    chars_after: u32,
+}
+
+/// 自动压力路径：先 pruner（不调模型），剪枝后仍超压才摘要压缩。
+export async fn relieve(policy: Policy, transcript: Vec<Message>) -> CompactOutcome {
+    let before = transcript_chars(transcript.clone());
+    if before <= policy.compact_threshold_chars {
+        return unchanged(transcript);
+    }
+    let (pruned_transcript, pruned_events, pruned_count) = prune_tool_results(transcript);
+    let after_prune = transcript_chars(pruned_transcript.clone());
+    if pruned_count > 0 {
+        pruned_events.push(SessionEvent::ToolResultsPruned {
+            count: pruned_count,
+            chars_before: before,
+            chars_after: after_prune,
+        });
+    }
+    // 剪枝独自解除压力 → 压缩整体跳过（原版语义）
+    if after_prune <= policy.compact_threshold_chars {
+        return CompactOutcome {
+            transcript: pruned_transcript,
+            events: pruned_events,
+            notice: String::from(""),
+            pruned: pruned_count > 0,
+            compacted: false,
+            items: 0,
+            chars_before: before,
+            chars_after: after_prune,
+        };
+    }
+    let outcome = summarize(policy, pruned_transcript).await;
+    let mut events = pruned_events;
+    events.append(outcome.events.clone());
+    CompactOutcome {
+        transcript: outcome.transcript,
+        events,
+        notice: String::from(""),
+        pruned: pruned_count > 0,
+        compacted: true,
+        items: outcome.items,
+        chars_before: before,
+        chars_after: outcome.chars_after,
+    }
+}
+
+/// 按需路径（/compact）：跳过压力判定，直接摘要压缩（不耗模型回合——
+/// 压缩请求是服务侧请求，不进入主循环回合计数）。
+export async fn compact_now(policy: Policy, transcript: Vec<Message>) -> CompactOutcome {
+    let before = transcript_chars(transcript.clone());
+    let outcome = summarize(policy, transcript).await;
+    let tokens = saved_tokens(before, outcome.chars_after);
+    CompactOutcome {
+        transcript: outcome.transcript,
+        events: outcome.events,
+        notice: format!("Compacted {} history items into 1 summary (~{} estimated tokens saved).", outcome.items, tokens),
+        pruned: false,
+        compacted: true,
+        items: outcome.items,
+        chars_before: before,
+        chars_after: outcome.chars_after,
+    }
+}
+
+/// 摘要压缩：system 保留 + 老span → 一条 [compacted] 摘要 + 最近 KEEP_RECENT 条。
+async fn summarize(policy: Policy, transcript: Vec<Message>) -> CompactOutcome {
+    let total = transcript.len();
+    let items = if total > 1 + KEEP_RECENT { total - 1 - KEEP_RECENT } else { 0 };
+    if items == 0 {
+        return unchanged(transcript);
+    }
+    let model = make_compactor(policy);
+    let mut span: Vec<Message> = Vec::new();
+    let mut idx: u32 = 0;
+    for m in transcript.clone() {
+        if idx >= 1 && idx < 1 + items {
+            span.push(m);
+        }
+        idx += 1;
+    }
+    let prompt = render_span(span);
+    let mut slice: Vec<Message> = Vec::new();
+    slice.push(Message::system(String::from(
+        "You are the condensation backend of a harness session. Summarize the conversation span below into one compact message that preserves every fact the agent still needs (task, decisions, file states, results). Output the summary text only.",
+    )));
+    slice.push(Message::user(prompt));
+    let summary = model.act(slice).await.unwrap_or(String::from("(compaction summary unavailable)"));
+    let mut out: Vec<Message> = Vec::new();
+    out.push(transcript[0].clone());
+    out.push(Message::user(format!("[compacted] {}", summary)));
+    let mut idx2: u32 = 0;
+    for m in transcript {
+        if idx2 >= 1 + items {
+            out.push(m);
+        }
+        idx2 += 1;
+    }
+    let after = transcript_chars(out.clone());
+    CompactOutcome {
+        transcript: out,
+        events: vec![SessionEvent::Compacted { items, chars_before: 0, chars_after: after, by: String::from("summary") }],
+        notice: String::from(""),
+        pruned: false,
+        compacted: true,
+        items,
+        chars_before: 0,
+        chars_after: after,
+    }
+}
+
+/// pruner：超预算工具结果 → 有界头 + 中段剪除标记 + 有界尾
+/// （原版语义：完整原件留在会话日志——HSL 侧以 events 携带剪前统计）。
+fn prune_tool_results(transcript: Vec<Message>) -> (Vec<Message>, Vec<SessionEvent>, u32) {
+    let mut out: Vec<Message> = Vec::new();
+    let mut events: Vec<SessionEvent> = Vec::new();
+    let mut count: u32 = 0;
+    for m in transcript {
+        if m.role == String::from("tool") && m.content.len() > MAX_TOOL_RESULT_CHARS {
+            count += 1;
+            let content = m.content.clone();
+            let head = content.take(PRUNE_HEAD);
+            let tail = if content.len() > PRUNE_TAIL { content.chars().skip((content.len() - PRUNE_TAIL) as usize).collect::<String>() } else { content };
+            let omitted = content.len() - head.len() - tail.len();
+            let mut body = head.trim_end();
+            body.push_str("\n...[middle pruned ");
+            body.push_str(omitted.to_string().as_str());
+            body.push_str(" chars]...\n");
+            body.push_str(tail.trim_start().as_str());
+            out.push(Message { role: m.role, content: body });
+            events.push(SessionEvent::ToolResultsPruned { count: 1, chars_before: content.len(), chars_after: body.len() });
+        } else {
+            out.push(m);
+        }
+    }
+    // 工具链 bug#3 规避：块语句后不以 `(` 开头收尾，经 let 中转
+    let triple = (out, events, count);
+    triple
+}
+
+/// 压缩器模型装配（scripted：compact 轨道；真实：LLM）。
+fn make_compactor(policy: Policy) -> Box<dyn ModelProvider> {
+    if policy.model == String::from("deepseek") {
+        DeepSeekModel::new(String::from("glm-4.5"), 0.1)
+    } else {
+        ScriptedModel::new(String::from("fixture"), String::from("compact"))
+    }
+}
+
+/// 老 span 渲染（喂给摘要模型）。
+fn render_span(span: Vec<Message>) -> String {
+    let mut out = String::from("");
+    for m in span {
+        out.push_str("--- ");
+        out.push_str(m.role.as_str());
+        out.push_str(" ---\n");
+        out.push_str(m.content.as_str());
+        out.push_str("\n");
+    }
+    out
+}
+
+/// 转录字符量。
+fn transcript_chars(transcript: Vec<Message>) -> u32 {
+    let mut total: u32 = 0;
+    for m in transcript {
+        total += m.content.len();
+    }
+    total
+}
+
+/// 节省 token 估算（chars/4 口径，负数截零）。
+fn saved_tokens(before: u32, after: u32) -> u64 {
+    if before > after {
+        ((before - after) / 4) as u64
+    } else {
+        0
+    }
+}
+
+/// 无变化结果。
+fn unchanged(transcript: Vec<Message>) -> CompactOutcome {
+    CompactOutcome {
+        transcript,
+        events: Vec::new(),
+        notice: String::from(""),
+        pruned: false,
+        compacted: false,
+        items: 0,
+        chars_before: 0,
+        chars_after: 0,
+    }
+}

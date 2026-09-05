@@ -42,6 +42,11 @@ impl SessionLog {
         self.events.map(|e| e.render())
     }
 
+    /// (事件名, 渲染行) 对序列（事件总线投递 / events.jsonl 出口用）。
+    fn replay_pairs(self) -> Vec<(String, String)> {
+        self.events.map(|e| (e.name(), e.render()))
+    }
+
     /// 尾部 N 条（调试窗口）。
     fn tail(self, n: u32) -> Vec<String> {
         let total = self.events.len();

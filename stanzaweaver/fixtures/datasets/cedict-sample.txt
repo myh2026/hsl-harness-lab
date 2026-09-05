@@ -1,0 +1,21 @@
+# CC-CEDICT sample (bundled subset for offline HSL replay; full set is network-downloaded upstream)
+江 江 [jiang1] /river/
+江天 江天 [jiang1 tian1] /river and sky/
+天 天 [tian1] /sky; day; heaven/
+天寒 天寒 [tian1 han2] /cold weather/
+寒 寒 [han2] /cold/
+寒烟 寒烟 [han2 yan1] /cold mist/
+月 月 [yue4] /moon; month/
+月江 月江 [yue4 jiang1] /moonlit river/
+烟 烟 [yan1] /smoke; mist/
+烟江 烟江 [yan1 jiang1] /misty river/
+夜 夜 [ye4] /night/
+夜雪 夜雪 [ye4 xue3] /night snow/
+雪 雪 [xue3] /snow/
+静 静 [jing4] /quiet; still/
+寒月 寒月 [han2 yue4] /cold moon/
+静夜 静夜 [jing4 ye4] /still night/
+寒楼 寒楼 [han2 lou2] /cold tower/
+守楼 守楼 [shou3 lou2] /keep watch at the tower/
+楼 楼 [lou2] /tower; building/
+寒江 寒江 [han2 jiang1] /cold river/

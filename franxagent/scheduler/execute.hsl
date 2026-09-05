@@ -1,0 +1,117 @@
+// ============================================================================
+// franxagent/scheduler/execute.hsl — execute_task（任务执行事件序列）
+// ============================================================================
+// FranxAgent 原架构对应：scheduler.py 的 execute_task(task_id, content,
+// cancel_event)：
+//   1. broadcast task_start {task_id, content, message}；
+//   2. tasks_agent 未初始化 → task_error "Agent not initialized"；
+//   3. 逐 chunk 消费 agent 输出：cancel_event 已置 → task_cancel 并返回；
+//      否则 task_chunk；流结束 → task_done {result = join(chunks)}；
+//   4. 异常 → task_error {error}；
+//   5. finally：active_tasks 摘除（由调用方在事件序列消费后执行）。
+// HSL 侧：纯函数——代理会话的结果以 AgentOutcome 注入，返回应多播的
+// 事件序列（kind + data JSON），由主图逐帧 broadcast。
+// cancel_at：-1 = 不取消；0 = 开始前取消（等价 cancel_event 预置）；
+// k > 0 = 发出 k 个 chunk 后取消（流中途取消）。
+// ============================================================================
+
+import { ScheduledTask } from "./tick.hsl";
+import { json_esc } from "./events.hsl";
+
+/// 代理会话结果（tasks_agent.input(...) 的化身）。
+#[derive(Debug, Clone)]
+export enum AgentOutcome {
+    /// state.tasks_agent is None → task_error "Agent not initialized"。
+    Unavailable,
+    /// 成功：输出分块（流式 chunk 的化身）。
+    Ok { chunks: Vec<String> },
+    /// 会话异常 → task_error {error}。
+    Failed { error: String },
+}
+
+/// 一帧调度事件（task_start / task_chunk / task_done / task_error /
+/// task_cancel；data 为已拼装的 JSON 字符串）。
+#[derive(Debug, Clone)]
+export struct TaskEvent {
+    kind: String,
+    data: String,
+}
+
+/// execute_task：产出事件序列（不发射；发射由主图 broadcast）。
+export fn execute_task(task: ScheduledTask, outcome: AgentOutcome, cancel_at: i64) -> Vec<TaskEvent> {
+    let mut events: Vec<TaskEvent> = Vec::new();
+    // 1) task_start（原版 message: ⏰ Executing scheduled task: {content}）
+    events.push(TaskEvent {
+        kind: String::from("task_start"),
+        data: format!(
+            "{{\"task_id\": \"{}\", \"content\": \"{}\", \"message\": \"⏰ Executing scheduled task: {}\"}}",
+            task.id, json_esc(task.content.clone()), json_esc(task.content.clone())
+        ),
+    });
+    // 2) 代理不可用 → task_error（原版 Agent not initialized 分支）
+    match outcome.clone() {
+        AgentOutcome::Unavailable => {
+            events.push(TaskEvent {
+                kind: String::from("task_error"),
+                data: format!(
+                    "{{\"task_id\": \"{}\", \"error\": \"Agent not initialized\"}}",
+                    task.id
+                ),
+            });
+        },
+        AgentOutcome::Failed { error } => {
+            // 4) 会话异常 → task_error {error}
+            events.push(TaskEvent {
+                kind: String::from("task_error"),
+                data: format!(
+                    "{{\"task_id\": \"{}\", \"error\": \"{}\"}}",
+                    task.id, json_esc(error.clone())
+                ),
+            });
+        },
+        AgentOutcome::Ok { chunks } => {
+            // 3) 逐 chunk：先查取消再消费（原版 for chunk in input 语义）
+            if cancel_at == 0 {
+                events.push(TaskEvent {
+                    kind: String::from("task_cancel"),
+                    data: format!("{{\"task_id\": \"{}\"}}", task.id),
+                });
+            } else {
+                let mut cancelled = false;
+                let mut consumed: Vec<String> = Vec::new();
+                for pair in chunks.enumerate() {
+                    let i = pair[0];
+                    let chunk = pair[1];
+                    if cancel_at > 0 && cancel_at == i {
+                        // 流中途取消：此前已消费 k = i 个 chunk
+                        events.push(TaskEvent {
+                            kind: String::from("task_cancel"),
+                            data: format!("{{\"task_id\": \"{}\"}}", task.id),
+                        });
+                        cancelled = true;
+                        break;
+                    }
+                    consumed.push(chunk.clone());
+                    events.push(TaskEvent {
+                        kind: String::from("task_chunk"),
+                        data: format!(
+                            "{{\"task_id\": \"{}\", \"chunk\": \"{}\"}}",
+                            task.id, json_esc(chunk.clone())
+                        ),
+                    });
+                }
+                if cancelled == false {
+                    // 全部 chunk 消费完 → task_done {result}
+                    events.push(TaskEvent {
+                        kind: String::from("task_done"),
+                        data: format!(
+                            "{{\"task_id\": \"{}\", \"result\": \"{}\"}}",
+                            task.id, json_esc(consumed.join(String::from("\n")))
+                        ),
+                    });
+                }
+            }
+        },
+    }
+    events
+}

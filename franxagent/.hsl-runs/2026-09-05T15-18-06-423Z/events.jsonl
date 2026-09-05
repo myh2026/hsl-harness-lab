@@ -1,0 +1,2 @@
+{"seq":0,"ts":"2026-09-05T15:18:06.455Z","name":"run_start","data":{"entry":"/tmp/boot-test.hsl","model":"scripted","task":"","scale":"microkernel"}}
+{"seq":1,"ts":"2026-09-05T15:18:06.464Z","name":"run_panic","data":{"message":"不可调用的值：unit"}}

@@ -2,36 +2,79 @@
 // franxagent/memory/persist.hsl — 消息持久化层（完整性守卫）
 // ============================================================================
 // FranxAgent 原架构对应：agent.py 的 _clean_orphan_tool_messages——
-// 双向匹配清理：孤儿 tool 消息（无配对 assistant 工具回合）剔除。
-// HSL 侧：扁平四角色流上等价实现——tool 消息必须向前追溯到最近的
-// assistant 消息；追溯不到即孤儿（剔除）。纯函数，加载即修复。
+// 双向匹配清理：
+// 1. 收集全部 assistant 工具回合的 tool_call id（我们的化身：assistant
+//    消息 pair 字段的分号 id 集）；
+// 2. 收集全部 tool 消息的 tool_call_id（pair 字段）；
+// 3. 有效 id = 两个集合的交集；
+// 4. assistant 工具回合只保留交集内的 id（全部失配 → 剥离 pair 但保留
+//    正文）；tool 消息仅在 id ∈ 交集时保留（无 tool_call_id 的 tool
+//    消息按原版语义弃置）；其余角色原样保留。
+// 纯函数，加载即修复（append-only 精神：只剔损坏，不改内容）。
 // ============================================================================
 
 import { Message } from "../types/messages.hsl";
 
-/// 孤儿 tool 消息清理（messages.json 完整性守卫）。
-///
-/// 语义：逐条扫描，tool 角色消息若在其之前的最近 user 边界内
-/// 找不到任何 assistant 消息（即无发起方），视为孤儿剔除。
-/// 其余消息原样保留（append-only 精神：只剔损坏，不改内容）。
+/// 孤儿 tool 消息清理（messages.json 完整性守卫；双向配对）。
 export fn clean_orphans(history: Vec<Message>) -> Vec<Message> {
-    let mut out: Vec<Message> = Vec::new();
-    let mut seen_assistant_since_user: bool = false;
-    for m in history {
-        let keep = if m.role == String::from("tool") {
-            seen_assistant_since_user
-        } else {
-            true
-        };
-        if m.role == String::from("user") {
-            seen_assistant_since_user = false;
-        } else {
-            if m.role == String::from("assistant") {
-                seen_assistant_since_user = true;
+    // 1) assistant 侧发起的 call id 全集
+    let mut call_ids: Vec<String> = Vec::new();
+    for m in history.clone() {
+        if m.role == String::from("assistant") {
+            for id in m.clone().pair_ids() {
+                if call_ids.contains(id.clone()) == false {
+                    call_ids.push(id);
+                }
             }
         }
-        if keep {
-            out.push(m);
+    }
+    // 2) tool 侧应答的 call id 全集
+    let mut result_ids: Vec<String> = Vec::new();
+    for m in history.clone() {
+        if m.role == String::from("tool") && m.pair.len() > 0 {
+            if result_ids.contains(m.pair.clone()) == false {
+                result_ids.push(m.pair.clone());
+            }
+        }
+    }
+    // 3) 有效 id = 交集（双向配对）
+    let valid = intersect(call_ids, result_ids);
+    // 4) 逐条裁决
+    let mut out: Vec<Message> = Vec::new();
+    for m in history {
+        if m.role == String::from("assistant") && m.pair.len() > 0 {
+            // 只保留配对成功的 tool_calls；全部失配 → 剥离但保留正文
+            let mut kept: Vec<String> = Vec::new();
+            for id in m.clone().pair_ids() {
+                if valid.contains(id.clone()) {
+                    kept.push(id);
+                }
+            }
+            if kept.len() > 0 {
+                out.push(m.clone().with_pair(kept.join(String::from(";"))));
+            } else {
+                out.push(m.clone().with_pair(String::from("")));
+            }
+        } else {
+            if m.role == String::from("tool") {
+                // tool 消息：id（若有）必须在交集中，否则孤儿弃置
+                if m.pair.len() > 0 && valid.contains(m.pair.clone()) {
+                    out.push(m);
+                }
+            } else {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// 两个 id 表的交集（保持左侧出现序）。
+fn intersect(a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for x in a {
+        if b.contains(x.clone()) && out.contains(x.clone()) == false {
+            out.push(x);
         }
     }
     out

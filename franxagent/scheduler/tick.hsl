@@ -1,0 +1,158 @@
+// ============================================================================
+// franxagent/scheduler/tick.hsl — 定时任务轮询（run_tasks 的纯函数化身）
+// ============================================================================
+// FranxAgent 原架构对应：scheduler.py 的 run_tasks() 无限轮询（10s 周期）：
+//   - 读 tasks.json（"HH:MM" → content）；
+//   - 当前时刻 == 任务时刻 且 未在今日触发过（_executed 去重）→ 触发；
+//   - 跨天（today != _last_date）→ 清空 _executed（每日去重）；
+//   - 触发时登记 active_tasks[task_id] = cancel_event（uuid4 任务号）。
+// HSL 侧：纯函数 run_tasks_once(now_hhmm, today, state) → (新状态, 应触发
+// 任务列表)；真实时钟线程（while True + sleep 10）属 web 适配层——
+// 主图以剧本 clock 轨道驱动逐 tick 调用（时序语义等价）。
+// task_id 用 std/random uuid_v4（种子固定 → 剧本确定性）。
+// ============================================================================
+
+import { uuid_v4 } from "std/random";
+import { KnowledgeStats } from "../types/state.hsl";
+
+/// 调度相位汇总（观测出口）。
+#[derive(Debug, Clone)]
+export struct SchedulerSummary {
+    /// 消费的 clock tick 帧数。
+    ticks: u32,
+    /// 触发的任务总数。
+    triggered: u32,
+    /// 完整跑完（task_done）。
+    completed: u32,
+    /// 被取消（task_cancel）。
+    cancelled: u32,
+    /// 代理会话失败（task_error）。
+    errored: u32,
+    /// 同分钟重复轮询去重跳过数。
+    dedup_skipped: u32,
+    /// 相位结束时 active_tasks 是否清空（finally 语义验证）。
+    active_clear: bool,
+    /// 定时任务会话的知识库增量聚合。
+    knowledge: KnowledgeStats,
+}
+
+impl SchedulerSummary {
+    fn zero() -> SchedulerSummary {
+        SchedulerSummary {
+            ticks: 0,
+            triggered: 0,
+            completed: 0,
+            cancelled: 0,
+            errored: 0,
+            dedup_skipped: 0,
+            active_clear: true,
+            knowledge: KnowledgeStats::zero(),
+        }
+    }
+}
+
+/// 调度器状态（_executed / _last_date / active_tasks 的化身）。
+#[derive(Debug, Clone)]
+export struct SchedulerState {
+    /// 上次 tick 的日期（YYYY-MM-DD；跨天清空 executed）。
+    today: String,
+    /// 今日已触发过的时刻（HH:MM 去重集）。
+    executed: Vec<String>,
+    /// active_tasks 登记（task_id 集；cancel_event 以 cancelled 名单化身）。
+    active: Vec<String>,
+    /// 已请求取消的 task_id（cancel_event.set() 的化身）。
+    cancelled: Vec<String>,
+    /// 观测计数。
+    triggered_total: u32,
+    dedup_skipped: u32,
+}
+
+impl SchedulerState {
+    fn new() -> SchedulerState {
+        SchedulerState {
+            today: String::from(""),
+            executed: Vec::new(),
+            active: Vec::new(),
+            cancelled: Vec::new(),
+            triggered_total: 0,
+            dedup_skipped: 0,
+        }
+    }
+}
+
+/// 应触发任务（run_tasks 轮询命中产物）。
+#[derive(Debug, Clone)]
+export struct ScheduledTask {
+    id: String,
+    time: String,
+    content: String,
+}
+
+/// run_tasks_once：一次轮询判定。
+/// tasks = [(HH:MM, content)]；now_hhmm = 当前 "HH:MM"；today = "YYYY-MM-DD"。
+/// 返回（更新后的状态, 本次应触发的任务）。
+export fn run_tasks_once(tasks: Vec<(String, String)>, now_hhmm: String, today: String, state: SchedulerState) -> (SchedulerState, Vec<ScheduledTask>) {
+    let mut next = state.clone();
+    // 跨天：清空 executed（每日去重）
+    if today != next.today {
+        next.executed = Vec::new();
+        next.today = today;
+    }
+    let mut out: Vec<ScheduledTask> = Vec::new();
+    for pair in tasks {
+        let time_str = pair.0;
+        let content = pair.1;
+        if time_str == now_hhmm {
+            if next.executed.contains(time_str.clone()) {
+                // 同一分钟重复轮询 → 去重跳过（不重复触发）
+                next.dedup_skipped += 1;
+            } else {
+                let task = ScheduledTask {
+                    id: uuid_v4(),
+                    time: time_str.clone(),
+                    content,
+                };
+                out.push(task);
+                next.executed.push(time_str);
+                next.triggered_total += 1;
+            }
+        }
+    }
+    (next, out)
+}
+
+/// active_tasks 登记（线程 spawn 前的注册语义）。
+export fn register_task(state: SchedulerState, task_id: String) -> SchedulerState {
+    let mut next = state.clone();
+    if next.active.contains(task_id.clone()) == false {
+        next.active.push(task_id);
+    }
+    next
+}
+
+/// cancel_task 路由（/cancel_task/<id>）：命中 → set cancel_event（化身：
+/// 记入 cancelled 名单），未命中 → false（404 语义）。
+export fn request_cancel(state: SchedulerState, task_id: String) -> (SchedulerState, bool) {
+    let mut next = state.clone();
+    if next.active.contains(task_id.clone()) {
+        if next.cancelled.contains(task_id.clone()) == false {
+            next.cancelled.push(task_id);
+        }
+        (next, true)
+    } else {
+        (next, false)
+    }
+}
+
+/// finally 块：任务结束（完成/取消/出错）后从 active_tasks 摘除。
+export fn finish_task(state: SchedulerState, task_id: String) -> SchedulerState {
+    let mut next = state.clone();
+    let mut kept: Vec<String> = Vec::new();
+    for id in next.active {
+        if id != task_id {
+            kept.push(id);
+        }
+    }
+    next.active = kept;
+    next
+}

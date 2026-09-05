@@ -1,0 +1,37 @@
+// ============================================================================
+// dsh/loop/feedback.hsl — command-feedback（用户反馈记录，不进模型历史）
+// ============================================================================
+// deepseek-harness 原架构对应：packages/feedback/command-feedback——
+// 「/feedback + 评语：立即记录、绝不启动模型工作，模型既看不到评语也
+// 不被打断；确认语点名会话与匿名用户，并按部署的遥测策略说明会话
+// 共享方式」。HSL 侧：评语入 RunState.feedback_remarks（运行结束落
+// feedback.log 工件）；确认语不进转录（adapter 渲染面）。
+// ============================================================================
+
+import { RunState } from "../types/state.hsl";
+import { SessionEvent } from "../types/events.hsl";
+
+/// 记录一条反馈：返回 (state, 事件, 确认文案)。确认文案不进转录。
+export fn record(mut state: RunState, remark: String) -> (RunState, Vec<SessionEvent>, String) {
+    if remark.trim().len() == 0 {
+        return (state, Vec::new(), String::from("Usage: /feedback <remark>. Nothing was recorded."));
+    }
+    let trimmed = remark.trim();
+    state.feedback_remarks.push(trimmed.clone());
+    (
+        state,
+        vec![SessionEvent::FeedbackRecorded { chars: trimmed.len() }],
+        String::from("Feedback recorded for session sess-001 (anonymous user). The remark is not shared with the model; it is written to feedback.log at run end."),
+    )
+}
+
+/// 反馈工件渲染（run 结束写 feedback.log）。
+export fn render_log(state: RunState) -> String {
+    let mut out = String::from("");
+    for r in state.feedback_remarks {
+        out.push_str("- ");
+        out.push_str(r.as_str());
+        out.push_str("\n");
+    }
+    out
+}
