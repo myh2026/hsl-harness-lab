@@ -1,0 +1,109 @@
+// ============================================================================
+// stanzaweaver/types/poem.hsl — 诗稿状态 / 模板 / 轮词汇（契约层）
+// ============================================================================
+// StanzaWeaver 原架构对应：pipeline.py 的 PipelineState（topic/template/
+// description/draft/refine_rounds/checker_pass）与 Message。
+// HSL 侧：PoemState 一等值 + MeterTemplate 结构 + Phase 轮词汇（edge guard）。
+// ============================================================================
+
+/// 格律模板（符号层的判定参数）。
+/// tone_pattern：逐字平仄模板（"平"/"仄" 串，按行给出）；
+/// rhyme_lines：须押韵的行号（0 起算）；
+/// template_kind 决定符号层的语言分支（zh/en）。
+#[derive(Debug, Clone)]
+export struct MeterTemplate {
+    key: String,
+    name: String,
+    lang: String,
+    line_count: u32,
+    chars_per_line: u32,
+    tone_pattern: Vec<String>,
+    rhyme_lines: Vec<u32>,
+    syllables_per_line: u32,
+}
+
+impl MeterTemplate {
+    /// 模板说明（提示词注入用）。
+    fn describe(self) -> String {
+        let mut out = format!("{}（{}）：{} 行 × {} 字", self.name, self.key, self.line_count, self.chars_per_line);
+        if self.lang == String::from("zh") {
+            out.push_str("；逐字平仄：");
+            for pattern in self.tone_pattern.clone() {
+                out.push_str(pattern.as_str());
+                out.push_str(" / ");
+            }
+            out.push_str("；押韵行：");
+            for line in self.rhyme_lines.clone() {
+                out.push_str(line.to_string().as_str());
+                out.push_str(" ");
+            }
+        } else {
+            out.push_str(format!("；每行 {} 音节", self.syllables_per_line).as_str());
+            out.push_str("；押韵行：");
+            for line in self.rhyme_lines.clone() {
+                out.push_str(line.to_string().as_str());
+                out.push_str(" ");
+            }
+        }
+        out
+    }
+}
+
+/// 一次生成会话的完整状态（可序列化、可续跑）。
+#[derive(Debug, Clone)]
+export struct PoemState {
+    topic: String,
+    template: MeterTemplate,
+    description: String,
+    draft: Vec<String>,
+    title: String,
+    refine_rounds: u32,
+    checker_pass: bool,
+    checker_suggestions: String,
+    current_step: u32,
+}
+
+impl PoemState {
+    fn new(topic: String, template: MeterTemplate) -> PoemState {
+        PoemState {
+            topic,
+            template,
+            description: String::from(""),
+            draft: Vec::new(),
+            title: String::from(""),
+            refine_rounds: 0,
+            checker_pass: false,
+            checker_suggestions: String::from(""),
+            current_step: 0,
+        }
+    }
+}
+
+/// 出口产物。
+#[derive(Debug, Clone)]
+export struct PoemResult {
+    topic: String,
+    template_key: String,
+    title: String,
+    poem: Vec<String>,
+    description: String,
+    refine_rounds: u32,
+    tool_calls: u32,
+    meter_valid: bool,
+    checker_pass: bool,
+    checker_suggestions: String,
+    ok: bool,
+}
+
+/// 流水线轮词汇（edge on Guard 用，G5）。
+#[derive(Debug, Clone)]
+export enum Phase {
+    DescriptionReady,
+    DraftReady,
+    ToolCalled,
+    LineChanged,
+    SubmitReady,
+    CheckRevise,
+    CheckPass,
+    BudgetExhausted,
+}

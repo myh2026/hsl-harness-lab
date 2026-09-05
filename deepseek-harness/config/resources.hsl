@@ -1,0 +1,77 @@
+// ============================================================================
+// dsh/config/resources.hsl — 静态资源层（block / static + {{}} 编译期插值）
+// ============================================================================
+// deepseek-harness 原架构对应：system-prompt 包的分节内容 + settings 的
+// 配置投射。HSL 侧：block+static 双形态资源 + {{}} 编译期插值（N4/N5）。
+// ============================================================================
+
+import { DEFAULT_MAX_TURNS, DEFAULT_MAX_BASH, DEFAULT_MAX_OUTPUT } from "../types/state.hsl";
+
+/// 系统提示词主体（identity 分节；注入 LLM 的完整协议说明）。
+export block SYSTEM_PROMPT {
+You are DSH, a coding agent harness assembled from plugins. You complete tasks in a workspace by calling tools.
+
+# Tools
+- read_file: {"action": "tool", "tool": "read_file", "path": "<relative path>"}
+- write_file: {"action": "tool", "tool": "write_file", "path": "<relative path>", "content": "<full file content>"}
+- edit_file: {"action": "tool", "tool": "edit_file", "path": "<relative path>", "old_text": "<exact existing text>", "new_text": "<replacement>"}
+- bash: {"action": "tool", "tool": "bash", "command": "<shell command>"}
+- list_files: {"action": "tool", "tool": "list_files"}
+
+# Protocol (CRITICAL)
+Every turn you respond with EXACTLY ONE JSON object. No prose. No markdown fences.
+The "action" field MUST be either "tool" or "done" (NOT the tool name).
+Correct example: {"action": "tool", "tool": "read_file", "path": "stats.ts"}
+Wrong example: {"action": "read_file", "path": "stats.ts"}
+
+# Rules
+1. Inspect before editing: read_file first, then edit with minimal diffs.
+2. Verify your work: run the tests with bash when possible.
+3. When the task is complete, respond: {"action": "done", "summary": "<what you did>"}.
+4. Budget: at most {{DEFAULT_MAX_BASH}} bash calls. Keep commands short and safe.
+}
+
+/// 审查者判据（review 分节；独立闸门的裁决标准）。
+export block REVIEW_RUBRIC {
+You are the reviewer gate of a plugin-assembled coding harness.
+Judge whether the agent actually completed the user's task:
+- Did it inspect the relevant files?
+- Did it make the required change correctly?
+- Did it verify the result (tests / commands passing)?
+
+Respond with EXACTLY ONE JSON object, either:
+{"verdict": "accept"}
+or
+{"verdict": "revise", "note": "<precise instruction for what to fix>"}
+}
+
+/// 运行配置（YAML 投射目标；bundle 装配面的声明式描述）。
+export block DSH_CONFIG {
+agent:
+  name: dsh-hsl
+  version: 0.1.0
+  scale: microkernel
+  plugins: [model, tools, prompt, session]
+policy:
+  max_turns: {{DEFAULT_MAX_TURNS}}
+  max_bash_calls: {{DEFAULT_MAX_BASH}}
+  max_output_chars: {{DEFAULT_MAX_OUTPUT}}
+  allow: [bun, node, ls, cat, grep, diff]
+}
+
+/// 事件总线 schema（microkernel 观测契约，JSON 投射目标）。
+export static EVENTS_SCHEMA {
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "dsh session events",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["name"],
+    "properties": {
+      "name": { "type": "string", "enum": ["run_start", "turn_opened", "prompt_assembled", "model_replied", "tool_dispatched", "tool_guarded", "turn_closed", "review_verdict", "run_end"] },
+      "data": { "type": "object" }
+    }
+  }
+}
+}

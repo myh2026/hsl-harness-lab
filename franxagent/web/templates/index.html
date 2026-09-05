@@ -1,0 +1,229 @@
+<!--
+Copyright (C) 2026 xhdlphzr
+This file is part of FranxAgent.
+FranxAgent is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or any later version.
+FranxAgent is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details.
+You should have received a copy of the GNU Affero General Public License along with FranxAgent.  If not, see <https://www.gnu.org/licenses/>.
+-->
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=yes"
+    />
+    <title>FranxAgent</title>
+    <!-- KaTeX online resources -->
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css"
+    />
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js"
+    ></script>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/contrib/auto-render.min.js"
+      onload="
+        if (!window.katexDisableDollar) {
+          renderMathInElement(document.body, {
+            delimiters: [
+              { left: '$$', right: '$$', display: true },
+              { left: '$', right: '$', display: false },
+            ],
+          });
+        } else {
+          renderMathInElement(document.body, {
+            delimiters: [{ left: '$$', right: '$$', display: true }],
+          });
+        }
+      "
+    ></script>
+    <!-- Markdown parser -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- highlight.js for code highlighting -->
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css"
+    />
+    <!-- CodeMirror 5 for code review panel -->
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css"
+    />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/clike/clike.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/rust/rust.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/go/go.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/css/css.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js"></script>
+    <!-- diff library for computing diffs in the code review panel -->
+    <script src="https://cdn.jsdelivr.net/npm/diff@5.2.0/dist/diff.min.js"></script>
+    <link rel="stylesheet" href="/static/css/index.css" />
+    <!-- Mermaid diagram rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script>
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: "default",
+        securityLevel: "loose",
+      });
+    </script>
+  </head>
+  <body>
+    <div class="app-container">
+      <!-- Sliding pages container -->
+      <div class="pages-wrapper">
+        <div class="pages-inner" id="pagesInner">
+          <!-- Chat page -->
+          <div id="chat-page" class="page">
+            <div class="page-header">
+              <h2 data-i18n="chat.header">🤖 FranxAgent</h2>
+            </div>
+            <div id="chat-messages" class="chat-messages"></div>
+            <div class="chat-input-area">
+              <textarea
+                id="message-input"
+                rows="2"
+                data-i18n-placeholder="chat.placeholder"
+                placeholder="Enter your command... Ctrl+Enter to send"
+              ></textarea>
+              <button id="send-btn" data-i18n="chat.send">Send</button>
+            </div>
+          </div>
+          <!-- Config page -->
+          <div id="config-page" class="page">
+            <div class="page-header">
+              <h2 data-i18n="config.header">⚙️ Configuration</h2>
+            </div>
+            <form id="config-form">
+              <label data-i18n="config.language">Language</label>
+              <select id="language">
+                <option value="en">English</option>
+                <option value="zh">中文</option>
+              </select>
+              <label data-i18n="config.api_key">API Key</label>
+              <input type="text" id="api_key" />
+              <label data-i18n="config.base_url">Base URL</label>
+              <input type="text" id="base_url" />
+              <label data-i18n="config.model">Model Name</label>
+              <input type="text" id="model" />
+              <label data-i18n="config.temperature">Temperature</label>
+              <input
+                type="number"
+                id="temperature"
+                step="0.1"
+                min="0"
+                max="2"
+                value="0.8"
+              />
+              <label data-i18n="config.thinking">Deep Thinking</label>
+              <input type="checkbox" id="thinking" />
+              <label data-i18n="config.knowledge_k"
+                >Knowledge Retrieval Count</label
+              >
+              <input
+                type="number"
+                id="knowledge_k"
+                step="1"
+                min="1"
+                max="10"
+                value="5"
+              />
+              <label data-i18n="config.settings">System Settings</label>
+              <textarea id="settings" rows="4"></textarea>
+              <hr />
+              <h3 data-i18n="config.ett_header">
+                📸 ETT (Multimodal) Tool Configuration
+              </h3>
+              <label data-i18n="config.ett_api_key">API Key (ett)</label>
+              <input
+                type="text"
+                id="ett_api_key"
+                data-i18n-placeholder="config.ett_api_key_placeholder"
+                placeholder="Leave empty to use top-level API key"
+              />
+              <label data-i18n="config.ett_model">Model Name (ett)</label>
+              <input type="text" id="ett_model" value="glm-4.6v-flash" />
+              <label data-i18n="config.ett_temperature"
+                >Temperature (ett)</label
+              >
+              <input
+                type="number"
+                id="ett_temperature"
+                step="0.1"
+                min="0"
+                max="1"
+                value="0.8"
+              />
+              <label data-i18n="config.ett_thinking">Deep Thinking (ett)</label>
+              <input type="checkbox" id="ett_thinking" />
+              <label data-i18n="config.ett_max_retries"
+                >Max Retries (ett)</label
+              >
+              <input
+                type="number"
+                id="ett_max_retries"
+                min="1"
+                max="30"
+                value="3"
+              />
+              <hr />
+              <h3 data-i18n="config.tasks_header">⏰ Scheduled Tasks</h3>
+              <div id="tasks-list"></div>
+              <button
+                type="button"
+                id="add-task"
+                class="btn-secondary"
+                data-i18n="config.add_task"
+              >
+                ➕ Add Task
+              </button>
+              <hr />
+              <h3 data-i18n="config.mcp_header">🌐 MCP Servers (stdio)</h3>
+              <div id="mcp-servers-list"></div>
+              <button
+                type="button"
+                id="add-mcp-server"
+                class="btn-secondary"
+                data-i18n="config.add_server"
+              >
+                ➕ Add Server
+              </button>
+              <button type="submit" data-i18n="config.save">
+                💾 Save Configuration
+              </button>
+            </form>
+            <div id="config-status"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom liquid glass dock -->
+      <div class="bottom-dock">
+        <button class="dock-item active" data-page="chat" data-i18n="nav.chat">
+          💬 Chat
+        </button>
+        <button class="dock-item" data-page="config" data-i18n="nav.config">
+          ⚙️ Config
+        </button>
+      </div>
+    </div>
+
+    <!-- highlight.js library (must load before chat.js) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <!-- Application scripts -->
+    <script src="/static/js/i18n.js"></script>
+    <script src="/static/js/auth.js"></script>
+    <script src="/static/js/chat.js"></script>
+    <script src="/static/js/config.js"></script>
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>

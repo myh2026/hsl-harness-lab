@@ -1,0 +1,45 @@
+{
+  "rows": [
+    {
+      "key": "dsh",
+      "name": "deepseek-harness",
+      "origFiles": 89,
+      "origLoc": 21842,
+      "hslFiles": 16,
+      "hslLoc": 1317,
+      "nativeTsLoc": 19,
+      "replicaLoc": 2261,
+      "origUiLoc": 0,
+      "rate": 0.9397033238714403
+    },
+    {
+      "key": "franx",
+      "name": "FranxAgent",
+      "origFiles": 29,
+      "origLoc": 5120,
+      "hslFiles": 14,
+      "hslLoc": 1403,
+      "nativeTsLoc": 0,
+      "replicaLoc": 0,
+      "origUiLoc": 3541,
+      "rate": 0.7259765625
+    },
+    {
+      "key": "stanza",
+      "name": "StanzaWeaver",
+      "origFiles": 35,
+      "origLoc": 6782,
+      "hslFiles": 9,
+      "hslLoc": 1212,
+      "nativeTsLoc": 0,
+      "replicaLoc": 0,
+      "origUiLoc": 2266,
+      "rate": 0.8212916543792391
+    }
+  ],
+  "total": {
+    "origLoc": 33744,
+    "hslLoc": 3932,
+    "rate": 0.8834755808440019
+  }
+}

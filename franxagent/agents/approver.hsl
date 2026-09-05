@@ -1,0 +1,71 @@
+// ============================================================================
+// franxagent/agents/approver.hsl — 审查闸门（Code Review Panel 的后端化身）
+// ============================================================================
+// FranxAgent 原架构对应：v5.0.0 Code Review Panel——write 提案滑入面板，
+// 用户查看 diff、可编辑、批准后落盘。HSL 侧：ApprovalGate 按策略裁决：
+// - scripted：剧本轨道（approvals）驱动（CI 确定性）；
+// - yolo：自动批准（信任模式）；
+// - readonly：一律拒绝（只读演示）。
+// 批准 → apply_proposal 落盘 + 结果回填模型；拒绝 → 提案作废并反馈。
+// ============================================================================
+
+import { ToolOutcome, Proposal } from "../types/messages.hsl";
+import { FranxConfig } from "../types/state.hsl";
+import { apply_proposal } from "../tools/fs.hsl";
+
+/// 裁决词汇。
+#[derive(Debug, Clone)]
+export enum Approval {
+    Approve { edited: String },
+    Reject { reason: String },
+}
+
+/// 审查闸门：裁决一次提案。
+export fn review_proposal(config: FranxConfig, proposal: Proposal) -> Approval {
+    let mode = config.approval.clone();
+    if mode == String::from("yolo") {
+        Approval::Approve { edited: proposal.after.clone() }
+    } else if mode == String::from("readonly") {
+        Approval::Reject { reason: String::from("readonly 模式：拒绝一切写盘") }
+    } else {
+        // scripted：剧本轨道驱动（"approve" / "reject:<reason>"）
+        let raw: String = native typescript {
+            return await $host.fixture.next("approvals");
+        };
+        if raw == String::from("approve") {
+            Approval::Approve { edited: proposal.after.clone() }
+        } else {
+            let reason = strip_prefix_or(raw, String::from("reject:"), String::from("审查未通过"));
+            Approval::Reject { reason }
+        }
+    }
+}
+
+/// 批准后的落盘（唯一写盘路径）。
+export fn settle(config: FranxConfig, proposal: Proposal, edited: String) -> ToolOutcome {
+    let final_proposal = Proposal {
+        path: proposal.path.clone(),
+        mode: proposal.mode.clone(),
+        before: proposal.before.clone(),
+        after: edited,
+    };
+    match apply_proposal(final_proposal) {
+        Ok(outcome) => outcome,
+        Err(message) => ToolOutcome {
+            call_id: String::from("apply"),
+            tool: String::from("write"),
+            ok: false,
+            output: format!("write failed: {}", message),
+            proposal: Option::None,
+        },
+    }
+}
+
+/// strip_prefix 的 Result 归一（拒绝原因解析）。
+fn strip_prefix_or(text: String, prefix: String, fallback: String) -> String {
+    let stripped = text.strip_prefix(prefix);
+    match stripped {
+        Option::Some(rest) => rest,
+        Option::None => fallback,
+    }
+}

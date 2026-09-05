@@ -1,0 +1,226 @@
+// ============================================================================
+// dsh/dsh.hsl — 入口：主编排 graph + main + 投射声明
+// ============================================================================
+// 复现 deepseek-harness 的 core spine（session / system-prompt / tools /
+// agent / agent-loop / everything-is-a-plugin）：
+//   model ──on Step::ToolRequested──> registry ──on Step::Observed──> model
+//   model ──on Step::ReviewRequested──> reviewer ──(Revise)──> model
+//   每轮事实 append 进 session log（模型可见事实全量落日志）
+//
+// 文法覆盖：GraphDef（mut 参数 + 返回类型）/ node 声明带初始化与 ? /
+//           条件边环（G3 环上全部带 guard）/ AgentLoop（G1）+
+//           match 穷尽（S6）/ macro_rules! bump / GraphName::run 调用约定 /
+//           project + rules 规则组（BNF v1.5）+ scale
+// ============================================================================
+
+import { Message, ToolResult, Action, Verdict, Step } from "./types/messages.hsl";
+import { Policy, RunState, RunStats, RunReport } from "./types/state.hsl";
+import { DshError } from "./types/errors.hsl";
+import { SessionEvent } from "./types/events.hsl";
+import { Harness, PluginHost, make_reviewer } from "./core/plugin.hsl";
+import { SessionLog } from "./core/session.hsl";
+import { DeepSeekModel, ModelProvider } from "./providers/model.hsl";
+import { parse_action } from "./agents/executor.hsl";
+import { review } from "./agents/reviewer.hsl";
+import { DSH_CONFIG, EVENTS_SCHEMA } from "./config/resources.hsl";
+
+macro_rules! bump {
+    ($field:expr, $by:expr) => { $field += $by; };
+}
+
+/// 主编排 graph：插件装配 → agent loop → 审查闸门 → 报告。
+///
+/// 拓扑（node 为物理依赖，edge 为带守卫的消息通道）：
+///   model ──ToolRequested──> registry（守卫执行管线）
+///   registry ──Observed──> model（观察回填）
+///   model ──ReviewRequested──> reviewer（done 后裁决）
+///   reviewer ──(Revise)──> model（打回回环；Accept 出环）
+graph Dsh(mut state: RunState) -> Result<RunReport, DshError> {
+    // 装配：everything-is-a-plugin → Harness 四件 spine
+    let harness: Harness = PluginHost::base().assemble(state.policy.clone())?;
+    node model: Box<dyn ModelProvider> = harness.provider.clone();
+    node registry: Harness = harness.clone();
+    node mut log: SessionLog = harness.log.clone();
+    node reviewer: Box<dyn ModelProvider> = make_reviewer(state.policy.clone())?;
+    let mut transcript: Vec<Message> = state.transcript.clone();
+    let mut turns: u32 = 0;
+    let mut accepted: bool = false;
+
+    // 条件环（G3：环上每条边都带 on Guard，由词法打破死锁）
+    edge model -> registry on Step::ToolRequested;
+    edge registry -> model on Step::Observed;
+    edge model -> reviewer on Step::ReviewRequested;
+    edge model -> log on Step::TurnLogged;
+
+    // AgentLoop（G1）：claim prompt → open turn → assemble → model → dispatch → log
+    loop {
+        if turns >= state.policy.max_turns {
+            log = log.append(SessionEvent::BudgetExhausted { phase: String::from("turns") });
+            break;
+        }
+        log = log.append(SessionEvent::TurnOpened { turn: turns });
+        let raw = model.act(transcript.clone()).await?;
+        // 模型自己的回合必须入转录（否则模型看不到自己已做过什么 → 重复动作）
+        transcript.push(Message::assistant(raw.clone()));
+        log = log.append(SessionEvent::ModelReplied { turn: turns, chars: raw.len() });
+        // 协议纠错回路：解析失败把错误反馈给模型重试（预算内）
+        let action = match parse_action(raw) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("[dsh] 协议违规，反馈重试: {}", e.message);
+                transcript.push(Message::user(format!("你的上一条输出违反了协议：{}\n请重新输出恰好一个 JSON 对象（action/tool 字段按系统提示词的格式）。", e.message)));
+                bump!(turns, 1);
+                continue;
+            },
+        };
+        match action {
+            Action::Tool { call } => {
+                // bash 预算闸门（运行时策略，与注册表白名单守卫互补）
+                if let ToolCall::Bash { command: _ } = call {
+                    if state.stats.bash_calls >= state.policy.max_bash_calls {
+                        transcript.push(Message::tool(String::from("bash 预算已耗尽（max_bash_calls），请收敛调用或直接 done")));
+                        bump!(turns, 1);
+                        continue;
+                    }
+                    bump!(state.stats.bash_calls, 1);
+                }
+                let outcome = registry.registry.clone().guarded_run(call.clone(), turns);
+                let result: ToolResult = match outcome {
+                    Ok(r) => r,
+                    Err(g) => {
+                        // 守卫拒绝：作为事实落日志 + 反馈模型（不终止 harness）
+                        log = log.append(SessionEvent::ToolGuarded { turn: turns, tool: g.tool.clone(), reason: g.reason.clone() });
+                        bump!(state.stats.guarded, 1);
+                        ToolResult {
+                            call: format!("guard {}", g.tool),
+                            ok: false,
+                            output: format!("guard denied: {}", g.reason),
+                            duration_ms: 0,
+                        }
+                    },
+                };
+                transcript.push(result.clone().observation());
+                log = log.append(SessionEvent::ToolDispatched { turn: turns, tool: call.name(), ok: result.ok });
+                if result.ok == false {
+                    bump!(state.stats.failures, 1);
+                }
+                bump!(state.stats.tool_calls, 1);
+                bump!(state.stats.turns, 1);
+                bump!(turns, 1);
+                log = log.append(SessionEvent::TurnClosed { turn: turns });
+            },
+            Action::Done { summary } => {
+                println!("[dsh] model declared done: {}", summary);
+                state.transcript = transcript.clone();
+                let v = review(state.clone(), reviewer.clone()).await?;
+                let accepted_now = match v.clone() {
+                    Verdict::Accept => true,
+                    Verdict::Revise { note: _ } => false,
+                };
+                log = log.append(SessionEvent::ReviewVerdict {
+                    accepted: accepted_now,
+                    note: match v.clone() {
+                        Verdict::Revise { note } => note,
+                        Verdict::Accept => String::from(""),
+                    },
+                });
+                match v {
+                    Verdict::Accept => {
+                        accepted = true;
+                        break;
+                    },
+                    Verdict::Revise { note } => {
+                        println!("[dsh] reviewer 要求返工: {}", note);
+                        transcript.push(Message::user(format!("reviewer 要求返工：{}\n请继续完成任务。", note)));
+                        bump!(state.stats.turns, 1);
+                        bump!(turns, 1);
+                    },
+                }
+            },
+        }
+    }
+
+    state.transcript = transcript.clone();
+    log = log.append(SessionEvent::RunEnd { verdict: if accepted { String::from("accepted") } else { String::from("budget_exhausted") }, turns });
+    let events_logged = log.len();
+    Ok(build_report(state, transcript, turns, accepted, events_logged))
+}
+
+fn build_report(state: RunState, transcript: Vec<Message>, turns: u32, accepted: bool, events_logged: u32) -> RunReport {
+    let verdict = if accepted { String::from("accepted") } else { String::from("budget_exhausted") };
+    RunReport {
+        task: state.policy.task.clone(),
+        verdict,
+        turns,
+        tool_calls: state.stats.tool_calls,
+        bash_calls: state.stats.bash_calls,
+        failures: state.stats.failures,
+        guarded: state.stats.guarded,
+        transcript_lines: transcript.len(),
+        events_logged,
+        ok: accepted,
+        transcript,
+    }
+}
+
+export fn main() -> Result<(), DshError> {
+    let policy = Policy::from_config()?;
+    let mut opening: Vec<Message> = Vec::new();
+    opening.push(Message::system(policy.task.clone()));
+    opening.push(Message::user(format!("workspace: {}\ntask: {}", policy.workspace, policy.task)));
+    let state = RunState { policy: policy.clone(), transcript: opening, stats: RunStats::zero() };
+    let report = Dsh::run(state)?;
+    write_artifacts(report, policy)
+}
+
+fn write_artifacts(report: RunReport, policy: Policy) -> Result<(), DshError> {
+    let report_md = render_report(report.clone(), policy);
+    let transcript_jsonl: String = native typescript {
+        const lines = report.transcript.map((m) => JSON.stringify({ role: m.role, content: m.content }));
+        return lines.join("\n") + "\n";
+    };
+    native typescript {
+        $host.artifacts.write("report.md", report_md);
+        $host.artifacts.write("transcript.jsonl", transcript_jsonl);
+        return true;
+    };
+    println!("[dsh] artifacts written: report.md / transcript.jsonl");
+    Ok(())
+}
+
+fn render_report(report: RunReport, policy: Policy) -> String {
+    let mut out = String::from("# DSH Run Report\n\n");
+    out.push_str("## 任务\n\n");
+    out.push_str(policy.task.as_str());
+    out.push_str("\n\n## 结果\n\n");
+    out.push_str(format!("- verdict: {}\n", report.verdict).as_str());
+    out.push_str(format!("- completed: {}\n", report.ok).as_str());
+    out.push_str("\n## 预算消耗\n\n");
+    out.push_str(format!("- turns: {}\n", report.turns).as_str());
+    out.push_str(format!("- tool_calls: {}\n", report.tool_calls).as_str());
+    out.push_str(format!("- bash_calls: {}\n", report.bash_calls).as_str());
+    out.push_str(format!("- failures: {}\n", report.failures).as_str());
+    out.push_str(format!("- guarded: {}\n", report.guarded).as_str());
+    out.push_str(format!("- events_logged: {}\n", report.events_logged).as_str());
+    out.push_str(format!("- transcript_lines: {}\n", report.transcript_lines).as_str());
+    out
+}
+
+scale = microkernel;
+
+project {
+    Dsh            -> "src/dsh/main.py"           : python,
+    Harness        -> "src/dsh/plugin-host.ts"    : typescript,
+    DeepSeekModel  -> "src/dsh/model.ts"          : typescript,
+    DSH_CONFIG     -> "config/harness.yml"        : yaml,
+    EVENTS_SCHEMA  -> "config/events.schema.json" : json,
+
+    rules {                                        // BNF v1.5 规则组
+        struct -> "src/types/{name}.rs"  : rust,
+        enum   -> "src/types/{name}.rs"  : rust,
+        trait  -> "src/types/{name}.rs"  : rust,
+        fn     -> "src/logic/{name}.rs"  : rust,
+        const  -> "src/consts/{name}.rs" : rust,
+        block  -> "config/{name}.yml"    : yaml,
+    }
+}

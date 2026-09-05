@@ -1,0 +1,168 @@
+// ============================================================================
+// stanzaweaver/prosody/lexicon.hsl — 词汇库（search_words 的检索面）
+// ============================================================================
+// StanzaWeaver 原架构对应：knowledge/（SQLite 词汇库 + 向量重排，
+// 语料 CC-CEDICT / CMUdict 等）。HSL 侧：紧凑内置词汇表（带平仄/韵组/
+// 语义描述的汉字与词），search_words 按音节数/平仄/韵组过滤 + 语义
+// 三元组重叠排序——检索面的符号化简化，接口与原实现同构。
+// ============================================================================
+
+/// 词目：字/词 + 平仄 + 韵组 + 语义。
+#[derive(Debug, Clone)]
+export struct WordEntry {
+    word: String,
+    tone: String,   // "平" | "仄"
+    rhyme: String,  // 韵组（如 "an" "ing" "ou"）
+    meaning: String,
+}
+
+/// 词汇库。
+#[derive(Debug, Clone)]
+export struct Lexicon {
+    entries: Vec<WordEntry>,
+}
+
+impl Lexicon {
+    /// 内置种子词汇表（示例语料；工程上由 importer 从词典导入）。
+    fn new() -> Lexicon {
+        Lexicon { entries: seed_entries() }
+    }
+
+    /// search_words：按平仄 / 韵组过滤 + 语义排序，返回前 limit 条。
+    fn search(self, query: String, tone: String, rhyme: String, limit: u32) -> Vec<String> {
+        let query_tris = trigrams(query.clone());
+        let mut scored: Vec<(f64, String)> = Vec::new();
+        for entry in self.entries {
+            if tone.len() > 0 && entry.tone != tone {
+                continue;
+            }
+            if rhyme.len() > 0 && entry.rhyme != rhyme {
+                continue;
+            }
+            let entry_tris = trigrams(entry.meaning.clone());
+            let score = overlap(query_tris.clone(), entry_tris);
+            scored.push((score, format!("{}（{}声·{}韵）{}", entry.word, entry.tone, entry.rhyme, entry.meaning)));
+        }
+        let ranked = sort_desc_pairs(scored);
+        let mut out: Vec<String> = Vec::new();
+        let take_n = if limit < ranked.len() { limit } else { ranked.len() };
+        for pair in ranked.take(take_n) {
+            out.push(pair.1.clone());
+        }
+        out
+    }
+
+    /// 查单字平仄（validator 逐字判定用；查无此字 → "?"）。
+    fn tone_of(self, ch: String) -> String {
+        if ch.len() != 1 {
+            return String::from("?");
+        }
+        for entry in self.entries {
+            if entry.word == ch {
+                return entry.tone;
+            }
+        }
+        String::from("?")
+    }
+
+    /// 查单字韵组（押韵判定用；查无此字 → "?"）。
+    fn rhyme_of(self, ch: String) -> String {
+        if ch.len() != 1 {
+            return String::from("?");
+        }
+        for entry in self.entries {
+            if entry.word == ch {
+                return entry.rhyme;
+            }
+        }
+        String::from("?")
+    }
+
+    /// 库容。
+    fn len(self) -> u32 {
+        self.entries.len()
+    }
+}
+
+/// 降序排序（确定性：同分保持声明序）。
+fn sort_desc_pairs(items: Vec<(f64, String)>) -> Vec<(f64, String)> {
+    let mut pool = items.clone();
+    let mut out: Vec<(f64, String)> = Vec::new();
+    while pool.len() > 0 {
+        let mut best_idx: u32 = 0;
+        let mut best_score: f64 = -1.0;
+        for pair in pool.clone().enumerate() {
+            if pair[1].0 > best_score {
+                best_score = pair[1].0;
+                best_idx = pair[0];
+            }
+        }
+        let picked = pool.remove(best_idx);
+        out.push(picked);
+    }
+    out
+}
+
+/// 字符三元组。
+fn trigrams(text: String) -> Vec<String> {
+    let chars = text.chars();
+    let mut out: Vec<String> = Vec::new();
+    let n = chars.len();
+    let mut i: u32 = 0;
+    while i + 2 < n {
+        out.push(chars.skip(i).take(3).collect::<String>());
+        i += 1;
+    }
+    out
+}
+
+/// 三元组重叠率。
+fn overlap(a: Vec<String>, b: Vec<String>) -> f64 {
+    if a.len() == 0 || b.len() == 0 {
+        return 0.0;
+    }
+    let mut hits: u32 = 0;
+    for tri in a {
+        if b.contains(tri) {
+            hits += 1;
+        }
+    }
+    let total = a.len() + b.len();
+    (hits as f64) / (total as f64)
+}
+
+/// 种子词汇（平仄按普通话声调：阴平/阳平=平，上/去=仄）。
+fn seed_entries() -> Vec<WordEntry> {
+    vec![
+        WordEntry { word: String::from("山"), tone: String::from("平"), rhyme: String::from("an"), meaning: String::from("mountain 山川峰峦") },
+        WordEntry { word: String::from("川"), tone: String::from("平"), rhyme: String::from("uan"), meaning: String::from("river plain 山川河流") },
+        WordEntry { word: String::from("风"), tone: String::from("平"), rhyme: String::from("eng"), meaning: String::from("wind 微风清风") },
+        WordEntry { word: String::from("花"), tone: String::from("平"), rhyme: String::from("ua"), meaning: String::from("flower 花开春花") },
+        WordEntry { word: String::from("云"), tone: String::from("平"), rhyme: String::from("un"), meaning: String::from("cloud 白云云卷") },
+        WordEntry { word: String::from("天"), tone: String::from("平"), rhyme: String::from("ian"), meaning: String::from("sky 天空长天") },
+        WordEntry { word: String::from("江"), tone: String::from("平"), rhyme: String::from("iang"), meaning: String::from("river 大江江水") },
+        WordEntry { word: String::from("烟"), tone: String::from("平"), rhyme: String::from("ian"), meaning: String::from("mist smoke 烟雨炊烟") },
+        WordEntry { word: String::from("舟"), tone: String::from("平"), rhyme: String::from("ou"), meaning: String::from("boat 孤舟轻舟") },
+        WordEntry { word: String::from("秋"), tone: String::from("平"), rhyme: String::from("iu"), meaning: String::from("autumn 秋色深秋") },
+        WordEntry { word: String::from("愁"), tone: String::from("平"), rhyme: String::from("ou"), meaning: String::from("sorrow 离愁乡愁") },
+        WordEntry { word: String::from("楼"), tone: String::from("平"), rhyme: String::from("ou"), meaning: String::from("tower 高楼江楼") },
+        WordEntry { word: String::from("明"), tone: String::from("平"), rhyme: String::from("ing"), meaning: String::from("bright 月明光明") },
+        WordEntry { word: String::from("清"), tone: String::from("平"), rhyme: String::from("ing"), meaning: String::from("clear 清风清泉") },
+        WordEntry { word: String::from("月"), tone: String::from("仄"), rhyme: String::from("ue"), meaning: String::from("moon 明月月色") },
+        WordEntry { word: String::from("夜"), tone: String::from("仄"), rhyme: String::from("e"), meaning: String::from("night 夜色静夜") },
+        WordEntry { word: String::from("雪"), tone: String::from("仄"), rhyme: String::from("ue"), meaning: String::from("snow 飞雪白雪") },
+        WordEntry { word: String::from("落"), tone: String::from("仄"), rhyme: String::from("uo"), meaning: String::from("fall 花落叶落") },
+        WordEntry { word: String::from("日"), tone: String::from("仄"), rhyme: String::from("i"), meaning: String::from("sun 日落白日") },
+        WordEntry { word: String::from("远"), tone: String::from("仄"), rhyme: String::from("uan"), meaning: String::from("far 远山遥远") },
+        WordEntry { word: String::from("静"), tone: String::from("仄"), rhyme: String::from("ing"), meaning: String::from("quiet 静夜寂静") },
+        WordEntry { word: String::from("望"), tone: String::from("仄"), rhyme: String::from("ang"), meaning: String::from("gaze 远望登望") },
+        WordEntry { word: String::from("对"), tone: String::from("仄"), rhyme: String::from("ui"), meaning: String::from("face 相对对坐") },
+        WordEntry { word: String::from("独"), tone: String::from("平"), rhyme: String::from("u"), meaning: String::from("alone 独坐孤独") },
+        WordEntry { word: String::from("尽"), tone: String::from("仄"), rhyme: String::from("in"), meaning: String::from("end 江尽尽头") },
+        WordEntry { word: String::from("见"), tone: String::from("仄"), rhyme: String::from("ian"), meaning: String::from("see 望见看见") },
+        WordEntry { word: String::from("入"), tone: String::from("仄"), rhyme: String::from("u"), meaning: String::from("enter 入夜深入") },
+        WordEntry { word: String::from("出"), tone: String::from("平"), rhyme: String::from("u"), meaning: String::from("out 日出出发") },
+        WordEntry { word: String::from("白"), tone: String::from("平"), rhyme: String::from("ai"), meaning: String::from("white 白云苍白") },
+        WordEntry { word: String::from("寒"), tone: String::from("平"), rhyme: String::from("an"), meaning: String::from("cold 寒江清寒") },
+    ]
+}

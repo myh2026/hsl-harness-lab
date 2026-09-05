@@ -1,0 +1,283 @@
+// ============================================================================
+// stanzaweaver/stanzaweaver.hsl — 入口：四步流水线 graph + main + 投射
+// ============================================================================
+// 复现 StanzaWeaver 的神经-符号四步流水线：
+//   Step 1 描述生成（writer）→ Step 2 初稿（仅验行数/字数）→
+//   Step 3 炼句循环（ReAct 四工具：search_words / refine_line / rewrite /
+//   submit；改动即全量校验）→ Step 4 检查 AI 终审（不过 → 打回 Step 3）。
+//
+// 拓扑（node 为物理依赖，edge 为带守卫的消息通道）：
+//   writer ──DraftReady──> validator（初稿形状校验）
+//   writer ──ToolCall──> weaver（四工具执行）
+//   weaver ──LineChanged──> validator（改动即全量校验）
+//   writer ──SubmitReady──> checker（定稿终审）
+//   checker ──CheckRevise──> writer（打回回环；无轮数上限——预算外）
+// ============================================================================
+
+import { PoemState, PoemResult, Phase } from "./types/poem.hsl";
+import { PoetModel, LlmPoet, ScriptedPoet } from "./providers/poet.hsl";
+import { Lexicon } from "./prosody/lexicon.hsl";
+import { get_template } from "./prosody/templates.hsl";
+import { validate_draft_shape } from "./prosody/validator.hsl";
+import { WeaveKit, WeaveOutcome, parse_weave_call } from "./tools/weave.hsl";
+import { WRITER_GUIDE, CHECKER_GUIDE, WEAVER_CONFIG } from "./config/resources.hsl";
+
+export const MAX_REFINE_ROUNDS: u32 = 12;
+export const MAX_BACK_LOOPS: u32 = 4;
+
+/// 四步流水线 graph：神经-符号编排。
+graph Stanza(topic: String, template_key: String) -> Result<PoemResult, WeaverError> {
+    node writer: Box<dyn PoetModel> = make_poet(String::from("writer"))?;
+    node checker: Box<dyn PoetModel> = make_poet(String::from("checker"))?;
+    node validator: Lexicon = Lexicon::new();
+    node weaver: WeaveKit = WeaveKit::new(Lexicon::new());
+
+    // 条件环（G3：环上每条边都带 on Guard）
+    edge writer -> validator on Phase::DraftReady;
+    edge writer -> weaver on Phase::ToolCalled;
+    edge weaver -> validator on Phase::LineChanged;
+    edge writer -> checker on Phase::SubmitReady;
+    edge checker -> writer on Phase::CheckRevise;
+
+    let template = get_template(template_key)?;
+    let mut state = PoemState::new(topic.clone(), template.clone());
+    let mut tool_calls: u32 = 0;
+
+    // ── Step 1：描述生成（现代文创意大纲，后续步骤复用）──
+    state.current_step = 1;
+    let desc_prompt = format!("以现代文为主题 \"{}\" 写一段 2-3 句的诗歌创意描述（意象、情感、结构）。只输出描述本身。", topic);
+    let description = writer.clone().compose(desc_prompt).await?;
+    state.description = description;
+
+    // ── Step 2：初稿（仅验行数 / 字数）──
+    state.current_step = 2;
+    let draft_prompt = format!(
+        "主题描述：{}\n格律模板：{}\n写出初稿（{} 行，每行 {} 字）。只输出诗行，每行一行。",
+        state.description, template.clone().describe(), template.line_count, template.chars_per_line
+    );
+    let draft_raw = writer.clone().compose(draft_prompt).await?;
+    let draft = split_lines(draft_raw);
+    let shape = validate_draft_shape(template.clone(), draft.clone());
+    if shape.valid == false {
+        let mut detail = String::from("初稿形状不合格：\n");
+        for v in shape.violations {
+            detail.push_str(format!("- {}\n", v).as_str());
+        }
+        return Err(WeaverError::new(String::from("draft"), detail));
+    }
+    state.draft = draft;
+
+    // ── Step 3 + Step 4：炼句循环 + 终审打回（无上限的预算化近似）──
+    let mut meter_valid: bool = false;
+    let mut back_loops: u32 = 0;
+    loop {
+        // Step 3：ReAct 炼句循环（submit 被符号层受理才出环）
+        state.current_step = 3;
+        let submitted = run_refine_loop(state.clone(), writer.clone(), weaver.clone())?;
+        tool_calls += submitted.1;
+        state.draft = submitted.2.draft.clone();
+        state.title = submitted.2.title.clone();
+        state.refine_rounds = submitted.0;
+        meter_valid = true;
+
+        // Step 4：检查 AI 终审（pass → 出环；fail → 打回 Step 3）
+        state.current_step = 4;
+        let poem_text = render_poem(state.draft.clone());
+        let check_prompt = format!(
+            "{}\n\n主题：{}\n描述：{}\n\n诗稿：\n{}\n\n请终审。",
+            CHECKER_GUIDE, topic, state.description, poem_text
+        );
+        let verdict_raw = checker.clone().compose(check_prompt).await?;
+        let verdict = parse_checker_verdict(verdict_raw)?;
+        if verdict.0 {
+            state.checker_pass = true;
+            break;
+        } else {
+            state.checker_suggestions = verdict.1.clone();
+            back_loops += 1;
+            if back_loops >= MAX_BACK_LOOPS {
+                break;
+            }
+            // 打回：把建议带回炼句循环（writer 上下文注入）
+            let revise_prompt = format!(
+                "终审建议：{}\n请按建议调用 refine_line 继续炼句，然后 submit。",
+                verdict.1
+            );
+            let _ = writer.clone().compose(revise_prompt).await?;
+            state.refine_rounds += 1;
+        }
+    }
+
+    Ok(build_result(state, tool_calls, meter_valid))
+}
+
+/// Step 3 炼句循环（内层）：ReAct 工具循环直到 submit 被受理。
+/// 返回 (rounds, tool_calls, 最终 outcome)。
+fn run_refine_loop(mut state: PoemState, writer: Box<dyn PoetModel>, weaver: WeaveKit) -> Result<(u32, u32, WeaveOutcome), WeaverError> {
+    let mut rounds: u32 = 0;
+    let mut tool_calls: u32 = 0;
+    let mut last: WeaveOutcome = WeaveOutcome {
+        tool: String::from("init"),
+        ok: true,
+        output: String::from(""),
+        draft: state.draft.clone(),
+        submitted: false,
+        title: String::from(""),
+    };
+    loop {
+        if rounds >= MAX_REFINE_ROUNDS {
+            return Err(WeaverError::new(String::from("budget"), format!("炼句轮数超过 {}（预算化近似——原版无上限）", MAX_REFINE_ROUNDS)));
+        }
+        // writer 上下文：指南 + 模板 + 当前稿 + 上次工具结果
+        let poem_text = render_poem(state.draft.clone());
+        let ctx = format!(
+            "{}\n\n模板：{}\n\n当前诗稿：\n{}\n\n上次工具结果：{}\n\n输出下一个工具调用 JSON。",
+            WRITER_GUIDE, state.template.clone().describe(), poem_text, last.render()
+        );
+        let raw = writer.clone().compose(ctx).await?;
+        let call = parse_weave_call(raw)?;
+        tool_calls += 1;
+        let outcome = weaver.clone().execute(state.clone(), call);
+        state.draft = outcome.draft.clone();
+        let done = outcome.submitted;
+        last = outcome;
+        rounds += 1;
+        if done {
+            return Ok((rounds, tool_calls, last));
+        }
+    }
+}
+
+/// checker 终审解析：{"pass": true} / {"pass": false, "suggestions": "..."}。
+fn parse_checker_verdict(raw: String) -> Result<(bool, String), WeaverError> {
+    let fields: HashMap<String, String> = native typescript {
+        try {
+            return $host.json.fields(raw);
+        } catch (e) {
+            const m = new Map();
+            m.set("error", String(e && e.message || e));
+            return m;
+        }
+    };
+    if fields.contains_key("error") {
+        let detail = fields.get("error").unwrap_or(String::from("?"));
+        return Err(WeaverError::new(String::from("check"), format!("终审输出不是合法 JSON：{}", detail)));
+    }
+    let pass = fields.get("pass").unwrap_or(String::from("false"));
+    if pass == String::from("true") {
+        Ok((true, String::from("")))
+    } else {
+        Ok((false, fields.get("suggestions").unwrap_or(String::from(""))))
+    }
+}
+
+/// 模型装配（writer / checker 双轨道）。
+fn make_poet(track: String) -> Result<Box<dyn PoetModel>, WeaverError> {
+    let model: String = native typescript {
+        return String($host.config.model);
+    };
+    if model == String::from("scripted") {
+        Ok(ScriptedPoet::new(track))
+    } else {
+        if track == String::from("checker") {
+            Ok(LlmPoet::new(0.2))
+        } else {
+            Ok(LlmPoet::new(0.8))
+        }
+    }
+}
+
+fn split_lines(raw: String) -> Vec<String> {
+    let lines = raw.lines();
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.len() > 0 {
+            out.push(trimmed);
+        }
+    }
+    out
+}
+
+fn render_poem(lines: Vec<String>) -> String {
+    lines.join("\n")
+}
+
+fn build_result(state: PoemState, tool_calls: u32, meter_valid: bool) -> PoemResult {
+    PoemResult {
+        topic: state.topic.clone(),
+        template_key: state.template.key.clone(),
+        title: state.title.clone(),
+        poem: state.draft.clone(),
+        description: state.description.clone(),
+        refine_rounds: state.refine_rounds,
+        tool_calls,
+        meter_valid,
+        checker_pass: state.checker_pass,
+        checker_suggestions: state.checker_suggestions.clone(),
+        ok: state.checker_pass,
+    }
+}
+
+export fn main() -> Result<(), WeaverError> {
+    let topic: String = native typescript {
+        const t = String($host.config.task);
+        return t === "" ? "秋江夜泊" : t;
+    };
+    let template_key: String = native typescript {
+        return "zh-wujue";
+    };
+    let result = Stanza::run(topic, template_key)?;
+    write_artifacts(result)
+}
+
+fn write_artifacts(result: PoemResult) -> Result<(), WeaverError> {
+    let report_md = render_report(result.clone());
+    native typescript {
+        $host.artifacts.write("report.md", report_md);
+        return true;
+    };
+    println!("[stanzaweaver] artifacts written: report.md");
+    Ok(())
+}
+
+fn render_report(result: PoemResult) -> String {
+    let mut out = String::from("# StanzaWeaver Result\n\n");
+    out.push_str("## 主题\n\n");
+    out.push_str(result.topic.as_str());
+    out.push_str("\n\n## 创意描述\n\n");
+    out.push_str(result.description.as_str());
+    out.push_str("\n\n## 诗稿\n\n");
+    if result.title.len() > 0 {
+        out.push_str(format!("《{}》\n", result.title).as_str());
+    }
+    for line in result.poem.clone() {
+        out.push_str(line.as_str());
+        out.push_str("\n");
+    }
+    out.push_str("\n## 流水线统计\n\n");
+    out.push_str(format!("- template: {}\n", result.template_key).as_str());
+    out.push_str(format!("- refine_rounds: {}\n", result.refine_rounds).as_str());
+    out.push_str(format!("- tool_calls: {}\n", result.tool_calls).as_str());
+    out.push_str(format!("- meter_valid: {}\n", result.meter_valid).as_str());
+    out.push_str(format!("- checker_pass: {}\n", result.checker_pass).as_str());
+    out.push_str(format!("- checker_suggestions: {}\n", result.checker_suggestions).as_str());
+    out
+}
+
+scale = microkernel;
+
+project {
+    Stanza     -> "src/stanzaweaver/pipeline.py" : python,
+    LlmPoet    -> "src/stanzaweaver/poet.ts"     : typescript,
+    WEAVER_CONFIG -> "config/weaver.yml"         : yaml,
+
+    rules {
+        struct -> "src/types/{name}.rs"  : rust,
+        enum   -> "src/types/{name}.rs"  : rust,
+        trait  -> "src/types/{name}.rs"  : rust,
+        fn     -> "src/logic/{name}.rs"  : rust,
+        const  -> "src/consts/{name}.rs" : rust,
+        block  -> "config/{name}.yml"    : yaml,
+    }
+}

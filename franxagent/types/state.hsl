@@ -1,0 +1,116 @@
+// ============================================================================
+// franxagent/types/state.hsl — 配置 / 轮统计 / 会话状态 / 会话报告
+// ============================================================================
+// FranxAgent 原架构对应：config.json（language/api_key/base_url/model/
+// temperature/thinking/knowledge_k）+ agent.py 的消息持久化与预算。
+// HSL 侧：FranxConfig::from_config 经 $host.config 装配（S1 零隐式转换）。
+// ============================================================================
+
+import { Message } from "./messages.hsl";
+import { FranxError } from "./errors.hsl";
+
+export const DEFAULT_MAX_TURNS: u32 = 16;
+export const DEFAULT_KNOWLEDGE_K: u32 = 5;
+export const DEFAULT_MAX_OUTPUT: u32 = 4_000;
+
+/// 会话配置（config.json 的 HSL 投影）。
+#[derive(Debug, Clone)]
+export struct FranxConfig {
+    model: String,
+    temperature: f64,
+    thinking: bool,
+    knowledge_k: u32,
+    max_turns: u32,
+    max_output_chars: u32,
+    workspace: String,
+    task: String,
+    allow: Vec<String>,
+    approval: String,
+}
+
+impl FranxConfig {
+    /// 从宿主配置装配（native 只做字段搬运，N1/N2 纪律）。
+    fn from_config() -> Result<FranxConfig, FranxError> {
+        let cfg: HashMap<String, String> = native typescript {
+            const c = $host.config;
+            const m = new Map();
+            m.set("model", String(c.model));
+            m.set("temperature", String(c.temperature));
+            m.set("max_turns", String(c.maxTurns));
+            m.set("max_output_chars", String(c.maxOutputChars));
+            m.set("workspace", String(c.workspace));
+            m.set("task", String(c.task));
+            m.set("allow", c.allow.join(","));
+            return m;
+        };
+        let model = cfg.get("model").unwrap_or(String::from("scripted"));
+        let temperature = cfg.get("temperature").unwrap_or(String::from("0.8")).parse::<f64>()?;
+        let max_turns = cfg.get("max_turns").unwrap_or(String::from("16")).parse::<u32>()?;
+        let max_output_chars = cfg.get("max_output_chars").unwrap_or(String::from("4000")).parse::<u32>()?;
+        let workspace = cfg.get("workspace").unwrap_or(String::from("."));
+        let task = cfg.get("task").unwrap_or(String::from(""));
+        let allow_raw = cfg.get("allow").unwrap_or(String::from("bun"));
+        let allow = allow_raw.split(',').map(|s| s.trim().to_string());
+        let approval = String::from("scripted");
+        Ok(FranxConfig {
+            model,
+            temperature,
+            thinking: false,
+            knowledge_k: DEFAULT_KNOWLEDGE_K,
+            max_turns,
+            max_output_chars,
+            workspace,
+            task,
+            allow,
+            approval,
+        })
+    }
+}
+
+/// 轮统计（预算观测）。
+#[derive(Debug, Clone)]
+export struct TurnStats {
+    turns: u32,
+    tool_calls: u32,
+    commands: u32,
+    proposals: u32,
+    approved: u32,
+    rejected: u32,
+    failures: u32,
+    corrections: u32,
+    memories: u32,
+}
+
+impl TurnStats {
+    fn zero() -> TurnStats {
+        TurnStats { turns: 0, tool_calls: 0, commands: 0, proposals: 0, approved: 0, rejected: 0, failures: 0, corrections: 0, memories: 0 }
+    }
+}
+
+/// 会话状态（graph 主参数）。
+#[derive(Debug, Clone)]
+export struct SessionState {
+    config: FranxConfig,
+    history: Vec<Message>,
+    stats: TurnStats,
+}
+
+/// 会话报告（出口产物）。
+#[derive(Debug, Clone)]
+export struct SessionReport {
+    task: String,
+    model: String,
+    verdict: String,
+    turns: u32,
+    tool_calls: u32,
+    commands: u32,
+    proposals: u32,
+    approved: u32,
+    rejected: u32,
+    corrections: u32,
+    failures: u32,
+    memories: u32,
+    reply: String,
+    history_lines: u32,
+    ok: bool,
+}

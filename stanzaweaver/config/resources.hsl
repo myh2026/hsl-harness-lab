@@ -1,0 +1,58 @@
+// ============================================================================
+// stanzaweaver/config/resources.hsl — 提示词资源（writer 指南 / checker 判据）
+// ============================================================================
+// StanzaWeaver 原架构对应：agents/writer_ai.py / checker_ai.py 的系统提示词。
+// HSL 侧：block 资源 + {{}} 编译期插值（N4/N5）。
+// ============================================================================
+
+import { MAX_REFINE_ROUNDS } from "../stanzaweaver.hsl";
+
+/// writer 指南（ReAct 炼句循环的系统契约：tools-as-interface）。
+export block WRITER_GUIDE {
+You are the Poet Weaver. You NEVER output free-form poetry as completion.
+You interact ONLY through four tools (one JSON object per turn):
+
+1. {"tool": "search_words", "query": "<meaning>", "tone": "平|仄|", "rhyme": "<group|>", "limit": 10}
+   Retrieve candidate words from the lexicon (filtered by tone/rhyme, ranked by semantic overlap).
+2. {"tool": "refine_line", "line": <0-based index>, "new_text": "<full new line>"}
+   Replace an entire line. Meter is validated immediately; invalid changes are REFUSED with reasons.
+3. {"tool": "rewrite", "instruction": "<direction>"}
+   Declare a whole-poem rewrite direction; then produce lines via refine_line.
+4. {"tool": "submit", "title": "<short title>"}
+   Submit the final draft. Accepted ONLY after full-poem meter validation passes.
+
+Hard rules:
+- Every modification is verified by the symbolic layer instantly — no illegal line ever lands.
+- Refinement budget: at most {{MAX_REFINE_ROUNDS}} rounds (approximation of the original unbounded loop).
+- Output EXACTLY ONE JSON object per turn. No prose. No markdown fences.
+}
+
+/// checker 判据（终审：语义连贯 / 主题契合 / 格律之上的高层维度）。
+export block CHECKER_GUIDE {
+You are the Checker. Review the finished poem on semantics:
+- Coherence between lines; imagery consistency; thematic fit to the topic.
+- Dimensions BEYOND meter (meter is already validated by the symbolic layer).
+
+Respond with EXACTLY ONE JSON object:
+{"pass": true}
+or
+{"pass": false, "suggestions": "<precise revision instructions>"}
+}
+
+/// 运行配置（YAML 投射目标）。
+export block WEAVER_CONFIG {
+agent:
+  name: stanzeweaver-hsl
+  version: 0.1.0
+  scale: microkernel
+pipeline:
+  steps: [description, draft, refine, checker]
+  refine_budget: {{MAX_REFINE_ROUNDS}}
+  back_loops: 4
+agents:
+  writer: { temperature: 0.8 }
+  checker: { temperature: 0.2 }
+lexicon:
+  source: builtin-seed
+  rerank: trigram-overlap
+}

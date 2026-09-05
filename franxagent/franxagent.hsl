@@ -1,0 +1,240 @@
+// ============================================================================
+// franxagent/franxagent.hsl — 入口：会话编排 graph + main + 投射声明
+// ============================================================================
+// 复现 FranxAgent 的 input() 核心循环（agent.py）：
+//   1. 用户消息入持久化历史；
+//   2. 知识混合检索 → 动态 system 注入（不入持久化历史）；
+//   3. 工具循环：模型输出 tool_calls → 路由执行（纠偏 + 安全闸门 +
+//      提案审查）→ 观察回填 → 再询问，直到纯文本回复；
+//   4. 结束：assistant 回复入历史 + 会话记忆沉淀 + 落盘。
+//
+// 拓扑（node 为物理依赖，edge 为带守卫的消息通道）：
+//   model ──ToolCalled──> router ──Observed──> model（观察回填环）
+//   router ──ProposalReady──> approver（write 提案送审）
+//   model ──Remembered──> store（会话记忆沉淀）
+// ============================================================================
+
+import { Message, ToolOutcome, Turn } from "./types/messages.hsl";
+import { FranxConfig, SessionState, TurnStats, SessionReport } from "./types/state.hsl";
+import { ChatModel, OpenAIChatModel, ScriptedChatModel } from "./providers/chat.hsl";
+import { KnowledgeStore } from "./knowledge/store.hsl";
+import { parse_reply, dispatch } from "./agents/router.hsl";
+import { review_proposal, settle, Approval } from "./agents/approver.hsl";
+import { clean_orphans } from "./memory/persist.hsl";
+import { USER_GUIDE, FRANX_CONFIG } from "./config/resources.hsl";
+
+macro_rules! bump {
+    ($field:expr, $by:expr) => { $field += $by; };
+}
+
+/// 会话编排 graph：一次用户输入的完整处理（工具循环 + 记忆 + 落盘）。
+graph Franx(mut session: SessionState) -> Result<SessionReport, FranxError> {
+    let config = session.config.clone();
+    node model: Box<dyn ChatModel> = make_model(config.clone())?;
+    node router: FranxConfig = config.clone();
+    node approver: FranxConfig = config.clone();
+    node mut store: KnowledgeStore = seed_knowledge();
+
+    // 条件环（G3：环上每条边都带 on Guard）
+    edge model -> router on Turn::ToolCalled;
+    edge router -> model on Turn::Observed;
+    edge router -> approver on Turn::ProposalReady;
+    edge model -> store on Turn::Remembered;
+
+    // 1) 历史健全化：孤儿 tool 消息清理（messages.json 的完整性守卫）
+    let mut history = clean_orphans(session.history.clone());
+
+    // 2) 知识检索 → 动态 system 注入（不入持久化历史）
+    let relevant = store.clone().search(session.config.clone().task.clone(), config.knowledge_k);
+    let mut context: Vec<Message> = Vec::new();
+    context.push(Message::system(USER_GUIDE));
+    if relevant.len() > 0 {
+        let mut joined = String::from("## Related Content\n\n");
+        for snippet in relevant {
+            joined.push_str(snippet.as_str());
+            joined.push_str("\n\n");
+        }
+        context.push(Message::system(joined));
+    }
+    for m in history.clone() {
+        context.push(m);
+    }
+
+    // 3) 工具循环（AgentLoop，G1）
+    let mut turns: u32 = 0;
+    let mut reply = String::from("");
+    let mut finished: bool = false;
+    loop {
+        if turns >= config.max_turns {
+            break;
+        }
+        let raw = model.chat(context.clone()).await?;
+        let (text, requests) = parse_reply(raw)?;
+        if requests.len() == 0 {
+            // 纯文本回复：会话结束
+            reply = text;
+            history.push(Message::assistant(text.clone()));
+            finished = true;
+            break;
+        }
+        // assistant 工具回合入历史（模型可见自己做过什么）
+        history.push(Message::assistant(format!("[tool_calls: {}]", requests.len())));
+        let mut observations: Vec<Message> = Vec::new();
+        for request in requests {
+            if request.corrected {
+                bump!(session.stats.corrections, 1);
+            }
+            let outcome = dispatch(router.clone(), request.clone());
+            bump!(session.stats.tool_calls, 1);
+            // 提案分支：write 提案送审查闸门
+            let final_outcome = match outcome.clone().proposal {
+                Option::Some(proposal) => {
+                    bump!(session.stats.proposals, 1);
+                    let verdict = review_proposal(approver.clone(), proposal.clone());
+                    match verdict {
+                        Approval::Approve { edited } => {
+                            bump!(session.stats.approved, 1);
+                            settle(approver.clone(), proposal.clone(), edited)
+                        },
+                        Approval::Reject { reason } => {
+                            bump!(session.stats.rejected, 1);
+                            ToolOutcome {
+                                call_id: outcome.call_id.clone(),
+                                tool: String::from("write"),
+                                ok: false,
+                                output: format!("proposal rejected: {}", reason),
+                                proposal: Option::None,
+                            }
+                        },
+                    }
+                },
+                Option::None => outcome,
+            };
+            if final_outcome.ok == false {
+                bump!(session.stats.failures, 1);
+            }
+            if final_outcome.tool == String::from("command") {
+                bump!(session.stats.commands, 1);
+            }
+            observations.push(final_outcome.to_message());
+        }
+        for obs in observations {
+            context.push(obs);
+            history.push(obs);
+        }
+        bump!(session.stats.turns, 1);
+        bump!(turns, 1);
+    }
+
+    // 4) 记忆沉淀（conversation 级，低权重）+ 状态回写
+    if finished {
+        let user_msg = session.config.task.clone();
+        store = store.remember(user_msg, reply.clone());
+        bump!(session.stats.memories, 1);
+    }
+    session.history = history;
+    Ok(build_report(session, reply, turns, finished))
+}
+
+fn build_report(session: SessionState, reply: String, turns: u32, finished: bool) -> SessionReport {
+    let verdict = if finished { String::from("replied") } else { String::from("budget_exhausted") };
+    SessionReport {
+        task: session.config.task.clone(),
+        model: session.config.model.clone(),
+        verdict,
+        turns,
+        tool_calls: session.stats.tool_calls,
+        commands: session.stats.commands,
+        proposals: session.stats.proposals,
+        approved: session.stats.approved,
+        rejected: session.stats.rejected,
+        corrections: session.stats.corrections,
+        failures: session.stats.failures,
+        memories: session.stats.memories,
+        reply,
+        history_lines: session.history.len(),
+        ok: finished,
+    }
+}
+
+/// 模型装配（OpenAI 兼容 / 剧本）。
+fn make_model(config: FranxConfig) -> Result<Box<dyn ChatModel>, FranxError> {
+    if config.model == String::from("scripted") {
+        Ok(ScriptedChatModel::new(String::from("acts")))
+    } else {
+        Ok(OpenAIChatModel::new(config.model.clone(), config.temperature))
+    }
+}
+
+/// 初始知识库（技能/工具文档种子；真实系统从 knowledge/ 目录装配）。
+fn seed_knowledge() -> KnowledgeStore {
+    KnowledgeStore::new().load(vec![
+        KnowledgeDoc {
+            doc_type: String::from("tool"),
+            text: String::from("read: 读取文件全文并附行号；目录路径返回结构清单。"),
+        },
+        KnowledgeDoc {
+            doc_type: String::from("tool"),
+            text: String::from("write: 提案-审查-批准模式写入；支持 overwrite/insert/edit 三模式。"),
+        },
+        KnowledgeDoc {
+            doc_type: String::from("skill"),
+            text: String::from("# skill: safe_delete\n删除文件必须用 mv 移动到 to-delete 目录并记录清单。"),
+        },
+    ])
+}
+
+export fn main() -> Result<(), FranxError> {
+    let config = FranxConfig::from_config()?;
+    let mut opening: Vec<Message> = Vec::new();
+    opening.push(Message::user(format!("task: {}", config.task)));
+    let session = SessionState { config: config.clone(), history: opening, stats: TurnStats::zero() };
+    let report = Franx::run(session)?;
+    write_artifacts(report)
+}
+
+fn write_artifacts(report: SessionReport) -> Result<(), FranxError> {
+    let report_md = render_report(report.clone());
+    native typescript {
+        $host.artifacts.write("report.md", report_md);
+        return true;
+    };
+    println!("[franxagent] artifacts written: report.md");
+    Ok(())
+}
+
+fn render_report(report: SessionReport) -> String {
+    let mut out = String::from("# FranxAgent Session Report\n\n");
+    out.push_str("## 任务\n\n");
+    out.push_str(report.task.as_str());
+    out.push_str("\n\n## 回复\n\n");
+    out.push_str(report.reply.as_str());
+    out.push_str("\n\n## 预算与统计\n\n");
+    out.push_str(format!("- verdict: {}\n", report.verdict).as_str());
+    out.push_str(format!("- turns: {}\n", report.turns).as_str());
+    out.push_str(format!("- tool_calls: {}\n", report.tool_calls).as_str());
+    out.push_str(format!("- commands: {}\n", report.commands).as_str());
+    out.push_str(format!("- proposals: {} (approved {}, rejected {})\n", report.proposals, report.approved, report.rejected).as_str());
+    out.push_str(format!("- protocol corrections: {}\n", report.corrections).as_str());
+    out.push_str(format!("- failures: {}\n", report.failures).as_str());
+    out.push_str(format!("- memories: {}\n", report.memories).as_str());
+    out
+}
+
+scale = microkernel;
+
+project {
+    Franx        -> "src/franxagent/session.py" : python,
+    OpenAIChatModel -> "src/franxagent/chat.ts"  : typescript,
+    USER_GUIDE   -> ".harness/USER_GUIDE.md"     : markdown,
+    FRANX_CONFIG -> "config/config.json"         : json,
+
+    rules {
+        struct -> "src/types/{name}.rs"  : rust,
+        enum   -> "src/types/{name}.rs"  : rust,
+        trait  -> "src/types/{name}.rs"  : rust,
+        fn     -> "src/logic/{name}.rs"  : rust,
+        const  -> "src/consts/{name}.rs" : rust,
+        block  -> "config/{name}.yml"    : yaml,
+    }
+}

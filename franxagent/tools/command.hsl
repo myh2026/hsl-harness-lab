@@ -1,0 +1,76 @@
+// ============================================================================
+// franxagent/tools/command.hsl — command 工具（删除禁令 → 移回收站）
+// ============================================================================
+// FranxAgent 原架构对应：knowledge/tools/command 的安全铁律——
+// 「直接执行任何删除命令严格禁止；改为移动到回收站/安全目录并记录」。
+// HSL 侧：删除动词黑名单（rm/del/rmdir/shred）首词命中即软拒绝，
+// 响应中给出移回收站的替代指令（模型可读，自行改道）。
+// ============================================================================
+
+import { ToolOutcome } from "../types/messages.hsl";
+import { FranxConfig } from "../types/state.hsl";
+import { cap_chars } from "./cap.hsl";
+
+/// 删除动词黑名单（首词命中 = 策略级拒绝）。
+const DELETE_VERBS: Vec<String> = vec![
+    String::from("rm"),
+    String::from("del"),
+    String::from("rmdir"),
+    String::from("shred"),
+];
+
+/// command 工具：管理员权限命令执行 + 删除禁令。
+#[capability(process_spawn)]
+export fn tool_command(config: FranxConfig, call_id: String, command: String) -> ToolOutcome {
+    let first = first_word(command.clone());
+    if DELETE_VERBS.contains(first.clone()) {
+        return ToolOutcome {
+            call_id,
+            tool: String::from("command"),
+            ok: false,
+            output: format!(
+                "安全策略拒绝：\"{}\" 是删除命令。请改用移动到安全目录（例如: mv <path> ./to-delete/），并用 write 工具记录移动清单以便用户恢复。",
+                first
+            ),
+            proposal: Option::None,
+        };
+    }
+    let r = native typescript {
+        try {
+            const out = await $host.shell.run(command, { timeoutMs: 60000 });
+            return { ok: out.ok, code: out.code, stdout: out.stdout, stderr: out.stderr };
+        } catch (e) {
+            return { ok: false, code: -1, stdout: "", stderr: String(e && e.message || e) };
+        }
+    };
+    let mut combined = String::from("");
+    if r.stdout.len() > 0 {
+        combined.push_str(r.stdout.as_str());
+    }
+    if r.stderr.len() > 0 {
+        if combined.len() > 0 {
+            combined.push_str("\n");
+        }
+        combined.push_str("[stderr]\n");
+        combined.push_str(r.stderr.as_str());
+    }
+    if combined.len() == 0 {
+        combined.push_str(format!("(no output, exit {})", r.code).as_str());
+    }
+    ToolOutcome {
+        call_id,
+        tool: String::from("command"),
+        ok: r.ok,
+        output: cap_chars(combined, config.max_output_chars),
+        proposal: Option::None,
+    }
+}
+
+/// 取命令首词。
+fn first_word(command: String) -> String {
+    let words = command.split_whitespace();
+    match words.first() {
+        Option::Some(w) => w,
+        Option::None => String::from(""),
+    }
+}

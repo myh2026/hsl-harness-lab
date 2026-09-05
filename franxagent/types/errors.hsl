@@ -1,0 +1,73 @@
+// ============================================================================
+// franxagent/types/errors.hsl — 错误层：LLM / 安全 / 顶层三级通道
+// ============================================================================
+// FranxAgent 原架构对应：agent.py 的 try-except 分层 + 工具错误回传模型。
+// HSL 侧：LlmError / SafetyError / FranxError + From×2，`?` 是唯一显式
+// 传播通道（S3）；工具软失败走 ToolOutcome（反馈模型自纠，不终止会话）。
+// ============================================================================
+
+/// 模型提供方错误（OpenAI 兼容端点的异常归一）。
+#[derive(Debug, Clone)]
+export struct LlmError {
+    code: u32,
+    message: String,
+}
+
+impl LlmError {
+    fn new(code: u32, message: String) -> LlmError {
+        LlmError { code, message }
+    }
+}
+
+/// 安全拒绝（删除禁令 / 只读模式；与工具软失败不同级——这是策略级拒绝）。
+#[derive(Debug, Clone)]
+export struct SafetyError {
+    tool: String,
+    reason: String,
+}
+
+impl SafetyError {
+    fn new(tool: String, reason: String) -> SafetyError {
+        SafetyError { tool, reason }
+    }
+}
+
+/// 顶层会话错误。
+#[derive(Debug, Clone)]
+export struct FranxError {
+    kind: String,
+    message: String,
+}
+
+impl FranxError {
+    fn new(kind: String, message: String) -> FranxError {
+        FranxError { kind, message }
+    }
+}
+
+// ? 自动包装：LlmError → FranxError
+impl From<LlmError> for FranxError {
+    fn from(src: LlmError) -> FranxError {
+        FranxError {
+            kind: String::from("llm"),
+            message: format!("llm {}: {}", src.code, src.message),
+        }
+    }
+}
+
+// ? 自动包装：SafetyError → FranxError
+impl From<SafetyError> for FranxError {
+    fn from(src: SafetyError) -> FranxError {
+        FranxError {
+            kind: String::from("safety"),
+            message: format!("safety {} 拒绝: {}", src.tool, src.reason),
+        }
+    }
+}
+
+// ? 自动包装：String（parse 错误）→ FranxError
+impl From<String> for FranxError {
+    fn from(src: String) -> FranxError {
+        FranxError { kind: String::from("parse"), message: src }
+    }
+}

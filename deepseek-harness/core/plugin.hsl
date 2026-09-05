@@ -1,0 +1,151 @@
+// ============================================================================
+// dsh/core/plugin.hsl — PluginHost：everything-is-a-plugin 的装配协议
+// ============================================================================
+// deepseek-harness 原架构对应：Cordis ctx + scope 包——「每个包都是插件，
+// 向 ctx 注册自己的贡献，组合出完整 harness」。HSL 侧：Plugin 的 contribute
+// 返回三类贡献臂；PluginHost::assemble 按声明序应用全部插件，
+// 装配过程本身作为事实回填 append-only 日志（组装即可观测）。
+// ============================================================================
+
+import { Policy } from "../types/state.hsl";
+import { DshError } from "../types/errors.hsl";
+import { SessionEvent } from "../types/events.hsl";
+import { DeepSeekModel, ScriptedModel, ModelProvider } from "../providers/model.hsl";
+import { ToolRegistry } from "./registry.hsl";
+import { SessionLog } from "./session.hsl";
+import { SystemPrompt } from "./prompt.hsl";
+
+/// 装配产物：一次 harness 组合的物理依赖集合。
+/// 对应 deepseek-harness bundle：model provider + 工具注册表 + 会话日志 +
+/// 系统提示词装配器（四件 spine 的运行时化身）。
+#[derive(Debug, Clone)]
+export struct Harness {
+    provider: Box<dyn ModelProvider>,
+    registry: ToolRegistry,
+    log: SessionLog,
+    prompt: SystemPrompt,
+}
+
+/// 插件贡献：装配的原子单位。
+/// deepseek-harness 中工具/模型/展示都是插件；这里收敛为四类贡献臂。
+#[derive(Debug, Clone)]
+export enum Contribution {
+    Provider { kind: String },
+    Tools { registry: ToolRegistry },
+    Prompt { section_order: u32, section_title: String },
+    Session { session_id: String },
+}
+
+/// 插件（name + kind；kind 决定贡献臂）。
+#[derive(Debug, Clone)]
+export struct Plugin {
+    name: String,
+    kind: String,
+}
+
+impl Plugin {
+    fn new(name: String, kind: String) -> Plugin {
+        Plugin { name, kind }
+    }
+
+    /// 插件身份（审计出口）。
+    fn identity(self) -> String {
+        format!("plugin {} ({})", self.name, self.kind)
+    }
+
+    /// 本插件的贡献（kind → Contribution 分发）。
+    fn contribute(self, policy: Policy) -> Contribution {
+        match self.kind.as_str() {
+            "model" => Contribution::Provider { kind: policy.model.clone() },
+            "tools" => Contribution::Tools { registry: ToolRegistry::new(policy.clone()) },
+            "prompt" => Contribution::Prompt { section_order: 0, section_title: String::from("identity") },
+            "session" => Contribution::Session { session_id: String::from("sess-001") },
+            _ => Contribution::Session { session_id: String::from("anonymous") },
+        }
+    }
+}
+
+/// 插件宿主：按声明序应用插件，产出 Harness。
+/// base 组合 = [model, tools, prompt, session] 四插件（对应
+/// deepseek-harness 的 dsh-base 默认 bundle）。
+#[derive(Debug, Clone)]
+export struct PluginHost {
+    plugins: Vec<Plugin>,
+}
+
+impl PluginHost {
+    /// 空宿主。
+    fn new() -> PluginHost {
+        PluginHost { plugins: Vec::new() }
+    }
+
+    /// 注册插件（声明序 = 应用序）。
+    fn use_plugin(mut self, plugin: Plugin) -> PluginHost {
+        self.plugins.push(plugin);
+        self
+    }
+
+    /// dsh base 组合：四插件 spine。
+    fn base() -> PluginHost {
+        PluginHost::new()
+            .use_plugin(Plugin::new(String::from("dsh-model"), String::from("model")))
+            .use_plugin(Plugin::new(String::from("dsh-tools"), String::from("tools")))
+            .use_plugin(Plugin::new(String::from("dsh-prompt"), String::from("prompt")))
+            .use_plugin(Plugin::new(String::from("dsh-session"), String::from("session")))
+    }
+
+    /// 装配：应用全部插件贡献，组合 Harness。
+    /// Provider 贡献决定模型后端选择；Tools 贡献携带注册表；
+    /// Prompt 贡献触发默认分节装配；Session 贡献决定日志身份。
+    /// 每个插件的应用都是一条日志事实（append-only，组装即可观测）。
+    fn assemble(self, policy: Policy) -> Result<Harness, DshError> {
+        let provider: Box<dyn ModelProvider> = make_provider(policy.clone())?;
+        let registry = ToolRegistry::new(policy.clone());
+        let prompt = SystemPrompt::default_for(policy.task.clone(), policy.max_bash_calls);
+        let mut log = SessionLog::new(String::from("sess-001"));
+        let mut session_id = String::from("sess-001");
+        for plugin in self.plugins.clone() {
+            let contribution = plugin.clone().contribute(policy.clone());
+            match contribution {
+                Contribution::Provider { kind } => {
+                    log = log.append(SessionEvent::RunStart {
+                        task: plugin.name.clone(),
+                        model: kind,
+                    });
+                },
+                Contribution::Tools { registry: _ } => {
+                    log = log.append(SessionEvent::PromptAssembled { sections: 5, chars: 0 });
+                },
+                Contribution::Prompt { section_order: _, section_title: _ } => {
+                    log = log.append(SessionEvent::PromptAssembled { sections: 1, chars: 0 });
+                },
+                Contribution::Session { session_id: sid } => {
+                    session_id = sid;
+                },
+            }
+        }
+        log = SessionLog::new(session_id).append(SessionEvent::RunStart {
+            task: policy.task.clone(),
+            model: policy.model.clone(),
+        });
+        Ok(Harness { provider, registry, log, prompt })
+    }
+}
+
+/// 按策略装配模型提供方（Provider 插件臂的实现选择）。
+fn make_provider(policy: Policy) -> Result<Box<dyn ModelProvider>, DshError> {
+    if policy.model == String::from("deepseek") {
+        Ok(DeepSeekModel::new(String::from("glm-4.5"), policy.temperature))
+    } else {
+        Ok(ScriptedModel::new(String::from("fixture"), String::from("actor")))
+    }
+}
+
+/// 按策略装配审查者（同源不同实例：低温、独立剧本轨道）。
+export fn make_reviewer(policy: Policy) -> Result<Box<dyn ModelProvider>, DshError> {
+    if policy.model == String::from("deepseek") {
+        Ok(DeepSeekModel::new(String::from("glm-4.5"), 0.1))
+    } else {
+        Ok(ScriptedModel::new(String::from("fixture"), String::from("reviewer")))
+    }
+}

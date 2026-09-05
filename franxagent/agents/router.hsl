@@ -1,0 +1,159 @@
+// ============================================================================
+// franxagent/agents/router.hsl — 工具路由：`tools` 单入口协议 + 纠偏
+// ============================================================================
+// FranxAgent 原架构对应：agent.py 的工具调用处理层——
+// 1) 模型只能调用名为 `tools` 的唯一函数（tool_name + arguments 内层）；
+// 2) 模型直接以内建工具名调用（如 "read"）时自动纠偏为 tools 包装；
+// 3) arguments 是 JSON 字符串 → HashMap<String,String> 进入 HSL（N2）。
+// ============================================================================
+
+import { ToolCall, ToolOutcome } from "../types/messages.hsl";
+import { FranxError } from "../types/errors.hsl";
+import { FranxConfig } from "../types/state.hsl";
+import { tool_read, tool_write_propose } from "../tools/fs.hsl";
+import { tool_command } from "../tools/command.hsl";
+import { tool_search } from "../tools/search.hsl";
+
+/// 模型原始输出 → (正文文本, 工具请求列表)。
+/// 协议：输出是 JSON，或含 "tool_calls" 数组，或纯文本回复。
+/// 纠偏：function.name != "tools" 且非 MCP 路径（无 "/"）时，
+/// 把 name 视为 tool_name、arguments 原样内移（corrections 计数 +1）。
+export fn parse_reply(raw: String) -> Result<(String, Vec<ToolRequestNorm>), FranxError> {
+    let parsed = native typescript {
+        const out = { text: "", calls: [], corrected: false };
+        try {
+            const obj = JSON.parse(raw);
+            if (typeof obj === "object" && obj !== null && Array.isArray(obj.tool_calls)) {
+                for (const tc of obj.tool_calls) {
+                    const fn = tc.function || {};
+                    let name = String(fn.name || "");
+                    let argsStr = String(fn.arguments || "{}");
+                    let corrected = false;
+                    if (name !== "tools" && !name.includes("/")) {
+                        // 纠偏：直接调用内建工具名 → 包装为 tools 协议
+                        try {
+                            const inner = JSON.parse(argsStr);
+                            argsStr = JSON.stringify({ tool_name: name, arguments: inner });
+                        } catch {
+                            argsStr = JSON.stringify({ tool_name: name, arguments: {} });
+                        }
+                        name = "tools";
+                        corrected = true;
+                    }
+                    out.calls.push({
+                        id: String(tc.id || "call_" + out.calls.length),
+                        name,
+                        arguments: argsStr,
+                    });
+                    out.corrected = out.corrected || corrected;
+                }
+                out.text = String(obj.content || "");
+                return out;
+            }
+        } catch {
+            // 非 JSON：纯文本回复
+        }
+        out.text = raw;
+        return out;
+    };
+    let mut requests: Vec<ToolRequestNorm> = Vec::new();
+    for c in parsed.calls {
+        let fields: HashMap<String, String> = native typescript {
+            try {
+                return $host.json.fields(c.arguments);
+            } catch (e) {
+                const m = new Map();
+                m.set("error", String(e && e.message || e));
+                return m;
+            }
+        };
+        let tool_name = fields.get("tool_name").unwrap_or(String::from(""));
+        let inner: HashMap<String, String> = native typescript {
+            try {
+                const args = JSON.parse(c.arguments);
+                const inner = args && typeof args === "object" ? args.arguments : {};
+                const m = new Map();
+                for (const k of Object.keys(inner || {})) {
+                    m.set(k, typeof inner[k] === "object" ? JSON.stringify(inner[k]) : String(inner[k]));
+                }
+                return m;
+            } catch (e) {
+                const m = new Map();
+                m.set("error", String(e && e.message || e));
+                return m;
+            }
+        };
+        let call = build_call(tool_name.clone(), inner.clone())?;
+        requests.push(ToolRequestNorm {
+            id: c.id,
+            call,
+            corrected: parsed.corrected,
+        });
+    }
+    Ok((parsed.text, requests))
+}
+
+/// 规范化请求（纠偏标记携带到统计层）。
+#[derive(Debug, Clone)]
+export struct ToolRequestNorm {
+    id: String,
+    call: ToolCall,
+    corrected: bool,
+}
+
+/// tool_name + arguments → ToolCall（封闭枚举装配，S6 穷尽）。
+fn build_call(tool_name: String, inner: HashMap<String, String>) -> Result<ToolCall, FranxError> {
+    if tool_name == String::from("read") {
+        Ok(ToolCall::Read { path: require(inner, "path")? })
+    } else if tool_name == String::from("write") {
+        Ok(ToolCall::Write {
+            path: require(inner, "path")?,
+            content: require(inner, "content")?,
+            mode: inner.get("mode").unwrap_or(String::from("overwrite")),
+            start_line: inner.get("start_line").unwrap_or(String::from("0")).parse::<u32>()?,
+            end_line: inner.get("end_line").unwrap_or(String::from("0")).parse::<u32>()?,
+        })
+    } else if tool_name == String::from("command") {
+        Ok(ToolCall::Command { command: require(inner, "command")? })
+    } else if tool_name == String::from("search") {
+        Ok(ToolCall::Search {
+            query: require(inner, "query")?,
+            max_results: inner.get("max_results").unwrap_or(String::from("5")).parse::<u32>()?,
+        })
+    } else if tool_name == String::from("add_skill") {
+        Ok(ToolCall::AddSkill {
+            name: require(inner, "name")?,
+            content: require(inner, "content")?,
+        })
+    } else {
+        Err(FranxError::new(String::from("parse"), format!("未知工具 \"{}\"（只能经 tools 协议调用 read/write/command/search/add_skill）", tool_name)))
+    }
+}
+
+fn require(fields: HashMap<String, String>, key: String) -> Result<String, FranxError> {
+    match fields.get(key) {
+        Option::Some(v) => Ok(v),
+        Option::None => Err(FranxError::new(String::from("parse"), format!("工具参数缺少字段 \"{}\"", key))),
+    }
+}
+
+/// 工具分发（router 的执行臂；write 产出提案交审查闸门）。
+export fn dispatch(config: FranxConfig, request: ToolRequestNorm) -> ToolOutcome {
+    let call_id = request.id.clone();
+    match request.call.clone() {
+        ToolCall::Read { path } => tool_read(config, call_id, path),
+        ToolCall::Write { path, content, mode, start_line, end_line } => {
+            tool_write_propose(config, call_id, ToolCall::Write { path, content, mode, start_line, end_line })
+        },
+        ToolCall::Command { command } => tool_command(config, call_id, command),
+        ToolCall::Search { query, max_results } => tool_search(config, call_id, query, max_results),
+        // add_skill 的执行臂在主循环（需要 KnowledgeStore 状态，路由层不持有）
+        ToolCall::AddSkill { name, content } => ToolOutcome {
+            call_id,
+            tool: String::from("add_skill"),
+            ok: true,
+            output: format!("skill {} queued ({} chars)", name, content.len()),
+            proposal: Option::None,
+        },
+    }
+}

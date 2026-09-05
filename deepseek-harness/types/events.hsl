@@ -1,0 +1,62 @@
+// ============================================================================
+// dsh/types/events.hsl — 会话事件词汇（append-only session log 的封闭词汇表）
+// ============================================================================
+// deepseek-harness 原架构对应：session 包的 append-only 事件日志——
+//「一轮 turn 经过的所有模型可见事实都回填日志」。HSL 侧：SessionEvent
+// 封闭枚举 + 渲染函数，S6 保证新增事件类型时所有消费方编译期直面分支。
+// ============================================================================
+
+/// 会话事件（不可变事实；log 只 append，不修改历史）。
+#[derive(Debug, Clone)]
+export enum SessionEvent {
+    RunStart { task: String, model: String },
+    TurnOpened { turn: u32 },
+    PromptAssembled { sections: u32, chars: u32 },
+    ModelReplied { turn: u32, chars: u32 },
+    ToolDispatched { turn: u32, tool: String, ok: bool },
+    ToolGuarded { turn: u32, tool: String, reason: String },
+    TurnClosed { turn: u32 },
+    ReviewVerdict { accepted: bool, note: String },
+    BudgetExhausted { phase: String },
+    RunEnd { verdict: String, turns: u32 },
+}
+
+impl SessionEvent {
+    /// 事件名（events.jsonl 的 name 字段，机器可读出口）。
+    fn name(self) -> String {
+        match self {
+            SessionEvent::RunStart { task: _, model: _ } => String::from("run_start"),
+            SessionEvent::TurnOpened { turn: _ } => String::from("turn_opened"),
+            SessionEvent::PromptAssembled { sections: _, chars: _ } => String::from("prompt_assembled"),
+            SessionEvent::ModelReplied { turn: _, chars: _ } => String::from("model_replied"),
+            SessionEvent::ToolDispatched { turn: _, tool: _, ok: _ } => String::from("tool_dispatched"),
+            SessionEvent::ToolGuarded { turn: _, tool: _, reason: _ } => String::from("tool_guarded"),
+            SessionEvent::TurnClosed { turn: _ } => String::from("turn_closed"),
+            SessionEvent::ReviewVerdict { accepted: _, note: _ } => String::from("review_verdict"),
+            SessionEvent::BudgetExhausted { phase: _ } => String::from("budget_exhausted"),
+            SessionEvent::RunEnd { verdict: _, turns: _ } => String::from("run_end"),
+        }
+    }
+
+    /// 单行渲染（人读出口；jsonl 由 write_artifacts 的 native 块序列化）。
+    fn render(self) -> String {
+        match self {
+            SessionEvent::RunStart { task, model } => format!("run_start task={} model={}", task, model),
+            SessionEvent::TurnOpened { turn } => format!("turn_opened #{}", turn),
+            SessionEvent::PromptAssembled { sections, chars } => format!("prompt_assembled sections={} chars={}", sections, chars),
+            SessionEvent::ModelReplied { turn, chars } => format!("model_replied #{} chars={}", turn, chars),
+            SessionEvent::ToolDispatched { turn, tool, ok } => {
+                let status = if ok { "ok" } else { "FAIL" };
+                format!("tool_dispatched #{} {} [{}]", turn, tool, status)
+            },
+            SessionEvent::ToolGuarded { turn, tool, reason } => format!("tool_guarded #{} {} ({})", turn, tool, reason),
+            SessionEvent::TurnClosed { turn } => format!("turn_closed #{}", turn),
+            SessionEvent::ReviewVerdict { accepted, note } => {
+                let status = if accepted { "accept" } else { "revise" };
+                format!("review_verdict {} ({})", status, note)
+            },
+            SessionEvent::BudgetExhausted { phase } => format!("budget_exhausted ({})", phase),
+            SessionEvent::RunEnd { verdict, turns } => format!("run_end {} turns={}", verdict, turns),
+        }
+    }
+}

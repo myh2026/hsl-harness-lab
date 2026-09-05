@@ -1,0 +1,74 @@
+// ============================================================================
+// franxagent/providers/chat.hsl — 模型提供方：OpenAI 兼容 / 剧本双实现
+// ============================================================================
+// FranxAgent 原架构对应：agent.py 的 OpenAI 客户端（流式 + thinking 开关，
+// HSL 侧收敛为整回合非流式——流式推送是前端关注点，不在契约层）+
+// ScriptedModel 的 fixture 驱动确定性轨道。
+// ============================================================================
+
+import { Message } from "../types/messages.hsl";
+import { LlmError } from "../types/errors.hsl";
+
+/// 模型契约：任何 OpenAI 兼容后端实现 chat 即可接入会话拓扑。
+export trait ChatModel {
+    async fn chat(self, messages: Vec<Message>) -> Result<String, LlmError>;
+}
+
+/// 真实模型（OpenAI 兼容 chat 协议，经 $host.llm 网关）。
+#[capability(net_connect)]
+#[derive(Debug, Clone)]
+export struct OpenAIChatModel {
+    model: String,
+    temperature: f64,
+}
+
+impl OpenAIChatModel {
+    fn new(model: String, temperature: f64) -> OpenAIChatModel {
+        OpenAIChatModel { model, temperature }
+    }
+}
+
+impl ChatModel for OpenAIChatModel {
+    async fn chat(self, messages: Vec<Message>) -> Result<String, LlmError> {
+        let raw: String = native typescript {
+            const msgs = messages.map((m) => ({ role: m.role, content: m.content }));
+            const r = await $host.llm.complete({
+                messages: msgs,
+                temperature: self.temperature,
+                maxTokens: 1024,
+            });
+            if (r === undefined || r === null) throw new Error("empty completion");
+            return r;
+        };
+        if raw.len() == 0 {
+            Err(LlmError::new(502, String::from("empty completion")))
+        } else {
+            Ok(raw)
+        }
+    }
+}
+
+/// 剧本模型（fixture 轨道驱动；track 参数化：acts / reviews / …）。
+#[derive(Debug, Clone)]
+export struct ScriptedChatModel {
+    track: String,
+}
+
+impl ScriptedChatModel {
+    fn new(track: String) -> ScriptedChatModel {
+        ScriptedChatModel { track }
+    }
+}
+
+impl ChatModel for ScriptedChatModel {
+    async fn chat(self, messages: Vec<Message>) -> Result<String, LlmError> {
+        let raw: String = native typescript {
+            return await $host.fixture.next(self.track);
+        };
+        if raw.len() == 0 {
+            Err(LlmError::new(503, String::from("fixture exhausted")))
+        } else {
+            Ok(raw)
+        }
+    }
+}

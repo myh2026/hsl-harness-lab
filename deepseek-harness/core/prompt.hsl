@@ -1,0 +1,95 @@
+// ============================================================================
+// dsh/core/prompt.hsl — SystemPrompt：有序分节装配 + 工具 schema 注入
+// ============================================================================
+// deepseek-harness 原架构对应：system-prompt 包——「提示词从有序 section、
+// 工具 schema 与变量装配而成」。HSL 侧：PromptSection 有序分节（order 决定
+// 拼接序）+ assemble 全量渲染 + with_variables 编译期插值协作。
+// ============================================================================
+
+import { ToolCall } from "../types/messages.hsl";
+import { SYSTEM_PROMPT, REVIEW_RUBRIC } from "../config/resources.hsl";
+
+/// 提示词分节（order 升序拼接；同 order 保持声明序）。
+#[derive(Debug, Clone)]
+export struct PromptSection {
+    order: u32,
+    title: String,
+    body: String,
+}
+
+/// 系统提示词装配器：分节集合 + 变量表。
+#[derive(Debug, Clone)]
+export struct SystemPrompt {
+    sections: Vec<PromptSection>,
+}
+
+impl SystemPrompt {
+    /// 空装配器。
+    fn new() -> SystemPrompt {
+        SystemPrompt { sections: Vec::new() }
+    }
+
+    /// 追加一个分节（order 由调用方定序）。
+    fn add_section(mut self, order: u32, title: String, body: String) -> SystemPrompt {
+        self.sections.push(PromptSection { order, title, body });
+        self
+    }
+
+    /// dsh 默认装配：identity（0）→ 协议主体（10）→ 工具 schema（20）→
+    /// 预算与安全（30）。对应 deepseek-harness 基础 bundle 的 section 次序。
+    fn default_for(policy_task: String, max_bash: u32) -> SystemPrompt {
+        let prompt = SystemPrompt::new();
+        prompt
+            .add_section(0, String::from("identity"), SYSTEM_PROMPT)
+            .add_section(
+                10,
+                String::from("session"),
+                format!("workspace task: {}", policy_task),
+            )
+            .add_section(20, String::from("tools"), render_tool_schemas())
+            .add_section(
+                30,
+                String::from("budget"),
+                format!("bash budget: at most {} calls per run. Keep commands short and safe.", max_bash),
+            )
+    }
+
+    /// 全量渲染（分节数 + 字符数回填事件日志）。
+    fn assemble(self) -> String {
+        let mut out = String::from("");
+        for section in self.sections {
+            out.push_str("## ");
+            out.push_str(section.title.as_str());
+            out.push_str("\n\n");
+            out.push_str(section.body.as_str());
+            out.push_str("\n\n");
+        }
+        out
+    }
+
+    /// 分节数（PromptAssembled 事件用）。
+    fn section_count(self) -> u32 {
+        self.sections.len()
+    }
+}
+
+/// 工具 schema 渲染：封闭枚举 ToolCall 的调用面（S6 保证 schema 与
+/// 分发器永不漂移——新增变体时这里编译期报错）。
+fn render_tool_schemas() -> String {
+    let read = ToolCall::ReadFile { path: String::from("<relative path>") };
+    let write = ToolCall::WriteFile { path: String::from("<relative path>"), content: String::from("<full file content>") };
+    let edit = ToolCall::EditFile { path: String::from("<relative path>"), old_text: String::from("<exact existing text>"), new_text: String::from("<replacement>") };
+    let bash = ToolCall::Bash { command: String::from("<shell command>") };
+    let list = ToolCall::ListFiles;
+    let mut out = String::from("");
+    for call in vec![read, write, edit, bash, list] {
+        out.push_str(call.name().as_str());
+        out.push_str("\n");
+    }
+    out
+}
+
+/// 审查者提示词（review 闸门独立装配，与主提示词同源不同实例）。
+export fn review_prompt() -> String {
+    REVIEW_RUBRIC
+}

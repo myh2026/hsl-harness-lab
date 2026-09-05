@@ -1,0 +1,13 @@
+{
+  "name": "stanzaweaver-web-adapter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "StanzaWeaver 原版 UI → HSL 复现流水线（dhv-ts scripted）Bun 适配服务器。仅依赖 socket.io。",
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}

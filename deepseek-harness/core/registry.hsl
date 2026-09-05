@@ -1,0 +1,98 @@
+// ============================================================================
+// dsh/core/registry.hsl — ToolRegistry：工具注册 + 守卫执行管线
+// ============================================================================
+// deepseek-harness 原架构对应：tools 包——「工具注册表 + 带守卫的执行管线，
+// loop 经注册表分发一切工具调用」。HSL 侧：注册表持有能力面
+// （#[capability] 编译期第一闸门），run 前置运行时第二闸门（预算/白名单）。
+// ============================================================================
+
+import { ToolCall, ToolResult } from "../types/messages.hsl";
+import { GuardError } from "../types/errors.hsl";
+import { Policy } from "../types/state.hsl";
+import { read_file, write_file, edit_file, list_files } from "../tools/workspace.hsl";
+import { run_bash } from "../tools/shell.hsl";
+
+/// 工具注册表：deepseek-harness 的「everything-is-a-plugin」在工具面的投影。
+/// 注册 = 编译期把分发臂写进 match（S6 穷尽）；守卫 = 运行期预算/白名单判定。
+#[derive(Debug, Clone)]
+export struct ToolRegistry {
+    policy: Policy,
+}
+
+impl ToolRegistry {
+    /// 装配注册表（策略即守卫参数）。
+    fn new(policy: Policy) -> ToolRegistry {
+        ToolRegistry { policy }
+    }
+
+    /// 守卫执行管线：guard → dispatch → normalize（输出封顶）。
+    ///
+    /// guard 判定（运行时第二闸门，与编译期 capability 双闸门互补）：
+    /// - bash 首词必须命中白名单；
+    /// - bash 预算由调用方（主循环）持有，此处只校验白名单。
+    fn guarded_run(self, call: ToolCall, turn: u32) -> Result<ToolResult, GuardError> {
+        if let ToolCall::Bash { command } = call.clone() {
+            let first = first_word(command.clone());
+            let allowed = self.policy.clone().allow.contains(first.clone());
+            if allowed == false {
+                return Err(GuardError::new(
+                    String::from("bash"),
+                    format!("turn {}: 首词 \"{}\" 不在白名单", turn, first),
+                ));
+            }
+        }
+        Ok(self.dispatch(call))
+    }
+
+    /// 分发臂：注册表的心脏（S6 穷尽 match，新增工具变体=编译期处决）。
+    fn dispatch(self, call: ToolCall) -> ToolResult {
+        let policy = self.policy.clone();
+        match call.clone() {
+            ToolCall::ReadFile { path } => soften(read_file(policy.clone(), path)),
+            ToolCall::WriteFile { path, content } => soften(write_file(policy.clone(), path, content)),
+            ToolCall::EditFile { path, old_text, new_text } => {
+                soften(edit_file(policy.clone(), path, old_text, new_text))
+            }
+            ToolCall::Bash { command } => soften(run_bash(policy.clone(), command)),
+            ToolCall::ListFiles => soften(list_files(policy)),
+        }
+    }
+
+    /// 注册面摘要（人读审计出口）。
+    fn describe(self) -> String {
+        let read = ToolCall::ReadFile { path: String::from("") };
+        let write = ToolCall::WriteFile { path: String::from(""), content: String::from("") };
+        let edit = ToolCall::EditFile { path: String::from(""), old_text: String::from(""), new_text: String::from("") };
+        let bash = ToolCall::Bash { command: String::from("") };
+        let list = ToolCall::ListFiles;
+        let mut names = String::from("");
+        for call in vec![read, write, edit, bash, list] {
+            names.push_str(call.name().as_str());
+            names.push_str(" ");
+        }
+        format!("registry [ {}] allow={}", names, self.policy.allow.join(","))
+    }
+}
+
+/// Result → 守卫管线的软失败归一：工具执行失败不终止 harness，
+/// 降级为 ok=false 的 ToolResult 回填转录（模型可见，自行纠错）。
+fn soften(result: Result<ToolResult, String>) -> ToolResult {
+    match result {
+        Ok(r) => r,
+        Err(message) => ToolResult {
+            call: String::from("tool"),
+            ok: false,
+            output: format!("tool error: {}", message),
+            duration_ms: 0,
+        },
+    }
+}
+
+/// 取命令首词（白名单判定）。
+fn first_word(command: String) -> String {
+    let words = command.split_whitespace();
+    match words.first() {
+        Option::Some(w) => w,
+        Option::None => String::from(""),
+    }
+}

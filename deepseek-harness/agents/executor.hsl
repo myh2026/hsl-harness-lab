@@ -1,0 +1,70 @@
+// ============================================================================
+// dsh/agents/executor.hsl — 执行器：模型输出解析（严格 JSON 协议）
+// ============================================================================
+// deepseek-harness 原架构对应：agent-loop 的 step 解析层。HSL 侧：
+// $host.json.fields 以 HashMap<String,String> 进入 HSL（N2 类型纪律：
+// 不让动态对象图穿透）；协议违规走 Err（调用方反馈重试）。
+// ============================================================================
+
+import { ToolCall, Action } from "../types/messages.hsl";
+import { DshError } from "../types/errors.hsl";
+
+/// 模型输出 → Action。
+export fn parse_action(raw: String) -> Result<Action, DshError> {
+    let fields: HashMap<String, String> = native typescript {
+        try {
+            return $host.json.fields(raw);
+        } catch (e) {
+            const m = new Map();
+            m.set("error", String(e && e.message || e));
+            return m;
+        }
+    };
+    if fields.contains_key("error") {
+        let detail = fields.get("error").unwrap_or(String::from("?"));
+        return Err(DshError::new(String::from("parse"), format!("模型输出不是合法 JSON：{}", detail)));
+    }
+    let kind = fields.get("action").unwrap_or(String::from(""));
+    if kind == String::from("tool") {
+        parse_tool(fields)
+    } else if kind == String::from("done") {
+        Ok(Action::Done { summary: fields.get("summary").unwrap_or(String::from("")) })
+    } else {
+        Err(DshError::new(String::from("parse"), format!("action 必须是 tool/done，得到 \"{}\"", kind)))
+    }
+}
+
+fn parse_tool(fields: HashMap<String, String>) -> Result<Action, DshError> {
+    let tool = fields.get("tool").unwrap_or(String::from(""));
+    if tool == String::from("read_file") {
+        Ok(Action::Tool { call: ToolCall::ReadFile { path: require_field(fields, "path")? } })
+    } else if tool == String::from("write_file") {
+        Ok(Action::Tool {
+            call: ToolCall::WriteFile {
+                path: require_field(fields, "path")?,
+                content: require_field(fields, "content")?,
+            },
+        })
+    } else if tool == String::from("edit_file") {
+        Ok(Action::Tool {
+            call: ToolCall::EditFile {
+                path: require_field(fields, "path")?,
+                old_text: require_field(fields, "old_text")?,
+                new_text: require_field(fields, "new_text")?,
+            },
+        })
+    } else if tool == String::from("bash") {
+        Ok(Action::Tool { call: ToolCall::Bash { command: require_field(fields, "command")? } })
+    } else if tool == String::from("list_files") {
+        Ok(Action::Tool { call: ToolCall::ListFiles })
+    } else {
+        Err(DshError::new(String::from("parse"), format!("未知工具 \"{}\"", tool)))
+    }
+}
+
+fn require_field(fields: HashMap<String, String>, key: String) -> Result<String, DshError> {
+    match fields.get(key) {
+        Option::Some(v) => Ok(v),
+        Option::None => Err(DshError::new(String::from("parse"), format!("缺少字段 \"{}\"", key))),
+    }
+}

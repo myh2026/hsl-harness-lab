@@ -1,0 +1,17 @@
+// ============================================================================
+// franxagent/tools/cap.hsl — 输出封顶（共享预算闸门）
+// ============================================================================
+
+/// 输出封顶（纯 HSL 字符串工程：chars().take(n).collect::<String>()）。
+export fn cap_chars(text: String, cap: u32) -> String {
+    if text.len() <= cap {
+        text
+    } else {
+        let head = text.chars().take(cap).collect::<String>();
+        let mut out = head;
+        out.push_str("\n...[truncated ");
+        out.push_str((text.len() - cap).to_string().as_str());
+        out.push_str(" chars]");
+        out
+    }
+}

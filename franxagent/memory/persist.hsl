@@ -1,0 +1,38 @@
+// ============================================================================
+// franxagent/memory/persist.hsl — 消息持久化层（完整性守卫）
+// ============================================================================
+// FranxAgent 原架构对应：agent.py 的 _clean_orphan_tool_messages——
+// 双向匹配清理：孤儿 tool 消息（无配对 assistant 工具回合）剔除。
+// HSL 侧：扁平四角色流上等价实现——tool 消息必须向前追溯到最近的
+// assistant 消息；追溯不到即孤儿（剔除）。纯函数，加载即修复。
+// ============================================================================
+
+import { Message } from "../types/messages.hsl";
+
+/// 孤儿 tool 消息清理（messages.json 完整性守卫）。
+///
+/// 语义：逐条扫描，tool 角色消息若在其之前的最近 user 边界内
+/// 找不到任何 assistant 消息（即无发起方），视为孤儿剔除。
+/// 其余消息原样保留（append-only 精神：只剔损坏，不改内容）。
+export fn clean_orphans(history: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::new();
+    let mut seen_assistant_since_user: bool = false;
+    for m in history {
+        let keep = if m.role == String::from("tool") {
+            seen_assistant_since_user
+        } else {
+            true
+        };
+        if m.role == String::from("user") {
+            seen_assistant_since_user = false;
+        } else {
+            if m.role == String::from("assistant") {
+                seen_assistant_since_user = true;
+            }
+        }
+        if keep {
+            out.push(m);
+        }
+    }
+    out
+}

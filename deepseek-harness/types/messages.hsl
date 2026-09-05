@@ -1,0 +1,108 @@
+// ============================================================================
+// dsh/types/messages.hsl — 对话消息 / 工具词汇 / 裁决词汇（契约层）
+// ============================================================================
+// deepseek-harness 原架构对应：session 包的事件词汇 + agent 包的 turn 语义。
+// HSL 侧：封闭枚举承载词汇表（S6：新增变体 = 编译期处决，直面分支）。
+// ============================================================================
+
+#[derive(Debug, Clone)]
+export struct Message {
+    role: String,
+    content: String,
+}
+
+impl Message {
+    fn system(text: String) -> Message {
+        Message { role: String::from("system"), content: text }
+    }
+
+    fn user(text: String) -> Message {
+        Message { role: String::from("user"), content: text }
+    }
+
+    fn assistant(text: String) -> Message {
+        Message { role: String::from("assistant"), content: text }
+    }
+
+    fn tool(text: String) -> Message {
+        Message { role: String::from("tool"), content: text }
+    }
+}
+
+/// 工具词汇：模型可调用的全部动作（封闭枚举——新增工具必须显式扩这里）。
+/// 对应 deepseek-harness tools 包注册表的可调用面。
+#[derive(Debug, Clone)]
+export enum ToolCall {
+    ReadFile { path: String },
+    WriteFile { path: String, content: String },
+    EditFile { path: String, old_text: String, new_text: String },
+    Bash { command: String },
+    ListFiles,
+}
+
+impl ToolCall {
+    /// 工具名（schema 注入 / 守卫审计共用）。
+    fn name(self) -> String {
+        match self {
+            ToolCall::ReadFile { path: _ } => String::from("read_file"),
+            ToolCall::WriteFile { path: _, content: _ } => String::from("write_file"),
+            ToolCall::EditFile { path: _, old_text: _, new_text: _ } => String::from("edit_file"),
+            ToolCall::Bash { command: _ } => String::from("bash"),
+            ToolCall::ListFiles => String::from("list_files"),
+        }
+    }
+}
+
+/// 工具执行结果（observation 回填 transcript + append 进 session log）。
+#[derive(Debug, Clone)]
+export struct ToolResult {
+    call: String,
+    ok: bool,
+    output: String,
+    duration_ms: u64,
+}
+
+impl ToolResult {
+    fn observation(self) -> Message {
+        let mut text = String::from("[tool ");
+        text.push_str(self.call.as_str());
+        text.push_str("]");
+        if self.ok {
+            text.push_str(" ok\n");
+        } else {
+            text.push_str(" FAILED\n");
+        }
+        text.push_str(self.output.as_str());
+        Message::tool(text)
+    }
+
+    /// 单行摘要（run.json 机器可读出口）。
+    fn summary_line(self) -> String {
+        let status = if self.ok { "ok" } else { "FAIL" };
+        format!("{} [{}] {} chars, {} ms", self.call, status, self.output.len(), self.duration_ms)
+    }
+}
+
+/// 模型回合词汇：主循环的两类出口。
+#[derive(Debug, Clone)]
+export enum Action {
+    Tool { call: ToolCall },
+    Done { summary: String },
+}
+
+/// 审查裁决词汇（review 闸门）。
+#[derive(Debug, Clone)]
+export enum Verdict {
+    Accept,
+    Revise { note: String },
+}
+
+/// 拓扑边事件词汇（edge on Guard 用，G5 枚举变体 guard）。
+#[derive(Debug, Clone)]
+export enum Step {
+    ToolRequested,
+    Observed,
+    TurnLogged,
+    ReviewRequested,
+    BudgetExhausted,
+}

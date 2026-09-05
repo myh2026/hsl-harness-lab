@@ -1,0 +1,73 @@
+// ============================================================================
+// stanzaweaver/providers/poet.hsl — 模型提供方：真实 LLM / 剧本双实现
+// ============================================================================
+// StanzaWeaver 原架构对应：agents/base.py 的 LLM 客户端（writer/checker
+// 可独立配置不同端点）。HSL 侧：PoetModel trait（writer/checker 双轨道
+// fixture 或 $host.llm 网关）。
+// ============================================================================
+
+import { ModelError } from "../types/errors.hsl";
+
+/// 诗人模型契约：writer 与 checker 共用，track 参数化。
+export trait PoetModel {
+    async fn compose(self, prompt: String) -> Result<String, ModelError>;
+}
+
+/// 真实模型（经 $host.llm 网关）。
+#[capability(net_connect)]
+#[derive(Debug, Clone)]
+export struct LlmPoet {
+    temperature: f64,
+}
+
+impl LlmPoet {
+    fn new(temperature: f64) -> LlmPoet {
+        LlmPoet { temperature }
+    }
+}
+
+impl PoetModel for LlmPoet {
+    async fn compose(self, prompt: String) -> Result<String, ModelError> {
+        let raw: String = native typescript {
+            const r = await $host.llm.complete({
+                messages: [
+                    { role: "user", content: prompt },
+                ],
+                temperature: self.temperature,
+                maxTokens: 1024,
+            });
+            if (r === undefined || r === null) throw new Error("empty completion");
+            return r;
+        };
+        if raw.len() == 0 {
+            Err(ModelError::new(502, String::from("empty completion")))
+        } else {
+            Ok(raw)
+        }
+    }
+}
+
+/// 剧本模型（fixture 轨道驱动）。
+#[derive(Debug, Clone)]
+export struct ScriptedPoet {
+    track: String,
+}
+
+impl ScriptedPoet {
+    fn new(track: String) -> ScriptedPoet {
+        ScriptedPoet { track }
+    }
+}
+
+impl PoetModel for ScriptedPoet {
+    async fn compose(self, prompt: String) -> Result<String, ModelError> {
+        let raw: String = native typescript {
+            return await $host.fixture.next(self.track);
+        };
+        if raw.len() == 0 {
+            Err(ModelError::new(503, String::from("fixture exhausted")))
+        } else {
+            Ok(raw)
+        }
+    }
+}

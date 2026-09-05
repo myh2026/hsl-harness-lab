@@ -1,0 +1,83 @@
+// ============================================================================
+// franxagent/tools/search.hsl — search 工具（DuckDuckGo 免费网页检索）
+// ============================================================================
+// FranxAgent 原架构对应：knowledge/tools/search——DuckDuckGo 集成，
+// 无 API key。HSL 侧：native 块内 fetch html.duckduckgo.com（N1：
+// 检索是网络效应，留在 native；结果归一为纯文本清单回填模型）。
+// 离线/被拦时软失败（模型可见，可改道）。
+// ============================================================================
+
+import { ToolOutcome } from "../types/messages.hsl";
+import { FranxConfig } from "../types/state.hsl";
+import { cap_chars } from "./cap.hsl";
+
+/// search 工具：DuckDuckGo HTML 端点检索（title + snippet + link）。
+#[capability(net_connect)]
+export fn tool_search(config: FranxConfig, call_id: String, query: String, max_results: u32) -> ToolOutcome {
+    let r = native typescript {
+        try {
+            const url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query);
+            const res = await fetch(url, {
+                headers: { "User-Agent": "Mozilla/5.0 (compatible; FranxAgentHSL/1.0)" },
+                signal: AbortSignal.timeout(15000),
+            });
+            if (!res.ok) return { ok: false, error: "HTTP " + res.status, body: "" };
+            const html = await res.text();
+            return { ok: true, error: "", body: html };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e), body: "" };
+        }
+    };
+    if r.ok == false {
+        return ToolOutcome {
+            call_id,
+            tool: String::from("search"),
+            ok: false,
+            output: format!("search failed: {}", r.error),
+            proposal: Option::None,
+        };
+    }
+    let results = extract_results(r.body, max_results);
+    if results.len() == 0 {
+        ToolOutcome {
+            call_id,
+            tool: String::from("search"),
+            ok: true,
+            output: format!("no results for \"{}\"", query),
+            proposal: Option::None,
+        }
+    } else {
+        let mut out = String::from("");
+        for pair in results.enumerate() {
+            out.push_str(format!("{}. {}\n", pair[0] + 1, pair[1]).as_str());
+        }
+        ToolOutcome {
+            call_id,
+            tool: String::from("search"),
+            ok: true,
+            output: cap_chars(out, config.max_output_chars),
+            proposal: Option::None,
+        }
+    }
+}
+
+/// 从 HTML 抽取结果行（native 正则效应；纯文本行回 HSL）。
+fn extract_results(html: String, max_results: u32) -> Vec<String> {
+    let lines: Vec<String> = native typescript {
+        const re = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+        const out = [];
+        let m;
+        while ((m = re.exec(html)) !== null) {
+            const href = m[1];
+            const title = m[2].replace(/<[^>]+>/g, "").trim();
+            const uddg = href.indexOf("uddg=");
+            let link = href;
+            if (uddg >= 0) {
+                try { link = decodeURIComponent(href.slice(uddg + 5).split("&")[0]); } catch { }
+            }
+            out.push(title + " — " + link);
+        }
+        return out;
+    };
+    lines.take(max_results)
+}

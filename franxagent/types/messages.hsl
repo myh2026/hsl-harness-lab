@@ -1,0 +1,122 @@
+// ============================================================================
+// franxagent/types/messages.hsl — 消息 / 工具请求 / 工具结果 / 提案（契约层）
+// ============================================================================
+// FranxAgent 原架构对应：agent.py 的 messages 数组（OpenAI 四角色流 +
+// tool_calls 结构）与 USER_GUIDE 的 `tools` 单入口协议。
+// HSL 侧：封闭枚举承载工具词汇；提案（Proposal）是 write 工具
+// proposal-review-overwrite 模式的一等值。
+// ============================================================================
+
+#[derive(Debug, Clone)]
+export struct Message {
+    role: String,
+    content: String,
+}
+
+impl Message {
+    fn system(text: String) -> Message {
+        Message { role: String::from("system"), content: text }
+    }
+
+    fn user(text: String) -> Message {
+        Message { role: String::from("user"), content: text }
+    }
+
+    fn assistant(text: String) -> Message {
+        Message { role: String::from("assistant"), content: text }
+    }
+
+    fn tool(text: String) -> Message {
+        Message { role: String::from("tool"), content: text }
+    }
+}
+
+/// 工具词汇：`tools` 单入口协议的内层工具（封闭枚举，S6）。
+/// 与 FranxAgent 内建五件套对齐：read / write / command / search / add_skill。
+#[derive(Debug, Clone)]
+export enum ToolCall {
+    Read { path: String },
+    Write { path: String, content: String, mode: String, start_line: u32, end_line: u32 },
+    Command { command: String },
+    Search { query: String, max_results: u32 },
+    AddSkill { name: String, content: String },
+}
+
+impl ToolCall {
+    /// 工具名（协议解析 / 审计共用）。
+    fn name(self) -> String {
+        match self {
+            ToolCall::Read { path: _ } => String::from("read"),
+            ToolCall::Write { path: _, content: _, mode: _, start_line: _, end_line: _ } => String::from("write"),
+            ToolCall::Command { command: _ } => String::from("command"),
+            ToolCall::Search { query: _, max_results: _ } => String::from("search"),
+            ToolCall::AddSkill { name: _, content: _ } => String::from("add_skill"),
+        }
+    }
+}
+
+/// 工具请求（模型的一次 tool_call；纠偏后的规范化形态）。
+/// FranxAgent 纠偏语义：模型直接调用内建工具名时自动包装为 tools 协议。
+#[derive(Debug, Clone)]
+export struct ToolRequest {
+    id: String,
+    tool: ToolCall,
+}
+
+/// 工具执行结果（软失败反馈模型；不终止会话）。
+#[derive(Debug, Clone)]
+export struct ToolOutcome {
+    call_id: String,
+    tool: String,
+    ok: bool,
+    output: String,
+    proposal: Option<Proposal>,
+}
+
+impl ToolOutcome {
+    /// 回填转录的 tool 消息（OpenAI 风格 tool 角色）。
+    fn to_message(self) -> Message {
+        let mut text = String::from("[tool ");
+        text.push_str(self.tool.as_str());
+        text.push_str("]");
+        if self.ok {
+            text.push_str(" ok\n");
+        } else {
+            text.push_str(" FAILED\n");
+        }
+        text.push_str(self.output.as_str());
+        Message::tool(text)
+    }
+}
+
+/// write 提案（proposal-review-overwrite 模式的一等值）。
+/// v5.0.0 核心语义：write 不落盘，产出完整文件内容提案，
+/// 审查闸门批准后才写盘并回填模型。
+#[derive(Debug, Clone)]
+export struct Proposal {
+    path: String,
+    mode: String,
+    before: String,
+    after: String,
+}
+
+impl Proposal {
+    /// 提案渲染（审查面板的文本化身：前后对照）。
+    fn render(self) -> String {
+        format!(
+            "proposal {} ({}):\n--- before ({} chars) ---\n{}\n--- after ({} chars) ---\n{}",
+            self.path, self.mode, self.before.len(), self.before, self.after.len(), self.after
+        )
+    }
+}
+
+/// 会话轮词汇（edge on Guard 用，G5）。
+#[derive(Debug, Clone)]
+export enum Turn {
+    ToolCalled,
+    Observed,
+    ProposalReady,
+    Remembered,
+    Replied,
+    BudgetExhausted,
+}

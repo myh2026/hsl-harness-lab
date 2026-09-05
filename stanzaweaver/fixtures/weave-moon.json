@@ -1,0 +1,15 @@
+{
+  "tracks": {
+    "writer": [
+      "以月夜江天为轴：远山静默，一舟横渡，寒烟笼月，夜雪将至。孤清而不哀，收在一句雪夜守楼的画面上。",
+      "月夜江天远\n云山落日舟\n月江烟寒对\n夜雪静寒楼",
+      "{\"tool\": \"search_words\", \"query\": \"江天寒月烟\", \"tone\": \"平\", \"limit\": 8}",
+      "{\"tool\": \"refine_line\", \"line\": 2, \"new_text\": \"月江烟寒对\"}",
+      "{\"tool\": \"refine_line\", \"line\": 2, \"new_text\": \"烟江寒对月\"}",
+      "{\"tool\": \"submit\", \"title\": \"江夜\"}"
+    ],
+    "checker": [
+      "{\"pass\": true}"
+    ]
+  }
+}

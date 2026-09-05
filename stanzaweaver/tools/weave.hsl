@@ -1,0 +1,219 @@
+// ============================================================================
+// stanzaweaver/tools/weave.hsl — 四工具：search_words / refine_line /
+//                                rewrite / submit（tools-as-interface）
+// ============================================================================
+// StanzaWeaver 原架构对应：tools/__init__.py 的 WRITER_TOOLS。核心设计：
+// 「AI 不能输出自由文本冒充完成；只能调用四个结构化工具」。
+// HSL 侧：封闭枚举 WeaveCall + WeaveOutcome；每次改动即触发符号层
+// 全量校验（validate_full），违规拒绝修改并回传具体错误。
+// ============================================================================
+
+import { PoemState } from "../types/poem.hsl";
+import { Lexicon } from "../prosody/lexicon.hsl";
+import { validate_full, validate_line } from "../prosody/validator.hsl";
+
+/// 织造工具词汇（封闭枚举，S6）。
+#[derive(Debug, Clone)]
+export enum WeaveCall {
+    SearchWords { query: String, tone: String, rhyme: String, limit: u32 },
+    RefineLine { line: u32, new_text: String },
+    Rewrite { instruction: String },
+    Submit { title: String },
+}
+
+impl WeaveCall {
+    fn name(self) -> String {
+        match self {
+            WeaveCall::SearchWords { query: _, tone: _, rhyme: _, limit: _ } => String::from("search_words"),
+            WeaveCall::RefineLine { line: _, new_text: _ } => String::from("refine_line"),
+            WeaveCall::Rewrite { instruction: _ } => String::from("rewrite"),
+            WeaveCall::Submit { title: _ } => String::from("submit"),
+        }
+    }
+}
+
+/// 工具执行结果（observation 回填 writer 上下文）。
+#[derive(Debug, Clone)]
+export struct WeaveOutcome {
+    tool: String,
+    ok: bool,
+    output: String,
+    draft: Vec<String>,
+    submitted: bool,
+    title: String,
+}
+
+impl WeaveOutcome {
+    /// 渲染为 writer 上下文消息。
+    fn render(self) -> String {
+        let status = if self.ok { "ok" } else { "FAILED" };
+        format!("[tool {}] {}\n{}", self.tool, status, self.output)
+    }
+}
+
+/// 工具执行器：携带诗稿状态的织造工具箱（Step 3 ReAct 循环的执行臂）。
+#[derive(Debug, Clone)]
+export struct WeaveKit {
+    lexicon: Lexicon,
+}
+
+impl WeaveKit {
+    fn new(lexicon: Lexicon) -> WeaveKit {
+        WeaveKit { lexicon }
+    }
+
+    /// 执行一次工具调用（改动即全量校验——符号层铁律）。
+    fn execute(self, state: PoemState, call: WeaveCall) -> WeaveOutcome {
+        match call {
+            WeaveCall::SearchWords { query, tone, rhyme, limit } => {
+                let results = self.lexicon.clone().search(query.clone(), tone, rhyme, limit);
+                if results.len() == 0 {
+                    WeaveOutcome {
+                        tool: String::from("search_words"),
+                        ok: true,
+                        output: String::from("(no candidates)"),
+                        draft: state.draft.clone(),
+                        submitted: false,
+                        title: String::from(""),
+                    }
+                } else {
+                    let mut out = String::from("");
+                    for pair in results.enumerate() {
+                        out.push_str(format!("{}. {}\n", pair[0] + 1, pair[1]).as_str());
+                    }
+                    WeaveOutcome {
+                        tool: String::from("search_words"),
+                        ok: true,
+                        output: out,
+                        draft: state.draft.clone(),
+                        submitted: false,
+                        title: String::from(""),
+                    }
+                }
+            },
+            WeaveCall::RefineLine { line, new_text } => {
+                refine_line(self, state, line, new_text)
+            },
+            WeaveCall::Rewrite { instruction: _ } => {
+                // 整体重写：writer 上下文已含 instruction；这里只回显确认，
+                // 新稿由 writer 的下一轮 tool 调用（refine_line）或对话产出。
+                WeaveOutcome {
+                    tool: String::from("rewrite"),
+                    ok: true,
+                    output: String::from("rewrite instruction applied; produce new lines via refine_line"),
+                    draft: state.draft.clone(),
+                    submitted: false,
+                    title: String::from(""),
+                }
+            },
+            WeaveCall::Submit { title } => {
+                // 提交：先全量格律校验，通过才受理（否则拒绝并回传错误）
+                let report = validate_full(state.template.clone(), self.lexicon.clone(), state.draft.clone());
+                if report.valid {
+                    WeaveOutcome {
+                        tool: String::from("submit"),
+                        ok: true,
+                        output: format!("accepted ({} lines, meter valid)", state.draft.len()),
+                        draft: state.draft.clone(),
+                        submitted: true,
+                        title,
+                    }
+                } else {
+                    let mut out = String::from("rejected — meter violations:\n");
+                    for v in report.violations {
+                        out.push_str(format!("- {}\n", v).as_str());
+                    }
+                    out.push_str("请继续炼句（refine_line）后再次 submit。");
+                    WeaveOutcome {
+                        tool: String::from("submit"),
+                        ok: false,
+                        output: out,
+                        draft: state.draft.clone(),
+                        submitted: false,
+                        title: String::from(""),
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// refine_line：整句替换 + 立即单行校验（该句音节数 + 逐位平仄；
+/// 不通过则拒绝修改——与原实现语义一致；全量校验在 submit 时执行）。
+fn refine_line(kit: WeaveKit, state: PoemState, line: u32, new_text: String) -> WeaveOutcome {
+    if line >= state.draft.len() {
+        return WeaveOutcome {
+            tool: String::from("refine_line"),
+            ok: false,
+            output: format!("行号 {} 越界（现有 {} 行，0 起算）", line, state.draft.len()),
+            draft: state.draft.clone(),
+            submitted: false,
+            title: String::from(""),
+        };
+    }
+    let report = validate_line(state.template.clone(), kit.lexicon.clone(), line, new_text.clone());
+    if report.valid {
+        let mut new_draft = state.draft.clone();
+        new_draft.remove(line);
+        new_draft.insert(line, new_text.clone());
+        WeaveOutcome {
+            tool: String::from("refine_line"),
+            ok: true,
+            output: format!("line {} → \"{}\" (line meter valid)", line, new_text),
+            draft: new_draft,
+            submitted: false,
+            title: String::from(""),
+        }
+    } else {
+        let mut out = String::from("refused — line meter violations:\n");
+        for v in report.violations {
+            out.push_str(format!("- {}\n", v).as_str());
+        }
+        out.push_str("修改未生效；请调整后重试。");
+        WeaveOutcome {
+            tool: String::from("refine_line"),
+            ok: false,
+            output: out,
+            draft: state.draft.clone(),
+            submitted: false,
+            title: String::from(""),
+        }
+    }
+}
+
+/// 模型输出 → WeaveCall（严格 JSON 协议；N2 类型纪律）。
+export fn parse_weave_call(raw: String) -> Result<WeaveCall, String> {
+    let fields: HashMap<String, String> = native typescript {
+        try {
+            return $host.json.fields(raw);
+        } catch (e) {
+            const m = new Map();
+            m.set("error", String(e && e.message || e));
+            return m;
+        }
+    };
+    if fields.contains_key("error") {
+        let detail = fields.get("error").unwrap_or(String::from("?"));
+        return Err(format!("工具输出不是合法 JSON：{}", detail));
+    }
+    let tool = fields.get("tool").unwrap_or(String::from(""));
+    if tool == String::from("search_words") {
+        Ok(WeaveCall::SearchWords {
+            query: fields.get("query").unwrap_or(String::from("")),
+            tone: fields.get("tone").unwrap_or(String::from("")),
+            rhyme: fields.get("rhyme").unwrap_or(String::from("")),
+            limit: fields.get("limit").unwrap_or(String::from("20")).parse::<u32>()?,
+        })
+    } else if tool == String::from("refine_line") {
+        Ok(WeaveCall::RefineLine {
+            line: fields.get("line").unwrap_or(String::from("0")).parse::<u32>()?,
+            new_text: fields.get("new_text").unwrap_or(String::from("")),
+        })
+    } else if tool == String::from("rewrite") {
+        Ok(WeaveCall::Rewrite { instruction: fields.get("instruction").unwrap_or(String::from("")) })
+    } else if tool == String::from("submit") {
+        Ok(WeaveCall::Submit { title: fields.get("title").unwrap_or(String::from("")) })
+    } else {
+        Err(format!("未知工具 \"{}\"（可用：search_words / refine_line / rewrite / submit）", tool))
+    }
+}

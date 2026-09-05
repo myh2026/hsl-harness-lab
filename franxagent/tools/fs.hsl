@@ -1,0 +1,164 @@
+// ============================================================================
+// franxagent/tools/fs.hsl — read（行号全文）+ write（提案-审查-批准模式）
+// ============================================================================
+// FranxAgent 原架构对应：knowledge/tools/read + write。
+// v5.0.0 核心语义：write 不落盘——读取原文件，按 mode（overwrite /
+// insert / edit）计算应用后的完整内容，作为提案（Proposal）返回，
+// 审查闸门批准后才写盘（N1：native 只做 fs 效应；三模式纯 HSL）。
+// ============================================================================
+
+import { ToolOutcome, Proposal } from "../types/messages.hsl";
+import { FranxConfig } from "../types/state.hsl";
+import { ToolCall } from "../types/messages.hsl";
+import { cap_chars } from "./cap.hsl";
+
+/// read 工具：带行号全文（模型按行号定位 write edit 模式的目标区间）。
+#[capability(file_read)]
+export fn tool_read(config: FranxConfig, call_id: String, path: String) -> ToolOutcome {
+    let r = native typescript {
+        try {
+            const body = await $host.fs.read(path);
+            return { ok: true, body, error: "" };
+        } catch (e) {
+            return { ok: false, body: "", error: String(e && e.message || e) };
+        }
+    };
+    if r.ok {
+        let numbered = number_lines(r.body);
+        ToolOutcome {
+            call_id,
+            tool: String::from("read"),
+            ok: true,
+            output: cap_chars(numbered, config.max_output_chars),
+            proposal: Option::None,
+        }
+    } else {
+        ToolOutcome {
+            call_id,
+            tool: String::from("read"),
+            ok: false,
+            output: r.error,
+            proposal: Option::None,
+        }
+    }
+}
+
+/// write 工具：提案模式（不落盘）。
+/// 读取原文件 → 按 mode 计算完整内容 → Proposal 返回。
+/// insert：start_line>0 时插到该行之后，否则追加文件末尾；
+/// edit：替换 [start_line, end_line] 闭区间（1 起算）。
+#[capability(file_read)]
+export fn tool_write_propose(config: FranxConfig, call_id: String, call: ToolCall) -> ToolOutcome {
+    if let ToolCall::Write { path, content, mode, start_line, end_line } = call {
+        let r = native typescript {
+            try {
+                const body = await $host.fs.read(path);
+                return { ok: true, body, error: "" };
+            } catch (e) {
+                return { ok: true, body: "", error: "" };
+            }
+        };
+        let before = r.body;
+        let after = apply_write_mode(before.clone(), content.clone(), mode.clone(), start_line, end_line);
+        let proposal = Proposal { path: path.clone(), mode: mode.clone(), before, after: after.clone() };
+        let mut output = String::from("write proposal ready (review required):\n");
+        output.push_str(proposal.clone().render().as_str());
+        ToolOutcome {
+            call_id,
+            tool: String::from("write"),
+            ok: true,
+            output: cap_chars(output, config.max_output_chars),
+            proposal: Option::Some(proposal),
+        }
+    } else {
+        ToolOutcome {
+            call_id,
+            tool: String::from("write"),
+            ok: false,
+            output: String::from("internal: 非 write 调用进入 write 工具"),
+            proposal: Option::None,
+        }
+    }
+}
+
+/// 提案批准后的落盘效应（审查闸门调用；这是唯一写盘路径）。
+#[capability(file_write)]
+export fn apply_proposal(proposal: Proposal) -> Result<ToolOutcome, String> {
+    let path = proposal.path.clone();
+    let after = proposal.after.clone();
+    let r = native typescript {
+        try {
+            $host.fs.write(path, after);
+            return { ok: true, error: "" };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e) };
+        }
+    };
+    if r.ok {
+        Ok(ToolOutcome {
+            call_id: String::from("apply"),
+            tool: String::from("write"),
+            ok: true,
+            output: format!("approved & wrote {} ({} chars)", proposal.path, proposal.after.len()),
+            proposal: Option::None,
+        })
+    } else {
+        Ok(ToolOutcome {
+            call_id: String::from("apply"),
+            tool: String::from("write"),
+            ok: false,
+            output: format!("write failed: {}", r.error),
+            proposal: Option::None,
+        })
+    }
+}
+
+/// 三模式内容计算（纯 HSL；proposal 语义的核心）。
+fn apply_write_mode(before: String, content: String, mode: String, start_line: u32, end_line: u32) -> String {
+    if mode == String::from("overwrite") {
+        content
+    } else if mode == String::from("insert") {
+        if start_line <= 0 {
+            if before.len() > 0 {
+                if before.ends_with(String::from("\n")) == false {
+                    return before + "\n" + content;
+                }
+            }
+            before + content
+        } else {
+            let lines = before.lines();
+            let mut out: Vec<String> = Vec::new();
+            for pair in lines.enumerate() {
+                out.push(pair[1].clone());
+                if pair[0] + 1 == start_line {
+                    out.push(content.clone());
+                }
+            }
+            out.join("\n")
+        }
+    } else {
+        // edit：替换 [start_line, end_line]（1 起算，闭区间）
+        let lines = before.lines();
+        let mut out: Vec<String> = Vec::new();
+        for pair in lines.enumerate() {
+            let line_no = pair[0] + 1;
+            if line_no == start_line {
+                out.push(content.clone());
+            } else {
+                if line_no < start_line || line_no > end_line {
+                    out.push(pair[1].clone());
+                }
+            }
+        }
+        out.join("\n")
+    }
+}
+
+/// 行号渲染（read 输出格式）。
+fn number_lines(text: String) -> String {
+    let mut out = String::from("");
+    for pair in text.lines().enumerate() {
+        out.push_str(format!("{} | {}\n", pair[0] + 1, pair[1]).as_str());
+    }
+    out
+}

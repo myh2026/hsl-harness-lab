@@ -1,0 +1,51 @@
+// ============================================================================
+// dsh/core/session.hsl — SessionLog：append-only 会话事件日志
+// ============================================================================
+// deepseek-harness 原架构对应：session 包——「每个 agent 的 history 都从
+// 事件日志派生；日志只追加，不修改」。HSL 侧：SessionLog 结构 + append /
+// replay / len，历史上已发生的事实永不改写（S7 不可变优先精神）。
+// ============================================================================
+
+import { SessionEvent } from "../types/events.hsl";
+
+/// append-only 会话日志。
+/// 不变式：一旦写入，任何路径都不修改既有条目（只有 push）。
+#[derive(Debug, Clone)]
+export struct SessionLog {
+    session_id: String,
+    events: Vec<SessionEvent>,
+}
+
+impl SessionLog {
+    fn new(session_id: String) -> SessionLog {
+        SessionLog { session_id, events: Vec::new() }
+    }
+
+    /// 追加一个事实（唯一写入口）。
+    fn append(mut self, event: SessionEvent) -> SessionLog {
+        self.events.push(event);
+        self
+    }
+
+    /// 事件条数（报告出口用）。
+    fn len(self) -> u32 {
+        self.events.len()
+    }
+
+    /// 会话 ID（产物命名用）。
+    fn id(self) -> String {
+        self.session_id
+    }
+
+    /// 全量回放（人读渲染，逐行）。
+    fn replay(self) -> Vec<String> {
+        self.events.map(|e| e.render())
+    }
+
+    /// 尾部 N 条（调试窗口）。
+    fn tail(self, n: u32) -> Vec<String> {
+        let total = self.events.len();
+        let skip = if total > n { total - n } else { 0 };
+        self.events.skip(skip).map(|e| e.render())
+    }
+}

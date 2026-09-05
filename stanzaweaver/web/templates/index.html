@@ -1,0 +1,1251 @@
+<!-- Copyright (c) 2026 xhdlphzr -->
+<!-- SPDX-License-Identifier: MIT -->
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StanzaWeaver</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Alex+Brush&family=JetBrains+Mono:ital,wght@0,400;0,500&family=Noto+Serif+SC:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script>
+      var I18N = {};
+      var CURRENT_LANG = "en";
+      function t(key, args) {
+        var parts = key.split(".");
+        var val = I18N;
+        for (var i = 0; i < parts.length; i++) {
+          if (val === undefined || val === null) return key;
+          val = val[parts[i]];
+        }
+        if (val === undefined || val === null) return key;
+        if (args) {
+          Object.keys(args).forEach(function (k) {
+            val = val.replace(new RegExp("\\{" + k + "\\}", "g"), args[k]);
+          });
+        }
+        return val;
+      }
+      function applyI18N() {
+        document.querySelectorAll("[data-i18n]").forEach(function (el) {
+          var v = t(el.getAttribute("data-i18n"));
+          if (v !== el.getAttribute("data-i18n")) el.textContent = v;
+        });
+        document
+          .querySelectorAll("[data-i18n-placeholder]")
+          .forEach(function (el) {
+            var v = t(el.getAttribute("data-i18n-placeholder"));
+            if (v !== el.getAttribute("data-i18n-placeholder"))
+              el.placeholder = v;
+          });
+        document.querySelectorAll("[data-i18n-title]").forEach(function (el) {
+          var v = t(el.getAttribute("data-i18n-title"));
+          if (v !== el.getAttribute("data-i18n-title")) el.title = v;
+        });
+        document.documentElement.lang = t("html.lang");
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app">
+      <div id="import-overlay" class="import-overlay">
+        <div class="import-overlay-content">
+          <div class="import-spinner"></div>
+          <p data-i18n="import_overlay">导入词库中，请稍候...</p>
+        </div>
+      </div>
+      <header>
+        <div class="header-logo">
+          <h1>StanzaWeaver</h1>
+          <p class="slogan" data-i18n="header.slogan">以智识，巧织诗</p>
+        </div>
+        <div class="header-right">
+          <button
+            id="btn-ping"
+            class="btn-ping"
+            data-i18n-title="header.ping_title"
+            title="检查连接"
+          >
+            &#8635;
+          </button>
+          <span class="ai-status-label">AI</span>
+          <span id="llm-status-dot" class="llm-dot"></span>
+          <span id="llm-status-text" class="llm-status-text"></span>
+          <button
+            id="btn-config"
+            class="btn-icon"
+            data-i18n-title="header.config_title"
+            title="LLM配置"
+          >
+            &#9881;
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section class="input-section">
+          <div class="field">
+            <label data-i18n="topic.label">主题</label>
+            <textarea
+              id="topic"
+              data-i18n-placeholder="topic.placeholder"
+              placeholder="输入你想写的诗歌主题...也可以粘贴一首诗让AI帮忙修改"
+            ></textarea>
+          </div>
+          <div class="field field-inline">
+            <label data-i18n="template.label">格律</label>
+            <select id="template-select">
+              <option value="" data-i18n="template.default_option">
+                -- 选择模板 --
+              </option>
+            </select>
+            <button
+              id="btn-custom-template"
+              class="btn-secondary btn-small"
+              data-i18n="template.custom"
+            >
+              + 自定义
+            </button>
+          </div>
+          <div class="actions">
+            <button
+              id="btn-generate"
+              class="btn-primary"
+              disabled
+              data-i18n="generate.button"
+            >
+              开始生成
+            </button>
+          </div>
+        </section>
+
+        <section id="progress-section" class="hidden card">
+          <div class="section-header" data-i18n="progress.title">生成进度</div>
+          <div id="progress-list"></div>
+        </section>
+
+        <section id="poem-section" class="hidden card">
+          <div class="section-header-row">
+            <span class="section-header" data-i18n="poem.title">诗稿</span>
+            <button
+              id="btn-copy"
+              class="btn-copy"
+              data-i18n-title="poem.copy_title"
+              title="复制诗稿"
+            >
+              &#128203;
+            </button>
+            <button
+              id="btn-history"
+              class="btn-history-link"
+              data-i18n-title="poem.history_title"
+              title="历史记录"
+            >
+              &#128220;
+            </button>
+          </div>
+          <div id="poem-display"></div>
+          <div id="checker-inline" class="checker-inline hidden"></div>
+          <div id="tool-status" class="tool-status hidden"></div>
+        </section>
+
+        <section id="feedback-section" class="hidden card">
+          <div class="feedback-buttons">
+            <button
+              id="btn-accept"
+              class="btn-accept"
+              data-i18n="review.accept"
+            >
+              定稿
+            </button>
+            <button
+              id="btn-reject"
+              class="btn-reject"
+              data-i18n="review.reject"
+            >
+              不定稿
+            </button>
+          </div>
+          <div id="feedback-input-area" class="hidden">
+            <div class="field">
+              <input
+                type="text"
+                id="user-feedback"
+                data-i18n-placeholder="feedback.placeholder"
+                placeholder="输入修改意见..."
+              />
+            </div>
+            <button
+              id="btn-feedback"
+              class="btn-send"
+              disabled
+              data-i18n="feedback.button"
+            >
+              发送反馈
+            </button>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="config-modal" class="modal hidden">
+      <div class="modal-content">
+        <h2 data-i18n="config_modal.title">LLM 配置</h2>
+        <div class="config-group">
+          <label
+            ><span data-i18n="config_modal.language">语言</span>
+            <select id="cfg-language">
+              <option value="zh" data-i18n="config_modal.lang_zh">汉语</option>
+              <option value="en" data-i18n="config_modal.lang_en">英语</option>
+            </select>
+          </label>
+        </div>
+        <div class="config-group">
+          <label>Base URL <input type="text" id="cfg-writer-url" /></label>
+          <label>API Key <input type="password" id="cfg-writer-key" /></label>
+          <label>Model <input type="text" id="cfg-writer-model" /></label>
+        </div>
+        <div class="config-group">
+          <h3 data-i18n="config_modal.checker">检查AI</h3>
+          <label>Base URL <input type="text" id="cfg-checker-url" /></label>
+          <label>API Key <input type="password" id="cfg-checker-key" /></label>
+          <label>Model <input type="text" id="cfg-checker-model" /></label>
+        </div>
+        <div class="modal-actions">
+          <button
+            id="btn-save-config"
+            class="btn-primary"
+            data-i18n="config_modal.save"
+          >
+            保存
+          </button>
+          <button
+            id="btn-close-config"
+            class="btn-secondary"
+            data-i18n="config_modal.cancel"
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="history-modal" class="modal hidden">
+      <div class="modal-content modal-wide">
+        <h2 data-i18n="history_modal.title">历史记录</h2>
+        <div id="history-list" class="history-list"></div>
+        <div class="modal-actions">
+          <button
+            id="btn-close-history"
+            class="btn-secondary"
+            data-i18n="history_modal.close"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="template-modal" class="modal hidden">
+      <div class="modal-content modal-wide">
+        <h2 data-i18n="template_modal.title">自定义格律模板</h2>
+        <div class="config-group">
+          <label
+            ><span data-i18n="template_modal.name_label">模板名称</span>
+            <input
+              type="text"
+              id="tmpl-name"
+              data-i18n-placeholder="template_modal.name_placeholder"
+              placeholder="如：浣溪沙"
+          /></label>
+        </div>
+        <div class="config-group config-row">
+          <label
+            ><span data-i18n="template_modal.language_label">语言</span>
+            <select id="tmpl-language">
+              <option value="zh" data-i18n="template_modal.lang_zh">
+                汉语
+              </option>
+              <option value="en" data-i18n="template_modal.lang_en">
+                英语
+              </option>
+              <option value="fr" data-i18n="template_modal.lang_fr">
+                法语
+              </option>
+              <option value="it" data-i18n="template_modal.lang_it">
+                意大利语
+              </option>
+              <option value="la" data-i18n="template_modal.lang_la">
+                古典拉丁语
+              </option>
+            </select>
+          </label>
+          <label
+            ><span data-i18n="template_modal.lines_label">行数</span>
+            <input type="number" id="tmpl-lines" value="4" min="1" max="30"
+          /></label>
+          <label
+            ><span data-i18n="template_modal.syllables_label">每行音节</span>
+            <input
+              type="text"
+              id="tmpl-syl-per-line"
+              value="7,7,7,7"
+              data-i18n-placeholder="template_modal.syllables_placeholder"
+              placeholder="逗号分隔"
+          /></label>
+        </div>
+        <div class="config-group">
+          <div
+            class="section-header"
+            style="margin-top: 8px"
+            data-i18n="template_modal.constraints_title"
+          >
+            每行音节约束
+          </div>
+          <div id="tmpl-syllable-table" class="syllable-table"></div>
+        </div>
+        <div class="config-group">
+          <label data-i18n="template_modal.custom_code_label"
+            >自定义检测代码（Python，可选）</label
+          >
+          <div id="tmpl-code" class="code-editor"></div>
+        </div>
+        <div class="modal-actions">
+          <button
+            id="btn-create-template"
+            class="btn-primary"
+            data-i18n="template_modal.create"
+          >
+            生成模板
+          </button>
+          <button
+            id="btn-close-template"
+            class="btn-secondary"
+            data-i18n="template_modal.cancel"
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
+    <script>
+      const socket = io();
+      const CSRF_TOKEN = "{{ csrf_token }}";
+      function csrfHeaders() {
+        return { "X-CSRF-Token": CSRF_TOKEN };
+      }
+      let isGenerating = false;
+      let llmDisabled = true;
+      let lastPoem = [];
+      let currentStep = "";
+      var STEP_NAMES = {
+        1: "生成描述",
+        2: "生成初稿",
+        3: "炼句优化",
+        4: "终审",
+      };
+      const STEP_ORDER = [1, 2, 3, 4];
+
+      function applyButtonStates() {
+        var gen = document.getElementById("btn-generate");
+        gen.disabled = llmDisabled || isGenerating;
+        if (isGenerating) {
+          gen.classList.add("is-loading");
+          gen.textContent = t("generate.loading") || "生成中...";
+        } else {
+          gen.classList.remove("is-loading");
+          gen.textContent = t("generate.button");
+        }
+        document.getElementById("btn-feedback").disabled = llmDisabled;
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        fetch("/api/config", { headers: csrfHeaders() })
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (cfg) {
+            CURRENT_LANG = cfg.language || "zh";
+            return fetch("/api/i18n/" + CURRENT_LANG);
+          })
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (data) {
+            I18N = data;
+            STEP_NAMES[1] = t("steps.step1_description");
+            STEP_NAMES[2] = t("steps.step2_draft");
+            STEP_NAMES[3] = t("steps.step3_refine");
+            STEP_NAMES[4] = t("steps.step4_check");
+            applyI18N();
+            loadTemplates();
+          });
+
+        document
+          .getElementById("btn-generate")
+          .addEventListener("click", startGenerate);
+        document
+          .getElementById("btn-feedback")
+          .addEventListener("click", sendFeedback);
+        document
+          .getElementById("btn-reject")
+          .addEventListener("click", showFeedbackInput);
+        document
+          .getElementById("btn-accept")
+          .addEventListener("click", acceptFinal);
+        document
+          .getElementById("btn-config")
+          .addEventListener("click", openConfig);
+        document
+          .getElementById("btn-ping")
+          .addEventListener("click", manualPing);
+        document
+          .getElementById("btn-close-config")
+          .addEventListener("click", closeConfig);
+        document
+          .getElementById("btn-save-config")
+          .addEventListener("click", saveConfig);
+        document
+          .getElementById("btn-custom-template")
+          .addEventListener("click", openTemplateModal);
+        document
+          .getElementById("btn-create-template")
+          .addEventListener("click", createTemplate);
+        document
+          .getElementById("btn-close-template")
+          .addEventListener("click", closeTemplateModal);
+        document.getElementById("btn-copy").addEventListener("click", copyPoem);
+        document
+          .getElementById("btn-history")
+          .addEventListener("click", openHistory);
+        document
+          .getElementById("btn-close-history")
+          .addEventListener("click", closeHistory);
+
+        const topicEl = document.getElementById("topic");
+        topicEl.addEventListener("input", function () {
+          this.style.height = "0";
+          var h = this.scrollHeight;
+          this.style.height = Math.max(44, Math.min(h, 340)) + "px";
+          this.style.overflowY = h > 340 ? "auto" : "hidden";
+        });
+        document
+          .getElementById("tmpl-lines")
+          .addEventListener("change", function () {
+            const n = parseInt(this.value) || 4;
+            const raw = document
+              .getElementById("tmpl-syl-per-line")
+              .value.trim();
+            const arr = raw
+              ? raw.split(",").map(function (s) {
+                  return parseInt(s.trim()) || 7;
+                })
+              : [];
+            while (arr.length < n)
+              arr.push(arr.length > 0 ? arr[arr.length - 1] : 7);
+            document.getElementById("tmpl-syl-per-line").value = arr
+              .slice(0, n)
+              .join(",");
+            rebuildSyllableTable();
+          });
+        document
+          .getElementById("tmpl-syl-per-line")
+          .addEventListener("change", rebuildSyllableTable);
+        document
+          .getElementById("tmpl-language")
+          .addEventListener("change", refreshTplEditor);
+
+        socket.on("progress", handleProgress);
+        socket.on("done", handleDone);
+        socket.on("error", handleError);
+        socket.on("templates_updated", function () {
+          loadTemplates();
+        });
+        var pollTimer = setInterval(function () {
+          fetch("/api/import-status")
+            .then(function (r) {
+              return r.json();
+            })
+            .then(function (d) {
+              if (!d.importing) {
+                document
+                  .getElementById("import-overlay")
+                  .classList.add("hidden");
+                clearInterval(pollTimer);
+              }
+            });
+        }, 800);
+
+        fetch("/api/llm-status")
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (data) {
+            updateLLMStatus(data);
+          })
+          .catch(function () {
+            applyButtonStates();
+          });
+        socket.on("llm_status", function (data) {
+          updateLLMStatus(data);
+        });
+      });
+
+      function loadTemplates() {
+        fetch("/api/templates")
+          .then((r) => r.json())
+          .then((templates) => {
+            const select = document.getElementById("template-select");
+            select.innerHTML =
+              '<option value="">' + t("template.default_option") + "</option>";
+            templates.forEach((t) => {
+              const opt = document.createElement("option");
+              opt.value = t.key;
+              opt.textContent = t.display_name || t.name;
+              select.appendChild(opt);
+            });
+          });
+      }
+
+      function getSelectedTemplate() {
+        const select = document.getElementById("template-select");
+        const val = select.value;
+        if (!val) return null;
+        return val;
+      }
+
+      function showToast(message, type) {
+        type = type || "info";
+        var container = document.getElementById("toast-container");
+        var toast = document.createElement("div");
+        toast.className = "toast toast-" + type;
+        toast.textContent = message;
+        container.appendChild(toast);
+        requestAnimationFrame(function () {
+          toast.classList.add("toast-show");
+        });
+        setTimeout(function () {
+          toast.classList.remove("toast-show");
+          toast.addEventListener("transitionend", function () {
+            toast.remove();
+          });
+        }, 3000);
+      }
+
+      function updateLLMStatus(data) {
+        var dot = document.getElementById("llm-status-dot");
+        var text = document.getElementById("llm-status-text");
+        dot.className = "llm-dot";
+        text.textContent = "";
+        llmDisabled = true;
+        if (data.writer === "error" || data.checker === "error") {
+          dot.classList.add("llm-dot-error");
+          text.textContent = t("status.connection_failed");
+        } else if (data.writer === "ok" && data.checker === "ok") {
+          dot.classList.add("llm-dot-ok");
+          llmDisabled = false;
+        } else if (data.writer === "checking" || data.checker === "checking") {
+          dot.classList.add("llm-dot-checking");
+        }
+        applyButtonStates();
+      }
+
+      function manualPing() {
+        updateLLMStatus({ writer: "checking", checker: "checking" });
+        fetch("/api/llm-ping", { method: "POST", headers: csrfHeaders() })
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (data) {
+            updateLLMStatus(data);
+          });
+      }
+
+      function startGenerate() {
+        const topic = document.getElementById("topic").value.trim();
+        const templateKey = getSelectedTemplate();
+        if (!topic) {
+          showToast(t("toast.enter_topic"), "warning");
+          return;
+        }
+        if (!templateKey) {
+          showToast(t("toast.select_template"), "warning");
+          return;
+        }
+
+        isGenerating = true;
+        applyButtonStates();
+        document.getElementById("progress-section").classList.remove("hidden");
+        document.getElementById("poem-section").classList.remove("hidden");
+        document.getElementById("feedback-section").classList.add("hidden");
+        document.getElementById("checker-inline").classList.add("hidden");
+        document.getElementById("tool-status").classList.add("hidden");
+        document.getElementById("progress-list").innerHTML = "";
+        document.getElementById("poem-display").innerHTML = "";
+        document.getElementById("feedback-input-area").classList.add("hidden");
+        document.getElementById("user-feedback").value = "";
+        lastPoem = [];
+        currentStep = "";
+        renderedSeqs.clear();
+
+        socket.emit("generate", { topic: topic, template_key: templateKey });
+      }
+
+      function sendFeedback() {
+        const feedback = document.getElementById("user-feedback").value.trim();
+        if (!feedback || isGenerating) return;
+
+        isGenerating = true;
+        applyButtonStates();
+        document.getElementById("checker-inline").classList.add("hidden");
+        document.getElementById("tool-status").classList.add("hidden");
+        document.getElementById("feedback-section").classList.add("hidden");
+        lastPoem = [];
+        currentStep = "";
+        socket.emit("feedback", { feedback: feedback });
+      }
+
+      function showFeedbackInput() {
+        document
+          .getElementById("feedback-input-area")
+          .classList.remove("hidden");
+        document.getElementById("user-feedback").focus();
+      }
+
+      function acceptFinal() {
+        document.getElementById("feedback-section").classList.add("hidden");
+        showToast(t("toast.accept_success"), "success");
+      }
+
+      function updateStepDot(stepKey, state) {
+        const item = document.getElementById("progress-" + stepKey);
+        if (!item) return;
+        const dot = item.querySelector(".step-dot");
+        dot.className = "step-dot " + state;
+      }
+
+      function ensureStepItem(list, stepKey) {
+        let item = document.getElementById("progress-" + stepKey);
+        if (!item) {
+          item = createStepItem(stepKey, STEP_NAMES[stepKey] || stepKey);
+          list.appendChild(item);
+        }
+        return item;
+      }
+
+      const renderedSeqs = new Set();
+
+      function renderStepDetail(list, d) {
+        if (d.seq !== undefined && renderedSeqs.has(d.seq)) return;
+        const item = ensureStepItem(list, d.step);
+        const title = item.querySelector(".step-title");
+        if (d.rounds !== undefined) {
+          title.textContent = (d.title || "") + " (" + d.rounds + ")";
+        } else if (d.title) {
+          title.textContent = d.title;
+        }
+        const body = item.querySelector(".progress-body");
+        body
+          .querySelectorAll(".step-record.pending")
+          .forEach((el) => el.remove());
+        const count =
+          body.querySelectorAll(".step-record:not(.pending)").length + 1;
+        const rec = document.createElement("div");
+        rec.className = "step-record";
+        if (d.content) {
+          const label = document.createElement("div");
+          label.className = "step-record-label";
+          label.textContent =
+            (d.title || "") + (count > 1 ? t("round", { count: count }) : "");
+          rec.appendChild(label);
+          const pre = document.createElement("pre");
+          pre.textContent = d.content;
+          rec.appendChild(pre);
+        }
+        body.appendChild(rec);
+        if (d.seq !== undefined) renderedSeqs.add(d.seq);
+      }
+
+      function handleProgress(data) {
+        const list = document.getElementById("progress-list");
+
+        if (data.step !== currentStep) {
+          const prevIdx = STEP_ORDER.indexOf(currentStep);
+          const newIdx = STEP_ORDER.indexOf(data.step);
+          const goingBack = prevIdx >= 0 && newIdx < prevIdx;
+          if (prevIdx >= 0 && !goingBack) updateStepDot(currentStep, "done");
+          if (goingBack) updateStepDot(currentStep, "failed");
+
+          currentStep = data.step;
+
+          for (let i = 0; i <= newIdx; i++) {
+            ensureStepItem(list, STEP_ORDER[i]);
+          }
+
+          for (let i = 0; i < newIdx; i++) {
+            updateStepDot(STEP_ORDER[i], "done");
+          }
+          updateStepDot(currentStep, "running");
+        }
+
+        if (data.step_details) {
+          data.step_details.forEach((d) => {
+            renderStepDetail(list, d);
+            const item = ensureStepItem(list, d.step);
+            const dot = item.querySelector(".step-dot");
+            if (d.step === currentStep) {
+              dot.className = "step-dot running";
+            }
+          });
+        }
+
+        if (data.stream_text) {
+          const display = document.getElementById("poem-display");
+          if (!data.draft || !data.draft.length) {
+            display.innerHTML =
+              '<div class="poem-line stream-text">' +
+              escapeHtml(data.stream_text) +
+              "</div>";
+          }
+        }
+        if (data.draft && data.draft.length > 0) {
+          updatePoemDisplay(data.draft, data.title);
+        }
+
+        if (data.last_tool) {
+          const ts = document.getElementById("tool-status");
+          ts.classList.remove("hidden");
+          const toolNames = {
+            search_words: t("tools.search_words"),
+            refine_line: t("tools.refine_line"),
+            rewrite: t("tools.rewrite"),
+            submit: t("tools.submit"),
+            _thinking: t("tools.thinking"),
+          };
+          ts.innerHTML =
+            '<span class="tool-label">' +
+            (toolNames[data.last_tool] || data.last_tool) +
+            "</span>";
+          if (data.last_tool_result) {
+            ts.innerHTML +=
+              '<span class="tool-result">' +
+              escapeHtml(String(data.last_tool_result).substring(0, 200)) +
+              "</span>";
+          }
+        }
+
+        if (data.current_detail_step && data.current_detail) {
+          const item = document.getElementById(
+            "progress-" + data.current_detail_step,
+          );
+          if (item) {
+            const body = item.querySelector(".progress-body");
+            body
+              .querySelectorAll(".step-record.pending")
+              .forEach((el) => el.remove());
+            const rec = document.createElement("div");
+            rec.className = "step-record pending";
+            const pre = document.createElement("pre");
+            pre.textContent = data.current_detail;
+            rec.appendChild(pre);
+            body.appendChild(rec);
+          }
+        }
+      }
+
+      function createStepItem(stepKey, title) {
+        const wrapper = document.createElement("div");
+        wrapper.id = "progress-" + stepKey;
+        wrapper.className = "progress-step";
+
+        const header = document.createElement("div");
+        header.className = "progress-header";
+        header.innerHTML =
+          '<span class="step-dot"></span><span class="step-title">' +
+          title +
+          '</span><span class="step-caret">&#9660;</span>';
+
+        const body = document.createElement("div");
+        body.className = "progress-body";
+
+        header.addEventListener("click", () => {
+          body.classList.toggle("collapsed");
+          const caret = header.querySelector(".step-caret");
+          caret.innerHTML = body.classList.contains("collapsed")
+            ? "&#9654;"
+            : "&#9660;";
+        });
+
+        wrapper.appendChild(header);
+        wrapper.appendChild(body);
+        return wrapper;
+      }
+
+      function updatePoemDisplay(poem, title) {
+        if (JSON.stringify(poem) === JSON.stringify(lastPoem)) return;
+        lastPoem = [...poem];
+
+        const display = document.getElementById("poem-display");
+        display.innerHTML = "";
+        if (title) {
+          const titleDiv = document.createElement("div");
+          titleDiv.className = "poem-title";
+          titleDiv.textContent = title;
+          display.appendChild(titleDiv);
+        }
+        poem.forEach((line, i) => {
+          const div = document.createElement("div");
+          div.className = "poem-line";
+          div.textContent = line;
+          display.appendChild(div);
+        });
+      }
+
+      function handleDone(data) {
+        isGenerating = false;
+        applyButtonStates();
+
+        const poem = data.final_poem || data.draft || [];
+        const display = document.getElementById("poem-display");
+        display.innerHTML = "";
+
+        if (data.formatted_poem) {
+          const pre = document.createElement("pre");
+          pre.className = "poem-formatted";
+          pre.textContent = data.formatted_poem;
+          display.appendChild(pre);
+        } else {
+          updatePoemDisplay(poem, data.title);
+        }
+
+        document.getElementById("tool-status").classList.add("hidden");
+
+        const checkerInline = document.getElementById("checker-inline");
+        checkerInline.classList.remove("hidden");
+        if (data.checker_pass) {
+          checkerInline.innerHTML =
+            '<div class="checker-pass">&#10004; ' +
+            t("checker.pass") +
+            "</div>";
+        } else {
+          checkerInline.innerHTML =
+            '<div class="checker-fail">&#10008; ' +
+            t("checker.fail") +
+            "</div>";
+          if (data.checker_suggestions) {
+            checkerInline.innerHTML +=
+              '<div class="checker-detail">' +
+              escapeHtml(data.checker_suggestions) +
+              "</div>";
+          }
+        }
+
+        if (data.step_details) {
+          const list = document.getElementById("progress-list");
+          data.step_details.forEach((d) => {
+            renderStepDetail(list, d);
+          });
+          if (data.checker_pass) {
+            STEP_ORDER.forEach((k) => updateStepDot(k, "done"));
+          } else {
+            STEP_ORDER.forEach((k) => updateStepDot(k, "done"));
+            updateStepDot(4, "failed");
+          }
+        }
+
+        document.getElementById("feedback-section").classList.remove("hidden");
+        document.getElementById("feedback-input-area").classList.add("hidden");
+        document.getElementById("user-feedback").value = "";
+
+        if (data.checker_pass) {
+          const poemText = data.formatted_poem || poem.join("\n");
+          const topic = document.getElementById("topic").value;
+          const tmplName =
+            document.getElementById("template-select").selectedOptions[0]
+              .textContent;
+          fetch("/api/history", {
+            method: "POST",
+            headers: Object.assign(
+              { "Content-Type": "application/json" },
+              csrfHeaders(),
+            ),
+            body: JSON.stringify({
+              topic: topic,
+              template_name: tmplName,
+              poem: poemText,
+            }),
+          });
+        }
+      }
+
+      function handleError(data) {
+        showToast(data.message || t("toast.error_default"), "error");
+        isGenerating = false;
+        applyButtonStates();
+      }
+
+      function openConfig() {
+        fetch("/api/config", { headers: csrfHeaders() })
+          .then((r) => r.json())
+          .then((cfg) => {
+            document.getElementById("cfg-writer-url").value =
+              cfg.writer.base_url;
+            document.getElementById("cfg-writer-key").value =
+              cfg.writer.api_key;
+            document.getElementById("cfg-writer-model").value =
+              cfg.writer.model;
+            document.getElementById("cfg-checker-url").value =
+              cfg.checker.base_url;
+            document.getElementById("cfg-checker-key").value =
+              cfg.checker.api_key;
+            document.getElementById("cfg-checker-model").value =
+              cfg.checker.model;
+            document.getElementById("cfg-language").value =
+              cfg.language || "zh";
+          });
+        document.getElementById("config-modal").classList.remove("hidden");
+      }
+
+      function closeConfig() {
+        document.getElementById("config-modal").classList.add("hidden");
+      }
+
+      function saveConfig() {
+        const data = {
+          writer: {
+            base_url: document.getElementById("cfg-writer-url").value,
+            api_key: document.getElementById("cfg-writer-key").value,
+            model: document.getElementById("cfg-writer-model").value,
+          },
+          checker: {
+            base_url: document.getElementById("cfg-checker-url").value,
+            api_key: document.getElementById("cfg-checker-key").value,
+            model: document.getElementById("cfg-checker-model").value,
+          },
+          language: document.getElementById("cfg-language").value,
+        };
+        var prevLang = CURRENT_LANG;
+        fetch("/api/config", {
+          method: "POST",
+          headers: Object.assign(
+            { "Content-Type": "application/json" },
+            csrfHeaders(),
+          ),
+          body: JSON.stringify(data),
+        })
+          .then((r) => r.json())
+          .then(() => {
+            closeConfig();
+            if (data.language !== prevLang) {
+              location.reload();
+            } else {
+              showToast(t("toast.config_saved"), "success");
+            }
+          });
+      }
+
+      function copyPoem() {
+        var parts = [];
+        var titleEl = document.querySelector(".poem-title");
+        if (titleEl) parts.push(titleEl.textContent);
+        var formatted = document.querySelector(".poem-formatted");
+        if (formatted) {
+          parts.push(formatted.textContent);
+        } else {
+          var lines = document.querySelectorAll(".poem-line");
+          lines.forEach(function (el) {
+            parts.push(el.textContent);
+          });
+        }
+        var text = parts.join("\n");
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(function () {
+          var btn = document.getElementById("btn-copy");
+          btn.textContent = "\u2714";
+          setTimeout(function () {
+            btn.textContent = "\uD83D\uDCCB";
+          }, 1500);
+        });
+      }
+
+      function openHistory() {
+        document.getElementById("history-modal").classList.remove("hidden");
+        fetch("/api/history")
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (data) {
+            const list = document.getElementById("history-list");
+            if (data.length === 0) {
+              list.innerHTML =
+                '<p class="history-empty">' + t("history_modal.empty") + "</p>";
+              return;
+            }
+            list.innerHTML = "";
+            data.forEach(function (item) {
+              const div = document.createElement("div");
+              div.className = "history-item";
+              div.innerHTML =
+                '<div class="history-meta">' +
+                '<span class="history-topic">' +
+                escapeHtml(item.topic) +
+                "</span>" +
+                '<span class="history-template">' +
+                escapeHtml(item.template_name) +
+                "</span>" +
+                '<span class="history-time">' +
+                escapeHtml(item.created_at) +
+                "</span>" +
+                "</div>" +
+                '<div class="history-poem">' +
+                escapeHtml(item.poem).replace(/\n/g, "<br>") +
+                "</div>";
+              list.appendChild(div);
+            });
+          });
+      }
+
+      function closeHistory() {
+        document.getElementById("history-modal").classList.add("hidden");
+      }
+
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+          if (
+            !document
+              .getElementById("history-modal")
+              .classList.contains("hidden")
+          ) {
+            closeHistory();
+          }
+          if (
+            !document
+              .getElementById("template-modal")
+              .classList.contains("hidden")
+          ) {
+            closeTemplateModal();
+          }
+        }
+      });
+
+      document.addEventListener("click", function (e) {
+        if (
+          e.target.classList.contains("modal") &&
+          !e.target.classList.contains("hidden")
+        ) {
+          e.target.classList.add("hidden");
+        }
+      });
+
+      function escapeHtml(str) {
+        const div = document.createElement("div");
+        div.textContent = str;
+        return div.innerHTML;
+      }
+
+      let cmEditor = null;
+
+      var TPL_META = null;
+      var TPL_META_DEFAULT = {
+        zh: { attribute: "tone", values: ["平", "仄"], helpers: [] },
+        en: { attribute: "stress", values: ["light", "heavy"], helpers: [] },
+        it: { attribute: "stress", values: ["light", "heavy"], helpers: [] },
+        la: { attribute: "length", values: ["long", "short"], helpers: [] },
+        fr: { attribute: "", values: [], helpers: [] },
+      };
+
+      function tplScheme(lang) {
+        var meta = TPL_META || TPL_META_DEFAULT;
+        return meta[lang] || TPL_META_DEFAULT.zh;
+      }
+
+      function templateCodeHint(lang) {
+        var hintKey = "template_modal.code_hint_empty";
+        var hint = t(hintKey);
+        var meta = TPL_META;
+        if (meta && meta[lang] && meta[lang].helpers.length) {
+          var names = meta[lang].helpers.map(function (h) {
+            return "rules." + h;
+          });
+          hint = t("template_modal.code_hint", { helpers: names.join(", ") });
+        }
+        return hint;
+      }
+
+      function openTemplateModal() {
+        document.getElementById("template-modal").classList.remove("hidden");
+        if (!TPL_META) {
+          fetch("/api/templates/meta")
+            .then(function (r) {
+              return r.json();
+            })
+            .then(function (d) {
+              TPL_META = d;
+              refreshTplEditor();
+            });
+        }
+        refreshTplEditor();
+      }
+
+      function closeTemplateModal() {
+        document.getElementById("template-modal").classList.add("hidden");
+      }
+
+      function refreshTplEditor() {
+        const lang = document.getElementById("tmpl-language").value;
+        rebuildSyllableTable();
+        if (!cmEditor) {
+          cmEditor = CodeMirror(document.getElementById("tmpl-code"), {
+            value: "",
+            mode: "python",
+            theme: "default",
+            lineNumbers: true,
+            indentUnit: 4,
+            tabSize: 4,
+            lineWrapping: true,
+            placeholder: templateCodeHint(lang),
+          });
+        } else {
+          cmEditor.setOption("placeholder", templateCodeHint(lang));
+          cmEditor.setValue("");
+        }
+        setTimeout(function () {
+          cmEditor.refresh();
+        }, 50);
+      }
+
+      function rebuildSyllableTable() {
+        const lines =
+          parseInt(document.getElementById("tmpl-lines").value) || 4;
+        const raw = document.getElementById("tmpl-syl-per-line").value.trim();
+        const sylCounts = raw
+          ? raw.split(",").map(function (s) {
+              return parseInt(s.trim()) || 7;
+            })
+          : [];
+        while (sylCounts.length < lines)
+          sylCounts.push(
+            sylCounts.length > 0 ? sylCounts[sylCounts.length - 1] : 7,
+          );
+        document.getElementById("tmpl-syl-per-line").value = sylCounts
+          .slice(0, lines)
+          .join(",");
+
+        const lang = document.getElementById("tmpl-language").value;
+        const scheme = tplScheme(lang);
+        const freeLabel = t("syllable_constraints.free");
+        const table = document.getElementById("tmpl-syllable-table");
+        table.innerHTML = "";
+
+        for (let i = 0; i < lines; i++) {
+          const row = document.createElement("div");
+          row.className = "syl-row";
+          const label = document.createElement("span");
+          label.className = "syl-row-label";
+          label.textContent = t("line_label", { n: i + 1 });
+          row.appendChild(label);
+          const cnt = sylCounts[i] || 7;
+          for (let j = 0; j < cnt; j++) {
+            const sel = document.createElement("select");
+            sel.className = "syl-cell";
+            sel.dataset.line = i;
+            sel.dataset.pos = j;
+            let html = '<option value="">' + freeLabel + "</option>";
+            (scheme.values || []).forEach(function (v) {
+              html += '<option value="' + v + '">' + v + "</option>";
+            });
+            sel.innerHTML = html;
+            row.appendChild(sel);
+          }
+          table.appendChild(row);
+        }
+      }
+
+      function createTemplate() {
+        const name = document.getElementById("tmpl-name").value.trim();
+        if (!name) {
+          showToast(t("toast.empty_name"), "warning");
+          return;
+        }
+        const language = document.getElementById("tmpl-language").value;
+        const lines =
+          parseInt(document.getElementById("tmpl-lines").value) || 4;
+        const raw = document.getElementById("tmpl-syl-per-line").value.trim();
+        const sylCounts = raw
+          ? raw.split(",").map(function (s) {
+              return parseInt(s.trim()) || 7;
+            })
+          : [];
+        while (sylCounts.length < lines) sylCounts.push(7);
+        const code = cmEditor ? cmEditor.getValue() : "";
+
+        const syllables_per_line = sylCounts.slice(0, lines);
+        const scheme = tplScheme(language);
+        const constraints = [];
+        for (let i = 0; i < lines; i++) {
+          const lineConstraints = [];
+          const cnt = syllables_per_line[i];
+          const cells = document.querySelectorAll(
+            '.syl-cell[data-line="' + i + '"]',
+          );
+          let j = 0;
+          cells.forEach(function (sel) {
+            if (j >= cnt) return;
+            const attributes = { tone: "", stress: "", length: "" };
+            const val = sel.value || "";
+            if (scheme.attribute && val) attributes[scheme.attribute] = val;
+            lineConstraints.push({
+              onset: "",
+              nucleus: "",
+              coda: "",
+              attributes: attributes,
+            });
+            j++;
+          });
+          constraints.push(lineConstraints);
+        }
+
+        fetch("/api/templates/custom", {
+          method: "POST",
+          headers: Object.assign(
+            { "Content-Type": "application/json" },
+            csrfHeaders(),
+          ),
+          body: JSON.stringify({
+            name: name,
+            language: language,
+            lines: lines,
+            syllables_per_line: syllables_per_line,
+            constraints: constraints,
+            code: code,
+          }),
+        })
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (resp) {
+            showToast(resp.message, resp.status === "ok" ? "success" : "error");
+            if (resp.status === "ok") {
+              closeTemplateModal();
+              loadTemplates();
+            }
+          });
+      }
+    </script>
+    <div id="toast-container"></div>
+  </body>
+</html>

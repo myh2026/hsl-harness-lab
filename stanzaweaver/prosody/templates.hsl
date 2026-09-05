@@ -1,0 +1,60 @@
+// ============================================================================
+// stanzaweaver/prosody/templates.hsl — 格律模板注册表
+// ============================================================================
+// StanzaWeaver 原架构对应：templates/（zh.py 五绝七绝五律七律 + en.py
+// 十四行诗等，Python 类定义，可无限扩展）。HSL 侧：封闭注册表
+// （key → MeterTemplate），get 按 key 装配（穷尽 match）。
+// ============================================================================
+
+import { MeterTemplate } from "../types/poem.hsl";
+import { WeaverError } from "../types/errors.hsl";
+
+/// 模板注册表：get(key) 装配（S6 穷尽——新增模板必须显式扩这里）。
+export fn get_template(key: String) -> Result<MeterTemplate, WeaverError> {
+    if key == String::from("zh-wujue") {
+        Ok(MeterTemplate {
+            key: String::from("zh-wujue"),
+            name: String::from("五言绝句"),
+            lang: String::from("zh"),
+            line_count: 4,
+            chars_per_line: 5,
+            tone_pattern: vec![
+                String::from("仄仄平平仄"),
+                String::from("平平仄仄平"),
+                String::from("平平平仄仄"),
+                String::from("仄仄仄平平"),
+            ],
+            rhyme_lines: vec![1, 3],
+            syllables_per_line: 5,
+        })
+    } else if key == String::from("zh-qijue") {
+        Ok(MeterTemplate {
+            key: String::from("zh-qijue"),
+            name: String::from("七言绝句"),
+            lang: String::from("zh"),
+            line_count: 4,
+            chars_per_line: 7,
+            tone_pattern: vec![
+                String::from("仄仄平平仄仄平"),
+                String::from("平平仄仄仄平平"),
+                String::from("平平仄仄平平仄"),
+                String::from("仄仄平平仄仄平"),
+            ],
+            rhyme_lines: vec![0, 1, 3],
+            syllables_per_line: 7,
+        })
+    } else if key == String::from("en-couplet") {
+        Ok(MeterTemplate {
+            key: String::from("en-couplet"),
+            name: String::from("Heroic Couplet"),
+            lang: String::from("en"),
+            line_count: 2,
+            chars_per_line: 0,
+            tone_pattern: Vec::new(),
+            rhyme_lines: vec![0, 1],
+            syllables_per_line: 10,
+        })
+    } else {
+        Err(WeaverError::new(String::from("template"), format!("未知模板 \"{}\"（可用：zh-wujue / zh-qijue / en-couplet）", key)))
+    }
+}

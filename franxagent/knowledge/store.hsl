@@ -1,0 +1,212 @@
+// ============================================================================
+// franxagent/knowledge/store.hsl — 知识库：混合检索 + 技能沉淀 + 会话记忆
+// ============================================================================
+// FranxAgent 原架构对应：knowledge 包——向量库 + FTS5 关键词 + RRF 融合，
+// 每轮动态检索注入 system 消息；add_skill 即时入库。
+// HSL 侧：KnowledgeDoc 封闭类型分级（tool=1.0 / skill=0.8 / conversation=0.2
+// 权重，与原实现一致）；相似度用字符三元组重叠（确定性、零依赖，
+// 替代原 sentence-transformers——语义检索的符号化简化）；关键词与 RRF
+// 融合全部纯 HSL。
+// ============================================================================
+
+/// 知识文档（type 决定检索权重）。
+#[derive(Debug, Clone)]
+export struct KnowledgeDoc {
+    doc_type: String,
+    text: String,
+}
+
+impl KnowledgeDoc {
+    fn weight(self) -> f64 {
+        if self.doc_type == String::from("tool") {
+            1.0
+        } else if self.doc_type == String::from("skill") {
+            0.8
+        } else {
+            0.2
+        }
+    }
+}
+
+/// 知识库（内存态；持久化经 main 的 artifacts 出口）。
+#[derive(Debug, Clone)]
+export struct KnowledgeStore {
+    docs: Vec<KnowledgeDoc>,
+}
+
+impl KnowledgeStore {
+    /// 空库。
+    fn new() -> KnowledgeStore {
+        KnowledgeStore { docs: Vec::new() }
+    }
+
+    /// 装入一批文档（技能/工具描述）。
+    fn load(mut self, docs: Vec<KnowledgeDoc>) -> KnowledgeStore {
+        for d in docs {
+            self.docs.push(d);
+        }
+        self
+    }
+
+    /// add_skill：即时入库（skill 级）。
+    fn add_skill(mut self, name: String, content: String) -> KnowledgeStore {
+        self.docs.push(KnowledgeDoc {
+            doc_type: String::from("skill"),
+            text: format!("# skill: {}\n{}", name, content),
+        });
+        self
+    }
+
+    /// 会话记忆：摘要入库（conversation 级，低权重）。
+    fn remember(mut self, user_msg: String, ai_msg: String) -> KnowledgeStore {
+        self.docs.push(KnowledgeDoc {
+            doc_type: String::from("conversation"),
+            text: format!("user: {}\nassistant: {}", user_msg, ai_msg),
+        });
+        self
+    }
+
+    /// 混合检索：语义通道（三元组重叠×类型权重）+ 关键词通道（分词命中）
+    /// → RRF 融合（rank 1/k 常数 60，与原实现同参）。
+    /// 返回前 k 条文本（注入 system 消息的「Related Content」）。
+    fn search(self, query: String, k: u32) -> Vec<String> {
+        if self.docs.len() == 0 {
+            return Vec::new();
+        }
+        // 通道 1：语义（三元组重叠相似度）
+        let query_tris = trigrams(query.clone());
+        let mut semantic: Vec<(f64, u32, String)> = Vec::new();
+        for pair in self.docs.clone().enumerate() {
+            let doc = pair[1];
+            let doc_tris = trigrams(doc.text.clone());
+            let overlap = tris_overlap(query_tris.clone(), doc_tris);
+            let score = overlap * doc.weight();
+            semantic.push((score, pair[0], doc.text.clone()));
+        }
+        // 通道 2：关键词（查询词在文档中的命中数）
+        let mut keyword: Vec<(f64, u32, String)> = Vec::new();
+        let terms = query.split_whitespace();
+        for pair in self.docs.clone().enumerate() {
+            let doc = pair[1];
+            let mut hits: f64 = 0.0;
+            for term in terms.clone() {
+                if doc.text.contains(term.clone()) {
+                    hits += 1.0;
+                }
+            }
+            keyword.push((hits, pair[0], doc.text.clone()));
+        }
+        // RRF 融合：两通道各取排名，倒数排名融合
+        let semantic_ranked = rank_by_score(semantic);
+        let keyword_ranked = rank_by_score(keyword);
+        let mut fused: Vec<(f64, u32, String)> = Vec::new();
+        for entry in semantic_ranked {
+            let idx = entry[1];
+            let r_s = entry[0];
+            let r_k = find_rank(keyword_ranked.clone(), idx);
+            fused.push((1.0 / (60.0 + r_s) + 1.0 / (60.0 + r_k), idx, entry[2].clone()));
+        }
+        for entry in keyword_ranked {
+            let idx = entry[1];
+            let already = fused_contains(fused.clone(), idx);
+            if already == false {
+                let r_s = 999.0;
+                let r_k = entry[0];
+                fused.push((1.0 / (60.0 + r_s) + 1.0 / (60.0 + r_k), idx, entry[2].clone()));
+            }
+        }
+        let ranked = rank_by_score(fused);
+        let mut out: Vec<String> = Vec::new();
+        let take_n = if k < ranked.len() { k } else { ranked.len() };
+        for entry in ranked.take(take_n) {
+            out.push(entry[2].clone());
+        }
+        out
+    }
+
+    /// 库容（报告出口）。
+    fn len(self) -> u32 {
+        self.docs.len()
+    }
+}
+
+/// 字符三元组（语义通道的确定性替身）。
+fn trigrams(text: String) -> Vec<String> {
+    let chars = text.chars();
+    let mut out: Vec<String> = Vec::new();
+    let n = chars.len();
+    let mut i: u32 = 0;
+    while i + 2 < n {
+        out.push(chars.skip(i).take(3).collect::<String>());
+        i += 1;
+    }
+    out
+}
+
+/// 三元组重叠率（Jaccard 式：交集 / 并集上界）。
+fn tris_overlap(a: Vec<String>, b: Vec<String>) -> f64 {
+    if a.len() == 0 || b.len() == 0 {
+        return 0.0;
+    }
+    let mut hits: u32 = 0;
+    for tri in a {
+        if b.contains(tri) {
+            hits += 1;
+        }
+    }
+    let total = a.len() + b.len();
+    (hits as f64) / (total as f64)
+}
+
+/// 按分数降序排名 → [(rank, index, text)]（rank 从 1 起）。
+fn rank_by_score(items: Vec<(f64, u32, String)>) -> Vec<(f64, u32, String)> {
+    let mut sorted = items.clone();
+    sorted = sort_desc_triples(sorted);
+    let mut out: Vec<(f64, u32, String)> = Vec::new();
+    for pair in sorted.enumerate() {
+        let rank = (pair[0] + 1) as f64;
+        let item = pair[1];
+        out.push((rank, item.1, item.2.clone()));
+    }
+    out
+}
+
+/// 三元组按分数降序（选择排序：确定性，同分保持声明序）。
+fn sort_desc_triples(items: Vec<(f64, u32, String)>) -> Vec<(f64, u32, String)> {
+    let mut pool = items.clone();
+    let mut out: Vec<(f64, u32, String)> = Vec::new();
+    while pool.len() > 0 {
+        let mut best_idx: u32 = 0;
+        let mut best_score: f64 = -1.0;
+        for pair in pool.clone().enumerate() {
+            let score = pair[1].0;
+            if score > best_score {
+                best_score = score;
+                best_idx = pair[0];
+            }
+        }
+        let picked = pool.remove(best_idx);
+        out.push(picked);
+    }
+    out
+}
+
+/// 在排名表中找 index 的 rank（未上榜 → 999）。
+fn find_rank(ranked: Vec<(f64, u32, String)>, idx: u32) -> f64 {
+    for entry in ranked {
+        if entry.1 == idx {
+            return entry.0;
+        }
+    }
+    999.0
+}
+
+/// 融合表是否已含 index。
+fn fused_contains(fused: Vec<(f64, u32, String)>, idx: u32) -> bool {
+    for entry in fused {
+        if entry.1 == idx {
+            return true;
+        }
+    }
+    false
+}

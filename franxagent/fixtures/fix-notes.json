@@ -1,0 +1,13 @@
+{
+  "tracks": {
+    "acts": [
+      "{\"content\": \"\", \"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"tools\", \"arguments\": \"{\\\"tool_name\\\": \\\"read\\\", \\\"arguments\\\": {\\\"path\\\": \\\"notes.txt\\\"}}\"}}]}",
+      "{\"content\": \"updating notes\", \"tool_calls\": [{\"id\": \"call_2\", \"type\": \"function\", \"function\": {\"name\": \"write\", \"arguments\": \"{\\\"path\\\": \\\"notes.txt\\\", \\\"content\\\": \\\"TODO: fix variance denominator (n-1) [DONE]\\\", \\\"mode\\\": \\\"edit\\\", \\\"start_line\\\": 2, \\\"end_line\\\": 2}\"}}]}",
+      "{\"content\": \"trying to clean up\", \"tool_calls\": [{\"id\": \"call_3\", \"type\": \"function\", \"function\": {\"name\": \"tools\", \"arguments\": \"{\\\"tool_name\\\": \\\"command\\\", \\\"arguments\\\": {\\\"command\\\": \\\"rm notes.txt\\\"}}\"}}]}",
+      "已按您的指示更新了 notes.txt：第 2 行标记为 DONE（经提案-审查-批准流程落盘）。删除请求被安全策略拦截，已按规范改用移动方案提示。"
+    ],
+    "approvals": [
+      "approve"
+    ]
+  }
+}

@@ -1,0 +1,121 @@
+// ============================================================================
+// dsh/tools/workspace.hsl — 文件面工具（read/write/edit/list，路径监狱）
+// ============================================================================
+// deepseek-harness 原架构对应：fs/workspace 包——文件操作限制在
+// workspace 内。HSL 侧：#[capability(file_read,file_write)] 编译期能力域 +
+// $host.fs 运行时路径监狱（越界即抛错，双闸门互补）。
+// N1 纪律：native 只做效应与平凡类型捕获；行号渲染 / 封顶在 HSL 侧。
+// ============================================================================
+
+import { ToolResult } from "../types/messages.hsl";
+import { Policy } from "../types/state.hsl";
+
+/// 输出封顶（预算闸门之一；纯 HSL 字符串工程）。
+export fn cap_chars(text: String, cap: u32) -> String {
+    if text.len() <= cap {
+        text
+    } else {
+        let head = text.chars().take(cap).collect::<String>();
+        let mut out = head;
+        out.push_str("\n...[truncated ");
+        out.push_str((text.len() - cap).to_string().as_str());
+        out.push_str(" chars]");
+        out
+    }
+}
+
+/// read 工具：带行号的全文读取（模型按行号定位 edit 目标）。
+#[capability(file_read)]
+export fn read_file(policy: Policy, path: String) -> Result<ToolResult, String> {
+    let r = native typescript {
+        const t0 = Date.now();
+        try {
+            const body = await $host.fs.read(path);
+            return { ok: true, body, error: "", ms: Date.now() - t0 };
+        } catch (e) {
+            return { ok: false, body: "", error: String(e && e.message || e), ms: Date.now() - t0 };
+        }
+    };
+    let body = if r.ok { cap_chars(number_lines(r.body), policy.max_output_chars) } else { r.error };
+    Ok(ToolResult {
+        call: format!("read_file {}", path),
+        ok: r.ok,
+        output: body,
+        duration_ms: r.ms,
+    })
+}
+
+/// write 工具：全量写入。
+#[capability(file_write)]
+export fn write_file(policy: Policy, path: String, content: String) -> Result<ToolResult, String> {
+    let r = native typescript {
+        try {
+            const bytes = $host.fs.write(path, content);
+            return { ok: true, error: "", bytes };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e), bytes: 0 };
+        }
+    };
+    let output = if r.ok { format!("wrote {} bytes", r.bytes) } else { r.error };
+    Ok(ToolResult {
+        call: format!("write_file {}", path),
+        ok: r.ok,
+        output,
+        duration_ms: 0,
+    })
+}
+
+/// edit 工具：精确文本替换（old_text 必须唯一命中，否则拒绝修改）。
+/// 唯一性判定在宿主 fs.edit 内完成（与 HSL 侧 count 语义一致）。
+#[capability(file_read, file_write)]
+export fn edit_file(policy: Policy, path: String, old_text: String, new_text: String) -> Result<ToolResult, String> {
+    let r = native typescript {
+        try {
+            const result = $host.fs.edit(path, old_text, new_text);
+            return { ok: result.ok, error: result.error || "" };
+        } catch (e) {
+            return { ok: false, error: String(e && e.message || e) };
+        }
+    };
+    let output = if r.ok {
+        format!("replaced {} chars → {} chars", old_text.len(), new_text.len())
+    } else {
+        r.error
+    };
+    Ok(ToolResult {
+        call: format!("edit_file {}", path),
+        ok: r.ok,
+        output,
+        duration_ms: 0,
+    })
+}
+
+/// list 工具：工作区文件清单（宿主递归列举，字符串直通）。
+#[capability(file_read)]
+export fn list_files(policy: Policy) -> Result<ToolResult, String> {
+    let r = native typescript {
+        try {
+            const listing = await $host.fs.list(".");
+            return { ok: true, body: listing, error: "" };
+        } catch (e) {
+            return { ok: false, body: "", error: String(e && e.message || e) };
+        }
+    };
+    let body = if r.ok { cap_chars(r.body, policy.max_output_chars) } else { r.error };
+    Ok(ToolResult {
+        call: String::from("list_files"),
+        ok: r.ok,
+        output: body,
+        duration_ms: 0,
+    })
+}
+
+/// 行号渲染（read 输出格式：`<line> | <text>`）。
+fn number_lines(text: String) -> String {
+    let mut out = String::from("");
+    let lines = text.lines();
+    for pair in lines.enumerate() {
+        out.push_str(format!("{} | {}\n", pair[0] + 1, pair[1]).as_str());
+    }
+    out
+}

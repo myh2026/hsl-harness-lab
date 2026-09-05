@@ -1,0 +1,72 @@
+// ============================================================================
+// dsh/types/errors.hsl — 错误层：唯一显式错误通道（§5.9 From 转换）
+// ============================================================================
+// deepseek-harness 原架构对应：各包以自有错误类型经 ctx 上抛，汇聚为顶层错误。
+// HSL 侧：ProviderError / DshError 双层 + From×2，`?` 是唯一传播通道（S3）。
+// ============================================================================
+
+/// 模型提供方错误（llm 包 → 顶层的跨包通道）。
+#[derive(Debug, Clone)]
+export struct ProviderError {
+    code: u32,
+    message: String,
+}
+
+impl ProviderError {
+    fn new(code: u32, message: String) -> ProviderError {
+        ProviderError { code, message }
+    }
+}
+
+/// 工具守卫拒绝（guard 拒绝 ≠ 工具执行失败，需单独建模）。
+#[derive(Debug, Clone)]
+export struct GuardError {
+    tool: String,
+    reason: String,
+}
+
+impl GuardError {
+    fn new(tool: String, reason: String) -> GuardError {
+        GuardError { tool, reason }
+    }
+}
+
+/// 顶层 harness 错误（session/parse/guard/provider/budget 全归一）。
+#[derive(Debug, Clone)]
+export struct DshError {
+    kind: String,
+    message: String,
+}
+
+impl DshError {
+    fn new(kind: String, message: String) -> DshError {
+        DshError { kind, message }
+    }
+}
+
+// ? 自动包装：ProviderError → DshError
+impl From<ProviderError> for DshError {
+    fn from(src: ProviderError) -> DshError {
+        DshError {
+            kind: String::from("provider"),
+            message: format!("provider {}: {}", src.code, src.message),
+        }
+    }
+}
+
+// ? 自动包装：GuardError → DshError
+impl From<GuardError> for DshError {
+    fn from(src: GuardError) -> DshError {
+        DshError {
+            kind: String::from("guard"),
+            message: format!("guard {} 拒绝: {}", src.tool, src.reason),
+        }
+    }
+}
+
+// ? 自动包装：String（parse 错误）→ DshError
+impl From<String> for DshError {
+    fn from(src: String) -> DshError {
+        DshError { kind: String::from("parse"), message: src }
+    }
+}
